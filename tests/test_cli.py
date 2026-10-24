@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -13,6 +15,8 @@ from pathlib import Path
 import pymupdf
 import pytest
 from test_library import _create_snapshot
+
+import goodnotes_cli.cache as cache_module
 
 
 @pytest.fixture
@@ -31,11 +35,15 @@ def library_copy(tmp_path: Path) -> Path:
 
 
 def invoke(
-    arguments: list[str], tmp_path: Path, *, sandbox: Path | None = None
+    arguments: list[str],
+    tmp_path: Path,
+    *,
+    sandbox: Path | None = None,
+    data_dir: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     environment = dict(os.environ)
     environment.pop("GOODNOTES_SANDBOX", None)
-    environment["GOODNOTES_DATA_DIR"] = str(tmp_path / "state")
+    environment["GOODNOTES_DATA_DIR"] = str(data_dir or tmp_path / "state")
     prefix = ["--sandbox", str(sandbox)] if sandbox is not None else []
     return subprocess.run(
         [sys.executable, "-m", "goodnotes_cli", *prefix, *arguments],
@@ -52,6 +60,76 @@ def successful(result: subprocess.CompletedProcess[str]) -> dict:
     assert result.stderr == ""
     assert len(result.stdout.splitlines()) == 1
     return json.loads(result.stdout)
+
+
+def _tree_manifest(root: Path) -> tuple[tuple[object, ...], ...]:
+    entries: list[tuple[object, ...]] = []
+    paths = [root, *sorted(root.rglob("*"))]
+    for path in paths:
+        info = path.lstat()
+        is_file = stat.S_ISREG(info.st_mode)
+        digest = hashlib.sha256(path.read_bytes()).hexdigest() if is_file else None
+        entries.append(
+            (
+                path.relative_to(root).as_posix() if path != root else ".",
+                stat.S_IFMT(info.st_mode),
+                stat.S_IMODE(info.st_mode),
+                info.st_size,
+                info.st_mtime_ns,
+                info.st_ctime_ns,
+                digest,
+            )
+        )
+    return tuple(entries)
+
+
+def _top_level_manifest(root: Path) -> tuple[tuple[object, ...], ...]:
+    return tuple(
+        sorted(
+            (
+                path.name,
+                path.lstat().st_mode,
+                path.lstat().st_size,
+                path.lstat().st_mtime_ns,
+                path.lstat().st_ctime_ns,
+                os.readlink(path) if path.is_symlink() else None,
+            )
+            for path in root.iterdir()
+        )
+    )
+
+
+def _resolution_error_path(path: Path, *, runtime_fallback: Path | None = None) -> Path:
+    fallback = runtime_fallback or path
+    try:
+        path.resolve(strict=True)
+    except OSError as exc:
+        if exc.filename is not None:
+            return Path(os.fsdecode(exc.filename))
+        return fallback
+    except RuntimeError:
+        return fallback
+    pytest.fail(f"strict path resolution unexpectedly succeeded: {path}")
+
+
+def _set_tree_readonly(root: Path) -> None:
+    for path in sorted(root.rglob("*"), key=lambda item: len(item.parts), reverse=True):
+        mode = path.lstat().st_mode
+        if stat.S_ISDIR(mode):
+            path.chmod(0o555)
+        elif stat.S_ISREG(mode):
+            path.chmod(0o444)
+    root.chmod(0o555)
+
+
+def _restore_tree_writable(root: Path) -> None:
+    for path in sorted(root.rglob("*"), key=lambda item: len(item.parts), reverse=True):
+        mode = path.lstat().st_mode
+        if stat.S_ISDIR(mode):
+            path.chmod(0o700)
+        elif stat.S_ISREG(mode):
+            path.chmod(0o600)
+    root.chmod(0o700)
 
 
 def test_schema_needs_no_library(tmp_path: Path) -> None:
@@ -459,7 +537,94 @@ def test_missing_library_is_structured_stderr(tmp_path: Path) -> None:
     result = invoke(["ls"], tmp_path)
     assert result.returncode == 1
     assert result.stdout == ""
-    assert json.loads(result.stderr)["error"]["code"] == "operation_failed"
+    error = json.loads(result.stderr)["error"]
+    assert error["code"] == "cache_not_initialized"
+    details = error["details"]
+    assert {"operation", "path", "remedy"} <= details.keys()
+    assert details["path"] == str(tmp_path / "state")
+    assert "sync" in details["remedy"].casefold()
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_operation"),
+    [
+        ("read", "resolve_cache_directory"),
+        ("sync", "prepare_cache_directory"),
+        ("explicit_sandbox", "resolve_explicit_sandbox"),
+    ],
+)
+def test_symlink_loop_in_cache_ancestor_returns_structured_error_without_mutation(
+    library_copy: Path, tmp_path: Path, case: str, expected_operation: str
+) -> None:
+    loop_a = tmp_path / "loop-a"
+    loop_b = tmp_path / "loop-b"
+    loop_a.symlink_to(loop_b, target_is_directory=True)
+    loop_b.symlink_to(loop_a, target_is_directory=True)
+    data_dir = loop_a / "cache"
+    explicit_sandbox = data_dir / "snapshots" / "generated-snapshot"
+    source_before = _tree_manifest(library_copy)
+    fixture_before = _top_level_manifest(tmp_path)
+
+    if case == "sync":
+        arguments = ["sync", "--library", str(library_copy / "Library")]
+        result = invoke(arguments, tmp_path, data_dir=data_dir)
+        # The writer reports the requested cache path if parent setup fails.
+        expected_path = data_dir
+    elif case == "explicit_sandbox":
+        arguments = ["ls"]
+        result = invoke(arguments, tmp_path, sandbox=explicit_sandbox)
+        expected_path = _resolution_error_path(explicit_sandbox, runtime_fallback=explicit_sandbox)
+    else:
+        arguments = ["ls"]
+        result = invoke(arguments, tmp_path, data_dir=data_dir)
+        expected_path = _resolution_error_path(data_dir, runtime_fallback=data_dir)
+
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert "Traceback" not in result.stderr
+    error = json.loads(result.stderr)["error"]
+    assert error["code"] == "cache_invalid"
+    details = error["details"]
+    assert details["operation"] == expected_operation
+    assert details["path"] == str(expected_path)
+    assert {"operation", "path", "remedy"} <= details.keys()
+    assert _tree_manifest(library_copy) == source_before
+    assert _top_level_manifest(tmp_path) == fixture_before
+    assert not (tmp_path / "state").exists()
+
+
+def test_symlink_loop_in_managed_snapshot_pointer_returns_structured_error(
+    library_copy: Path, tmp_path: Path
+) -> None:
+    state = tmp_path / "state"
+    cache_module.refresh_cache(library_copy / "Library", state)
+    snapshots = state / "snapshots"
+    loop_a, loop_b = snapshots / "cycle-a", snapshots / "cycle-b"
+    loop_a.symlink_to(loop_b, target_is_directory=True)
+    loop_b.symlink_to(loop_a, target_is_directory=True)
+    pointer = state / "active.json"
+    data = json.loads(pointer.read_text())
+    pointer_target = loop_a / "child"
+    data["snapshot"] = str(pointer_target)
+    pointer.write_text(json.dumps(data))
+    pointer_before = pointer.read_bytes()
+    source_before = _tree_manifest(library_copy)
+    entries_before = _top_level_manifest(snapshots)
+
+    result = invoke(["ls"], tmp_path)
+
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert "Traceback" not in result.stderr
+    error = json.loads(result.stderr)["error"]
+    assert error["code"] == "cache_invalid"
+    assert error["details"]["operation"] == "resolve_read_view"
+    expected_path = _resolution_error_path(pointer_target, runtime_fallback=state)
+    assert error["details"]["path"] == str(expected_path)
+    assert error["details"]["remedy"]
+    assert pointer.read_bytes() == pointer_before
+    assert _top_level_manifest(snapshots) == entries_before
+    assert _tree_manifest(library_copy) == source_before
 
 
 @pytest.mark.parametrize("arguments", [["read"], ["ls", "--limit", "0"], ["unknown"]])
@@ -579,6 +744,140 @@ def test_sync_and_active_pointer_use_only_supplied_copy(library_copy: Path, tmp_
     assert Path(data["snapshot"]).is_relative_to(tmp_path / "state")
     listing = successful(invoke(["ls", "--limit", "1"], tmp_path))
     assert listing["items"]
+
+
+def test_managed_read_commands_work_with_a_readonly_cache(
+    library_copy: Path, tmp_path: Path
+) -> None:
+    state = tmp_path / "state"
+    captured = cache_module.refresh_cache(library_copy / "Library", state)
+    assert captured["captured_at"] is not None
+    source_before = _tree_manifest(library_copy)
+    export_path = tmp_path / "outside-cache.pdf"
+    commands = [
+        ["ls", "--limit", "1"],
+        ["tree", "--depth", "2"],
+        ["info", "doc-hostile"],
+        ["pages", "doc-hostile", "--with-recognition"],
+        ["read", "doc-hostile", "--page", "1", "--source", "handwriting"],
+        ["search", "generated query", "--notebook", "doc-hostile"],
+        ["scan-pdfs", "Synthetic PDF page", "--notebook", "doc-hostile", "--page-limit", "1"],
+        ["doctor"],
+        ["export", "doc-hostile", "--pages", "1", "--output", str(export_path)],
+    ]
+
+    try:
+        _set_tree_readonly(state)
+        if hasattr(os, "geteuid") and os.geteuid() != 0:
+            try:
+                writable_lock = os.open(state / cache_module._VIEW_LOCK, os.O_RDWR)
+            except PermissionError:
+                pass
+            else:
+                os.close(writable_lock)
+                pytest.fail("read-only fixture unexpectedly allowed a writable lock open")
+        cache_before = _tree_manifest(state)
+        doctor_result: dict | None = None
+        for arguments in commands:
+            result = invoke(arguments, tmp_path)
+            assert result.returncode == 0, f"{arguments}: {result.stderr}"
+            assert result.stderr == ""
+            assert len(result.stdout.splitlines()) == 1
+            data = json.loads(result.stdout)
+            if arguments[0] == "doctor":
+                doctor_result = data
+
+        assert doctor_result is not None
+        storage = doctor_result["storage"]
+        assert storage["cache_dir"] == str(state.resolve())
+        assert storage["snapshot_path"] == captured["snapshot"]
+        assert storage["captured_at"] == captured["captured_at"]
+        assert export_path.is_file()
+        assert export_path.parent == tmp_path
+        assert _tree_manifest(state) == cache_before
+        assert _tree_manifest(library_copy) == source_before
+    finally:
+        _restore_tree_writable(state)
+
+
+@pytest.mark.parametrize(
+    ("target_name", "expected_operation"),
+    [
+        ("projection.sqlite", "open_snapshot_database"),
+        ("fts.sqlite", "open_snapshot_database"),
+        ("snapshot-root", "resolve_read_view"),
+    ],
+)
+def test_unreadable_managed_database_has_structured_permission_error(
+    library_copy: Path, tmp_path: Path, target_name: str, expected_operation: str
+) -> None:
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        pytest.skip("chmod-based unreadable-file checks require a non-root process")
+
+    state = tmp_path / "state"
+    result = cache_module.refresh_cache(library_copy / "Library", state)
+    snapshot_root = Path(str(result["snapshot"]))
+    database_path = snapshot_root / "Library" / "Databases" / target_name
+    permission_target = snapshot_root if target_name == "snapshot-root" else database_path
+    expected_path = (
+        snapshot_root / "goodnotes-snapshot.json"
+        if target_name == "snapshot-root"
+        else database_path
+    )
+    if target_name != "snapshot-root":
+        assert database_path.is_file()
+    lock_fd = os.open(state / cache_module._VIEW_LOCK, os.O_RDONLY)
+    os.close(lock_fd)
+    source_before = _tree_manifest(library_copy)
+    pointer_before = (state / "active.json").read_bytes()
+    database_before = hashlib.sha256(
+        (snapshot_root / "Library" / "Databases" / "projection.sqlite").read_bytes()
+    ).hexdigest()
+    original_mode = stat.S_IMODE(permission_target.stat().st_mode)
+
+    try:
+        permission_target.chmod(0)
+        response = invoke(["doctor"], tmp_path)
+        assert response.returncode == 1
+        assert response.stdout == ""
+        error = json.loads(response.stderr)["error"]
+        assert error["code"] == "cache_permission_denied"
+        details = error["details"]
+        assert details["path"] == str(expected_path)
+        assert details["operation"] == expected_operation
+        assert {"operation", "path", "remedy"} <= details.keys()
+    finally:
+        permission_target.chmod(original_mode)
+
+    projection_path = snapshot_root / "Library" / "Databases" / "projection.sqlite"
+    assert hashlib.sha256(projection_path.read_bytes()).hexdigest() == database_before
+    assert (state / "active.json").read_bytes() == pointer_before
+    assert _tree_manifest(library_copy) == source_before
+
+
+def test_corrupt_managed_projection_has_structured_cache_error(
+    library_copy: Path, tmp_path: Path
+) -> None:
+    state = tmp_path / "state"
+    result = cache_module.refresh_cache(library_copy / "Library", state)
+    database_path = Path(str(result["snapshot"])) / "Library" / "Databases" / "projection.sqlite"
+    database_path.chmod(0o600)
+    database_path.write_bytes(b"generated invalid SQLite bytes")
+    source_before = _tree_manifest(library_copy)
+    pointer_before = (state / "active.json").read_bytes()
+
+    response = invoke(["doctor"], tmp_path)
+
+    assert response.returncode == 1
+    assert response.stdout == ""
+    error = json.loads(response.stderr)["error"]
+    assert error["code"] == "cache_invalid"
+    details = error["details"]
+    assert details["path"] == str(database_path)
+    assert details["operation"] == "read_snapshot_catalog"
+    assert {"operation", "path", "remedy"} <= details.keys()
+    assert (state / "active.json").read_bytes() == pointer_before
+    assert _tree_manifest(library_copy) == source_before
 
 
 def test_bundle_budget_and_published_paths(library_copy: Path, tmp_path: Path) -> None:

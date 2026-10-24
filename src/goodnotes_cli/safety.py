@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import stat
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from .errors import GoodnotesError
+from .errors import CacheAccessError, GoodnotesError
 
 SNAPSHOT_MARKER = "goodnotes-snapshot.json"
 _SQLITE_SIDECAR_PREFIX = "-"
@@ -76,6 +78,7 @@ class Sandbox:
     projection_path: Path
     fts_path: Path | None
     attachments_dir: Path
+    captured_at: str | None = None
 
     @classmethod
     def load(cls, path: str | Path) -> Sandbox:
@@ -101,6 +104,9 @@ class Sandbox:
             raise GoodnotesError(f"Snapshot marker is unreadable: {marker}") from exc
         if not isinstance(marker_data, dict) or marker_data.get("format_version") != 1:
             raise GoodnotesError(f"Unsupported or invalid snapshot marker: {marker}")
+        captured_at = marker_data.get("created_at_utc")
+        if captured_at is not None and not isinstance(captured_at, str):
+            raise GoodnotesError(f"Snapshot marker has an invalid capture time: {marker}")
 
         library_dir = root / "Library"
         database_dir = library_dir / "Databases"
@@ -128,6 +134,7 @@ class Sandbox:
             projection_path=projection_path,
             fts_path=fts_path if fts_path.exists() else None,
             attachments_dir=attachments_dir,
+            captured_at=captured_at,
         )
 
     def ensure_output(
@@ -167,6 +174,51 @@ def safe_output(
     return resolved
 
 
+def _check_database_read_access(path: Path) -> None:
+    """Classify SQLite open failures without adding I/O to successful reads."""
+
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except OSError as exc:
+        raise CacheAccessError.from_exception(
+            exc,
+            f"Could not read snapshot database: {path}",
+            operation="open_snapshot_database",
+            path=path,
+        ) from exc
+
+    try:
+        opened = os.fstat(descriptor)
+        current = path.lstat()
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or not stat.S_ISREG(current.st_mode)
+            or (
+                opened.st_dev,
+                opened.st_ino,
+            )
+            != (current.st_dev, current.st_ino)
+        ):
+            raise CacheAccessError(
+                "cache_invalid",
+                f"Snapshot database is not a stable regular file: {path}",
+                operation="open_snapshot_database",
+                path=path,
+            )
+    except OSError as exc:
+        raise CacheAccessError.from_exception(
+            exc,
+            f"Could not verify snapshot database: {path}",
+            operation="open_snapshot_database",
+            path=path,
+        ) from exc
+    finally:
+        os.close(descriptor)
+
+
 @contextmanager
 def open_database(path: str | Path) -> Iterator[sqlite3.Connection]:
     """Open a snapshot SQLite file in immutable read-only mode."""
@@ -194,7 +246,13 @@ def open_database(path: str | Path) -> Iterator[sqlite3.Connection]:
     except sqlite3.Error as exc:
         if connection is not None:
             connection.close()
-        raise GoodnotesError(f"Could not open SQLite database read-only: {absolute_path}") from exc
+        _check_database_read_access(absolute_path)
+        raise CacheAccessError(
+            "cache_invalid",
+            f"Could not open SQLite database read-only: {absolute_path}",
+            operation="open_snapshot_database",
+            path=absolute_path,
+        ) from exc
     assert connection is not None
     try:
         yield connection

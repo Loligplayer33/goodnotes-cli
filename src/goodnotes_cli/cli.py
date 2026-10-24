@@ -8,7 +8,7 @@ import shutil
 import sqlite3
 import tempfile
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from functools import wraps
 from pathlib import Path
 from typing import Annotated, Any, cast
@@ -20,7 +20,7 @@ from . import __version__
 from .cache import read_view, refresh_cache
 from .config import Settings, default_data_dir, default_library
 from .documents import export_pdf, register_annotated_pdf, render_page
-from .errors import GoodnotesError, TextIndexUnavailableError
+from .errors import CacheAccessError, GoodnotesError, TextIndexUnavailableError
 from .library import Library
 from .output import (
     Projection,
@@ -57,7 +57,11 @@ class AgentGroup(TyperGroup):
         try:
             return super().main(*args, **kwargs)
         except GoodnotesError as exc:
-            emit_error(getattr(exc, "code", "operation_failed"), str(exc))
+            emit_error(
+                getattr(exc, "code", "operation_failed"),
+                str(exc),
+                details=getattr(exc, "details", None),
+            )
             raise SystemExit(1) from None
 
 
@@ -116,7 +120,11 @@ def configure(
         Path | None, typer.Option(envvar="GOODNOTES_SANDBOX", help="Use an existing read view.")
     ] = None,
     data_dir: Annotated[
-        Path | None, typer.Option(envvar="GOODNOTES_DATA_DIR", help="CLI cache directory.")
+        Path | None,
+        typer.Option(
+            envvar="GOODNOTES_DATA_DIR",
+            help="Managed cache directory; use the same selection for sync and reads.",
+        ),
     ] = None,
     text: Annotated[bool, typer.Option("--text", help="Indent JSON for inspection.")] = False,
     json_output: Annotated[bool, typer.Option("--json", help="Compact JSON, the default.")] = False,
@@ -145,7 +153,17 @@ def repository(ctx: typer.Context) -> Iterator[Library]:
     cfg = settings(ctx)
     with read_view(cfg) as sandbox:
         cfg.snapshot_id = sandbox.root.name
-        with Library(sandbox) as lib:
+        with ExitStack() as stack:
+            try:
+                lib = stack.enter_context(Library(sandbox))
+            except sqlite3.Error as exc:
+                raise CacheAccessError(
+                    "cache_invalid",
+                    f"Could not read the copied library catalog: {sandbox.projection_path}",
+                    operation="read_snapshot_catalog",
+                    path=sandbox.projection_path,
+                    cache_dir=cfg.cache_dir,
+                ) from exc
             yield lib
 
 
@@ -161,6 +179,7 @@ def sync(
 
     Reads source files without opening source SQLite or writing to Goodnotes. Reuses
     an unchanged copy unless --force is set. Later source edits require another sync.
+    Requires cache write access and initializes persistent locks for read-only readers.
 
     Example: goodnotes sync --library /path/to/Library
     """
@@ -585,12 +604,20 @@ def publish_bundle(temporary: Path, destination: Path) -> None:
 def doctor(ctx: typer.Context) -> None:
     """Report local library counts, missing metadata, and text-source warnings.
 
-    Inspects the selected copy without refreshing it or contacting Goodnotes.
+    storage contains cache_dir, snapshot_path, and captured_at; unknown values are null.
+    Reads the selected copy without refreshing it or contacting Goodnotes.
 
     Example: goodnotes doctor
     """
     with repository(ctx) as lib:
-        emit(lib.stats(), settings(ctx))
+        cfg = settings(ctx)
+        result = lib.stats()
+        result["storage"] = {
+            "cache_dir": cfg.cache_dir,
+            "snapshot_path": lib.sandbox.root,
+            "captured_at": lib.sandbox.captured_at,
+        }
+        emit(result, cfg)
 
 
 @command()

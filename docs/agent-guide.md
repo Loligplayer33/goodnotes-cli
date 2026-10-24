@@ -2,6 +2,10 @@
 
 Run `uv run goodnotes` from the repository root. Start with `uv run goodnotes schema [COMMAND]` for the machine-readable contract or `uv run goodnotes COMMAND --help` for readable options. Put global options such as `--sandbox`, `--fields`, and `--expect-snapshot` before the command. See the [command reference](commands.md) for every option and bound.
 
+## Read an initialized cache
+
+Setup runs `sync` with read access to the source and write access to the cache. Browsing, searching, and reading then need only cache read access, including the existing `.view.lock`. Use the installed `goodnotes` executable directly if your runner cannot update the project environment. Keep the same `--data-dir` or `GOODNOTES_DATA_DIR` selection as setup. `doctor.storage` gives the resolved cache directory, snapshot path, and capture time. Cache permission failures return `cache_permission_denied`; missing setup or lock files return `cache_not_initialized`; malformed cache state returns `cache_invalid`. Follow `error.details` for the path, operation, and remedy. Do not bypass locking, create replacement locks, or silently choose another cache. A missing-lock repair requires stopping other CLI processes before a process with write access runs `sync`.
+
 ## Find pages and stored recognition text
 
 Use `info`, `ls`, or `tree` to find a notebook. Use `pages` for its current one-based page numbers. Select notebooks by exact UUID, full path, or unique exact name; use the full path or UUID when a name is ambiguous.

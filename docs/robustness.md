@@ -20,6 +20,16 @@ The managed cache retains the active generation. Once existing readers release t
 
 Tests cover unchanged reuse, one active generation after refresh, old-reader retention while capture proceeds, serialized concurrent syncs, and explicit managed-sandbox locking. See `test_refresh_retains_only_active_generated_snapshot_and_removes_registration`, `test_old_reader_holds_snapshot_while_capture_progresses_and_publication_waits`, `test_concurrent_refreshes_serialize_and_second_sees_fresh_cache`, and `test_explicit_managed_sandbox_takes_shared_view_lock` in [test_cache.py](../tests/test_cache.py). `test_render_loads_read_view_only_once` in [test_cli.py](../tests/test_cli.py) checks that one command resolves the read view once.
 
+## Read-only cache access
+
+Sync creates persistent lock files in the CLI cache. A reader opens the existing view lock read-only, acquires a shared lock, and creates no cache files or directories. Read access to the cache is sufficient for browsing, searching, and reading. Export commands also need write access to their output destination; registering an annotated PDF writes separate registration metadata.
+
+Readers reject missing locks, denied access, symlinks, and non-regular lock files. A nonblocking open prevents a raced FIFO from hanging before validation. The opened file's identity is checked again after the shared lock is acquired. Missing locks are never recreated by readers. Stop other CLI processes before using sync to repair a missing lock; deleting a lock while it is held breaks coordination through its original inode. The CLI never removes its lock files during normal operation.
+
+Cache access errors include a stable code and `details` with `operation`, `path`, and `remedy`. `cache_not_initialized` means setup or a required lock is missing, `cache_permission_denied` means the runner lacks access, and `cache_invalid` means the selected cache state failed validation. The CLI does not bypass locking or choose a different cache. Use the same `--data-dir` or `GOODNOTES_DATA_DIR` setting for setup and reading. See [agent setup](usage.md#read-access-for-an-agent).
+
+Generated tests exercise cache and source bytes and metadata before and after read-only commands, denied pointer and database access, malformed catalogs, missing-lock repair, unsafe lock files, replacement during acquisition, and interruption. The existing reader-versus-refresh tests also run through the read-only shared lock and ensure publication and pruning wait for readers. See [cache tests](../tests/test_cache.py) and [installed CLI tests](../tests/test_cli.py). Permission-mode assertions run as an ordinary user on macOS and Linux; root bypasses those permissions, so those denial cases skip when tests run as root.
+
 ## Interrupted refreshes and failed validation
 
 Refreshes capture into a staging directory and publish only after full validation. Ctrl-C removes the partial staging directory and leaves the prior active pointer unchanged. If the process is killed before cleanup, the next sync removes abandoned staging directories. A failed capture also preserves the previous active view. The tests simulate an interrupted capture and an abandoned staging directory; they do not send an operating-system SIGKILL to the process.

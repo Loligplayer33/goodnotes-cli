@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .errors import GoodnotesError
+from .errors import CacheAccessError
 from .safety import Sandbox
 
 if TYPE_CHECKING:
@@ -33,16 +34,43 @@ class Settings:
     expect_snapshot: str | None = None
     snapshot_id: str | None = None
     projection: Projection | None = None
+    cache_dir: Path | None = None
 
     def load_sandbox(self) -> Sandbox:
         if self.sandbox is not None:
             return Sandbox.load(self.sandbox)
         pointer = (self.data_dir or default_data_dir()) / "active.json"
+
+        def invalid_pointer() -> CacheAccessError:
+            return CacheAccessError(
+                "cache_invalid",
+                f"The active library pointer is invalid: {pointer}",
+                operation="read_active_pointer",
+                path=pointer,
+                cache_dir=pointer.parent,
+            )
+
         try:
-            data = json.loads(pointer.read_text())
-            path = data["snapshot"]
-        except (OSError, ValueError, KeyError, TypeError) as exc:
-            raise GoodnotesError("No local library. Run 'goodnotes sync' first.") from exc
-        if not isinstance(path, str):
-            raise GoodnotesError("Invalid active library pointer. Run 'goodnotes sync' again.")
+            info = pointer.lstat()
+            if not stat.S_ISREG(info.st_mode):
+                raise ValueError("not a regular file")
+            contents = pointer.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise CacheAccessError.from_exception(
+                exc,
+                f"Could not read the active library pointer: {pointer}",
+                operation="read_active_pointer",
+                path=pointer,
+                cache_dir=pointer.parent,
+                missing_is_uninitialized=True,
+            ) from exc
+        except ValueError as exc:
+            raise invalid_pointer() from exc
+        try:
+            data = json.loads(contents)
+        except ValueError as exc:
+            raise invalid_pointer() from exc
+        if not isinstance(data, dict) or not isinstance(data.get("snapshot"), str):
+            raise invalid_pointer()
+        path = data["snapshot"]
         return Sandbox.load(path)

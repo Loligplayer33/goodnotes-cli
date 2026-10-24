@@ -6,7 +6,8 @@ import json
 import multiprocessing
 import os
 import sqlite3
-from collections.abc import Iterator
+import stat
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -61,6 +62,26 @@ def generated_snapshots(data_dir: Path) -> list[Path]:
     return sorted(path for path in (data_dir / "snapshots").iterdir() if path.is_dir())
 
 
+def _assert_cache_access_error(error: GoodnotesError, *, code: str, path: Path) -> dict[str, Any]:
+    assert getattr(error, "code", None) == code
+    details = getattr(error, "details", None)
+    assert isinstance(details, dict)
+    assert {"operation", "path", "remedy"} <= details.keys()
+    assert details["path"] == str(path)
+    assert isinstance(details["operation"], str)
+    assert isinstance(details["remedy"], str)
+    return details
+
+
+def _expected_permission_path(action: Callable[[], object]) -> str:
+    try:
+        action()
+    except PermissionError as exc:
+        assert exc.filename is not None
+        return os.fsdecode(exc.filename)
+    pytest.fail("expected the mode-000 parent to deny filesystem access")
+
+
 def test_refresh_skips_capture_when_source_inventory_is_unchanged(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -79,6 +100,73 @@ def test_refresh_skips_capture_when_source_inventory_is_unchanged(
     assert second["snapshot"] == first["snapshot"]
     assert second["snapshot_id"] == first["snapshot_id"]
     assert second["captured_at"] == first["captured_at"]
+
+
+@pytest.mark.parametrize(
+    ("action", "expected_operation"),
+    [
+        ("read", "resolve_cache_directory"),
+        ("sync", "prepare_cache_directory"),
+    ],
+)
+def test_unsearchable_cache_parent_returns_structured_permission_error(
+    tmp_path: Path, action: str, expected_operation: str
+) -> None:
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        pytest.skip("chmod-based parent access checks require a non-root process")
+
+    source = make_library(tmp_path / "source")
+    inaccessible_parent = tmp_path / "inaccessible-parent"
+    inaccessible_parent.mkdir()
+    data_dir = inaccessible_parent / "cache"
+    original_mode = stat.S_IMODE(inaccessible_parent.stat().st_mode)
+    source_before = {
+        path.relative_to(source): (
+            path.stat().st_size,
+            path.stat().st_mtime_ns,
+            path.stat().st_ctime_ns,
+            hashlib.sha256(path.read_bytes()).hexdigest(),
+        )
+        for path in source.rglob("*")
+        if path.is_file()
+    }
+
+    inaccessible_parent.chmod(0)
+    try:
+        expected_path = _expected_permission_path(
+            lambda: data_dir.stat() if action == "read" else os.mkdir(data_dir, 0o700)
+        )
+        with pytest.raises(GoodnotesError) as error:
+            if action == "read":
+                with cache_module.read_view(Settings(data_dir=data_dir)):
+                    pass
+            else:
+                cache_module.refresh_cache(source, data_dir)
+
+        details = _assert_cache_access_error(
+            error.value, code="cache_permission_denied", path=Path(expected_path)
+        )
+        assert details["operation"] == expected_operation
+        if action == "read":
+            assert "read/search access" in details["remedy"].casefold()
+        else:
+            assert "sync" in details["remedy"].casefold()
+            assert "write/search access" in details["remedy"].casefold()
+    finally:
+        inaccessible_parent.chmod(original_mode)
+
+    source_after = {
+        path.relative_to(source): (
+            path.stat().st_size,
+            path.stat().st_mtime_ns,
+            path.stat().st_ctime_ns,
+            hashlib.sha256(path.read_bytes()).hexdigest(),
+        )
+        for path in source.rglob("*")
+        if path.is_file()
+    }
+    assert source_after == source_before
+    assert not data_dir.exists()
 
 
 def test_same_size_cached_attachment_replacement_triggers_refresh(tmp_path: Path) -> None:
@@ -326,10 +414,12 @@ def _refresh_waiting_to_publish(
     original_lock = cache_module._file_lock
 
     @contextmanager
-    def observe_exclusive_view_lock(path: Path, *, exclusive: bool) -> Iterator[None]:
+    def observe_exclusive_view_lock(
+        path: Path, *, exclusive: bool, create: bool = True
+    ) -> Iterator[None]:
         if path.name == cache_module._VIEW_LOCK and exclusive:
             publish_attempt.set()
-        with original_lock(path, exclusive=exclusive):
+        with original_lock(path, exclusive=exclusive, create=create):
             yield
 
     cache_module.create_snapshot = capture_then_signal
@@ -384,6 +474,282 @@ def _read_explicit_view_paused(
             Path(output).write_text(str(sandbox.root), encoding="utf-8")
     except BaseException as exc:
         Path(output).write_text(json.dumps({"error": repr(exc)}), encoding="utf-8")
+
+
+def _read_view_in_process(data_dir: str, output: str) -> None:
+    try:
+        with cache_module.read_view(Settings(data_dir=Path(data_dir))) as sandbox:
+            Path(output).write_text(str(sandbox.root), encoding="utf-8")
+    except GoodnotesError as exc:
+        Path(output).write_text(
+            json.dumps(
+                {
+                    "error": type(exc).__name__,
+                    "code": getattr(exc, "code", None),
+                    "details": getattr(exc, "details", None),
+                }
+            ),
+            encoding="utf-8",
+        )
+    except BaseException as exc:
+        Path(output).write_text(json.dumps({"error": type(exc).__name__}), encoding="utf-8")
+
+
+def test_read_view_opens_existing_lock_readonly_and_releases_it_on_interruption(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = make_library(tmp_path / "source")
+    data_dir = tmp_path / "cache"
+    cache_module.refresh_cache(source, data_dir)
+    view_lock = data_dir / cache_module._VIEW_LOCK
+    real_open = os.open
+    opened: list[tuple[int, int]] = []
+
+    def record_open(path: str | bytes | os.PathLike[str], flags: int, mode: int = 0o777) -> int:
+        descriptor = real_open(path, flags, mode)
+        if Path(os.fsdecode(path)) == view_lock:
+            opened.append((descriptor, flags))
+        return descriptor
+
+    monkeypatch.setattr(cache_module.os, "open", record_open)
+    with pytest.raises(KeyboardInterrupt):
+        with cache_module.read_view(Settings(data_dir=data_dir)):
+            raise KeyboardInterrupt
+
+    assert len(opened) == 1
+    descriptor, flags = opened[0]
+    assert flags & os.O_ACCMODE == os.O_RDONLY
+    assert flags & os.O_CREAT == 0
+    if hasattr(os, "O_NONBLOCK"):
+        assert flags & os.O_NONBLOCK
+    with pytest.raises(OSError):
+        os.fstat(descriptor)
+
+    probe = real_open(view_lock, os.O_RDONLY)
+    try:
+        fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(probe, fcntl.LOCK_UN)
+    finally:
+        os.close(probe)
+
+
+def test_read_view_does_not_create_a_missing_lock_and_sync_repairs_it(tmp_path: Path) -> None:
+    source = make_library(tmp_path / "source")
+    data_dir = tmp_path / "cache"
+    first = cache_module.refresh_cache(source, data_dir)
+    old_pointer = (data_dir / "active.json").read_bytes()
+    view_lock = data_dir / cache_module._VIEW_LOCK
+    view_lock.unlink()
+
+    with pytest.raises(GoodnotesError) as error:
+        with cache_module.read_view(Settings(data_dir=data_dir)):
+            pass
+
+    details = _assert_cache_access_error(error.value, code="cache_not_initialized", path=view_lock)
+    assert "sync" in details["remedy"].casefold()
+    assert not view_lock.exists()
+    assert (data_dir / "active.json").read_bytes() == old_pointer
+    assert Path(str(first["snapshot"])).is_dir()
+
+    refreshed = cache_module.refresh_cache(source, data_dir)
+    assert refreshed["status"] == "unchanged"
+    assert view_lock.is_file()
+    with cache_module.read_view(Settings(data_dir=data_dir)) as sandbox:
+        assert sandbox.root == Path(str(first["snapshot"]))
+
+
+def test_read_view_reports_active_pointer_permission_denial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = make_library(tmp_path / "source")
+    data_dir = tmp_path / "cache"
+    cache_module.refresh_cache(source, data_dir)
+    pointer = data_dir / "active.json"
+    original_read_text = Path.read_text
+
+    def deny_pointer_read(
+        path: Path, encoding: str | None = None, errors: str | None = None
+    ) -> str:
+        if path == pointer:
+            raise PermissionError("generated active-pointer denial")
+        return original_read_text(path, encoding=encoding, errors=errors)
+
+    monkeypatch.setattr(Path, "read_text", deny_pointer_read)
+    with pytest.raises(GoodnotesError) as error:
+        with cache_module.read_view(Settings(data_dir=data_dir)):
+            pass
+
+    _assert_cache_access_error(error.value, code="cache_permission_denied", path=pointer)
+
+
+def test_read_view_reports_malformed_active_pointer(tmp_path: Path) -> None:
+    source = make_library(tmp_path / "source")
+    data_dir = tmp_path / "cache"
+    cache_module.refresh_cache(source, data_dir)
+    pointer = data_dir / "active.json"
+    pointer.write_text("{generated malformed pointer", encoding="utf-8")
+
+    with pytest.raises(GoodnotesError) as error:
+        with cache_module.read_view(Settings(data_dir=data_dir)):
+            pass
+
+    _assert_cache_access_error(error.value, code="cache_invalid", path=pointer)
+
+
+@pytest.mark.parametrize("error_type", [PermissionError, GoodnotesError])
+def test_read_view_preserves_errors_raised_by_its_caller(
+    tmp_path: Path, error_type: type[Exception]
+) -> None:
+    source = make_library(tmp_path / "source")
+    data_dir = tmp_path / "cache"
+    cache_module.refresh_cache(source, data_dir)
+    failure = error_type("generated caller-side failure")
+
+    with pytest.raises(error_type) as error:
+        with cache_module.read_view(Settings(data_dir=data_dir)):
+            raise failure
+
+    assert error.value is failure
+
+
+def test_sync_cache_setup_permission_error_has_writer_remedy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = make_library(tmp_path / "source")
+    data_dir = tmp_path / "cache"
+    original_mkdir = Path.mkdir
+
+    def deny_cache_mkdir(
+        path: Path,
+        mode: int = 0o777,
+        parents: bool = False,
+        exist_ok: bool = False,
+    ) -> None:
+        if path == data_dir:
+            raise PermissionError("generated cache directory denial")
+        original_mkdir(path, mode=mode, parents=parents, exist_ok=exist_ok)
+
+    monkeypatch.setattr(Path, "mkdir", deny_cache_mkdir)
+    with pytest.raises(GoodnotesError) as error:
+        cache_module.refresh_cache(source, data_dir)
+
+    details = _assert_cache_access_error(error.value, code="cache_permission_denied", path=data_dir)
+    assert "sync" in details["remedy"].casefold()
+    assert "cache owner" in details["remedy"].casefold()
+    assert not data_dir.exists()
+
+
+@pytest.mark.parametrize("lock_kind", ["symlink", "directory"])
+def test_read_view_rejects_non_regular_view_lock_without_replacing_it(
+    tmp_path: Path, lock_kind: str
+) -> None:
+    source = make_library(tmp_path / "source")
+    data_dir = tmp_path / "cache"
+    cache_module.refresh_cache(source, data_dir)
+    view_lock = data_dir / cache_module._VIEW_LOCK
+    view_lock.unlink()
+    target = tmp_path / "lock-target"
+    target.write_bytes(b"generated lock target")
+    if lock_kind == "symlink":
+        view_lock.symlink_to(target)
+    else:
+        view_lock.mkdir()
+
+    with pytest.raises(GoodnotesError) as error:
+        with cache_module.read_view(Settings(data_dir=data_dir)):
+            pass
+
+    _assert_cache_access_error(error.value, code="cache_invalid", path=view_lock)
+    assert view_lock.is_symlink() if lock_kind == "symlink" else view_lock.is_dir()
+    assert target.read_bytes() == b"generated lock target"
+
+
+def test_read_view_reports_a_denied_lock_open_without_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = make_library(tmp_path / "source")
+    data_dir = tmp_path / "cache"
+    cache_module.refresh_cache(source, data_dir)
+    view_lock = data_dir / cache_module._VIEW_LOCK
+    pointer_before = (data_dir / "active.json").read_bytes()
+    original_open = os.open
+
+    def deny_view_lock(path: str | bytes | os.PathLike[str], flags: int, mode: int = 0o777) -> int:
+        if Path(os.fsdecode(path)) == view_lock:
+            raise PermissionError("generated permission denial")
+        return original_open(path, flags, mode)
+
+    monkeypatch.setattr(cache_module.os, "open", deny_view_lock)
+    with pytest.raises(GoodnotesError) as error:
+        with cache_module.read_view(Settings(data_dir=data_dir)):
+            pass
+
+    _assert_cache_access_error(error.value, code="cache_permission_denied", path=view_lock)
+    assert view_lock.is_file()
+    assert (data_dir / "active.json").read_bytes() == pointer_before
+
+
+def test_read_view_rejects_fifo_lock_without_blocking(tmp_path: Path) -> None:
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("FIFO locks are only available on POSIX")
+
+    source = make_library(tmp_path / "source")
+    data_dir = tmp_path / "cache"
+    cache_module.refresh_cache(source, data_dir)
+    view_lock = data_dir / cache_module._VIEW_LOCK
+    view_lock.unlink()
+    os.mkfifo(view_lock)
+
+    context = multiprocessing.get_context("spawn")
+    output = tmp_path / "fifo-reader-output.json"
+    process = context.Process(
+        target=_read_view_in_process,
+        args=(str(data_dir), str(output)),
+    )
+    process.start()
+    try:
+        process.join(10)
+        assert not process.is_alive(), "opening a FIFO as the view lock must not block"
+        assert process.exitcode == 0
+        result = json.loads(output.read_text(encoding="utf-8"))
+        assert result["error"] == "CacheAccessError"
+        assert result["code"] == "cache_invalid"
+        assert result["details"]["path"] == str(view_lock)
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join()
+
+
+def test_read_view_rejects_a_replaced_lock_inode_after_acquiring_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = make_library(tmp_path / "source")
+    data_dir = tmp_path / "cache"
+    cache_module.refresh_cache(source, data_dir)
+    view_lock = data_dir / cache_module._VIEW_LOCK
+    original_inode = view_lock.stat().st_ino
+    displaced = data_dir / ".view.lock-displaced"
+    original_flock = fcntl.flock
+    replaced = False
+
+    def replace_after_lock(descriptor: int, operation: int) -> None:
+        nonlocal replaced
+        original_flock(descriptor, operation)
+        if operation == fcntl.LOCK_SH and not replaced:
+            replaced = True
+            view_lock.rename(displaced)
+            view_lock.write_bytes(b"replacement lock")
+
+    monkeypatch.setattr(cache_module.fcntl, "flock", replace_after_lock)
+    with pytest.raises(GoodnotesError) as error:
+        with cache_module.read_view(Settings(data_dir=data_dir)):
+            pass
+
+    _assert_cache_access_error(error.value, code="cache_invalid", path=view_lock)
+    assert replaced
+    assert displaced.stat().st_ino == original_inode
+    assert view_lock.stat().st_ino != original_inode
 
 
 def test_existing_cache_without_pointer_locks_before_resolving_reader(
@@ -591,9 +957,9 @@ def test_explicit_managed_sandbox_takes_shared_view_lock(
     original_lock = cache_module._file_lock
 
     @contextmanager
-    def record_lock(path: Path, *, exclusive: bool) -> Iterator[None]:
+    def record_lock(path: Path, *, exclusive: bool, create: bool = True) -> Iterator[None]:
         acquired.append((path, exclusive))
-        with original_lock(path, exclusive=exclusive):
+        with original_lock(path, exclusive=exclusive, create=create):
             yield
 
     monkeypatch.setattr(cache_module, "_file_lock", record_lock)
