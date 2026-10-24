@@ -40,6 +40,7 @@ These options are accepted before a command. They apply only where the command u
 | `--data-dir PATH` | `GOODNOTES_DATA_DIR`; otherwise `$XDG_CACHE_HOME/goodnotes-cli`, or `~/.cache/goodnotes-cli` | Select the managed cache location. |
 | `--text` | Off | Indent JSON for inspection. |
 | `--json` | On | Emit compact JSON. If both `--text` and `--json` are given, compact JSON wins. |
+| `--verbose` | Off | Include full JSON metadata instead of the concise response profile. |
 | `--fields FIELDS` | All fields | Comma-separated keys to keep. It selects keys in object rows under `items`, `pages`, or `hits` when present; otherwise it selects top-level response keys. An unknown key returns the valid keys for that level. |
 | `--expect-snapshot ID` | Unset | Fail with `stale_snapshot` if a cache-backed command opens a different read-view generation. |
 | `--version` | N/A | Print the CLI version and exit. |
@@ -48,6 +49,8 @@ These options are accepted before a command. They apply only where the command u
 `GOODNOTES_DATA_DIR` takes precedence over the default cache path; `--data-dir` overrides the environment. The same precedence applies to `GOODNOTES_SANDBOX` and `--sandbox`.
 
 Field selection filters object rows while keeping surrounding metadata, including warnings and pagination. Empty row arrays stay empty and still validate requested field names. Responses without object-row arrays, such as `bundle`, use top-level selection. Valid optional response keys are omitted when absent. Cache-backed commands always retain `snapshot`. Declared fields are checked before commands write outputs or cache state. Use `schema COMMAND` for field names; selecting `recognition` requires `pages --with-recognition`.
+
+Concise profiles apply by default to sync/watch, listings, item and page metadata, page reads, renders, exports, and bundles. Other commands retain their full responses. Sync/watch omit the snapshot path and detailed capture counters. Listings omit parent IDs and timestamps. Page reads share the document ID at the response level. Native summaries keep coverage, fidelity status, object counts, unsupported reasons, and warnings. `--verbose` restores full metadata; `--fields` deliberately projects the full field contract instead of the concise profile. Errors are always complete. Use `schema COMMAND` for both output shapes.
 
 ## Names, folders, and pages
 
@@ -68,9 +71,9 @@ goodnotes sync [--library PATH] [--force | --no-force]
 | `--library PATH` | Goodnotes Library at `~/Library/Containers/com.goodnotesapp.x/Data/Library` on macOS | Choose the source Library directory. |
 | `--force` / `--no-force` | `--no-force` | Capture and validate a fresh generation even when inventory checks match. |
 
-Refreshes the active managed copy and removes superseded managed generations after readers finish. It reads source Library files but does not open source SQLite databases, control Goodnotes, or write to the source library. The result includes `status` (`ready` or `unchanged`), `snapshot` (the generation path), `snapshot_id` (the generation ID), `checked_at`, `source_changed_during_refresh`, and, when available, `captured_at` and `warnings`. A true `source_changed_during_refresh` means the published copy is valid as of `captured_at`; it does not promise that the source stayed unchanged until the command returned.
+Refreshes the active managed copy and removes superseded managed generations after readers finish. It reads source Library files but does not open source SQLite databases, control Goodnotes, or write to the source library. The result includes `status` (`ready` or `unchanged`), `snapshot_id`, `checked_at`, `source_changed_during_refresh`, and, when available, `captured_at` and `warnings`. Global `--verbose` adds the `snapshot` generation path and detailed capture counters. A true `source_changed_during_refresh` means the published copy is valid as of `captured_at`; it does not promise that the source stayed unchanged until the command returned.
 
-`capture_stats` reports logical file and byte counts for captured, reused, cloned, copied, and hashed data. Unchanged files can reuse a prior verified digest when both source and cached-file metadata match. A clone shares storage blocks but has an independent file identity; byte counts do not measure physical disk allocation. `--force` bypasses reuse. Sync includes the optional `notes_main.db` native store and its WAL files. Do not combine `sync` with the global `--sandbox` option; choose the source with `--library`.
+With global `--verbose`, `capture_stats` reports logical file and byte counts for captured, reused, cloned, copied, and hashed data. Unchanged files can reuse a prior verified digest when both source and cached-file metadata match. A clone shares storage blocks but has an independent file identity; byte counts do not measure physical disk allocation. `--force` bypasses reuse. Sync includes the optional `notes_main.db` native store and its WAL files. Do not combine `sync` with the global `--sandbox` option; choose the source with `--library`.
 
 ### watch
 
@@ -109,7 +112,7 @@ goodnotes ls [--folder FOLDER] [--limit N] [--offset N]
 | `--limit N` | `100` | `1` to `1000` items |
 | `--offset N` | `0` | `0` or greater |
 
-Lists direct children in stored order. The result has an `items` array, `next_offset`, and the active read-view `snapshot` ID. Item rows include `id`, `name`, `kind`, `path`, `parent_id`, `page_count`, and `updated_at`.
+Lists direct children in stored order. The result has an `items` array, `next_offset`, and the active read-view `snapshot` ID. Item rows include `id`, `name`, `kind`, `path`, and `page_count`; global `--verbose` adds `parent_id` and `updated_at`.
 
 ### tree
 
@@ -146,7 +149,7 @@ goodnotes pages NOTEBOOK [--limit N] [--offset N] [--with-recognition | --no-wit
 | `--offset N` | `0` | `0` or greater |
 | `--with-recognition` / `--no-with-recognition` | `--no-with-recognition` | Add or omit stored recognition status metadata. |
 
-Lists the notebook's active pages in current order, numbered from 1. The result has a `pages` array, `next_offset`, and the active read-view `snapshot` ID. Page rows include page and notebook IDs, page number, position, available background attachment and PDF-page mapping, dimensions, and annotation count. `--with-recognition` adds per-page availability and index state without returning candidate text. The top-level `annotation_count_source` is `projection.notes_items`; it does not count ink or OCR results.
+Lists the notebook's active pages in current order, numbered from 1. The result has a `pages` array, shared `document_id`, `next_offset`, and the active read-view `snapshot` ID. Page rows include their IDs, numbers, and annotation counts. Global `--verbose` adds position, background/PDF mapping, dimensions, and per-row document IDs. `--with-recognition` adds per-page availability and index state without returning candidate text. The top-level `annotation_count_source` is `projection.notes_items`; it does not count ink or OCR results.
 
 ### read
 
@@ -235,18 +238,23 @@ Registers a user-exported full notebook PDF for the `annotated` layer. It checks
 ### bundle
 
 ```text
-goodnotes bundle NOTEBOOK --output DIR [--pages EXPR] [--layer LAYER] [--dpi N] [--max-chars N]
+goodnotes bundle NOTEBOOK --output DIR [--pages EXPR] [--source SOURCE] [--layer LAYER] [--dpi N] [--max-chars N]
 ```
 
 | Option | Default | Bounds or values |
 | --- | --- | --- |
 | `--output DIR` | Required | New directory |
 | `--pages EXPR` | `1` | Up to 10 distinct pages, for example `1-3,7` |
-| `--layer LAYER` | `background` | `background`, `native`, or `annotated` |
+| `--source SOURCE` | `pdf` | Text sources: `all`, `pdf`, `handwriting`, or `textbox`. Does not change images. |
+| `--layer LAYER` | `native` | `background`, `native`, or `annotated` |
 | `--dpi N` | `150` | `72` to `300` |
 | `--max-chars N` | `12000` | `1` to `1000000` characters across all selected pages |
 
-Creates `page-NNNN.png` files and `text.json` in the new directory. The result reports the directory, manifest path, selected pages, layer, truncation status, and active read-view `snapshot` ID. The page images use the same layer and annotation rules as [render](#render). Existing destinations are not overwritten; outputs must be outside the snapshot and production Goodnotes locations.
+Creates `page-NNNN.png` files and `text.json` in the new directory. By default, it returns concise `page_evidence` with native annotated images and PDF text, plus the manifest path, selected pages, layer, text source, truncation status, capture time, and active read-view `snapshot` ID. Native rendering requires its optional runtime and copied store; failure never silently substitutes a clean background. Existing destinations are not overwritten; outputs must be outside the snapshot and production Goodnotes locations.
+
+Evidence appears directly in stdout, so an agent can read the text and open absolute image paths without another manifest-read call. Concise output shares the document ID and keeps one page ID and image path per page, source-labeled text, annotation coverage, and distinct warnings. Global `--verbose` includes full nested metadata. The on-disk `text.json` retains full diagnostics regardless of output mode. The same character budget and truncation flags apply to stdout and the manifest.
+
+`--source` filters text using the same rules as `read` and is always recorded as `text_source` in stdout and the manifest. Use `--source all` to include stored recognition candidates and typed text. Use `--layer background` when deliberately requesting clean page images, or `--layer annotated` for a registered PDF export. These overrides preserve the original browsing, reading, and export capabilities.
 
 ### doctor
 

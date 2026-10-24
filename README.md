@@ -76,17 +76,19 @@ You need macOS or Linux, Python 3.11 or newer, and [`uv`](https://docs.astral.sh
 
 After sync, browse and read commands need only read access to the cache. An agent can use that copy without access to the live Goodnotes library. `doctor` reports its location and capture time. See [restricted agent setup](docs/usage.md#read-access-for-an-agent) for permissions and custom cache locations.
 
-For recent notes, have the agent sync once at the start of each request, then pin the returned `snapshot_id` across its reads. Once [native rendering is set up](docs/pdf-and-handwriting.md#native-ink-without-manual-pdf-exports), it can inspect the actual pen annotations with:
+For recent notes, have the agent sync once at the start of each request. Once [native rendering is set up](docs/pdf-and-handwriting.md#native-ink-without-manual-pdf-exports), one bundle provides actual pen annotations and slide text:
 
 ```sh
-uv run goodnotes --expect-snapshot SNAPSHOT_ID bundle "Notebook name" --pages 3 --layer native --output /tmp/study-page-3
+uv run goodnotes bundle "Notebook name" --pages 3 --output /tmp/study-page-3
 ```
 
 `uv run goodnotes watch` is optional for continuous refresh or for an agent with cache-only access. Both routes observe files already present on this Mac and cannot tell whether an iPad edit has arrived. Refreshes reuse verified unchanged files, and the managed cache retains one published generation after readers finish. Native rendering also needs writable temporary scratch and an output destination.
 
+Bundle holds one read view throughout. If later commands must match it, pin its returned `snapshot` with global `--expect-snapshot ID`.
+
 ## Working with results
 
-Commands return compact JSON by default. Put `--text` before the command to indent the JSON. Public page numbers start at 1. Search stays in the stored index; use `scan-pdfs` as a separate PDF-background check when needed.
+Commands return concise compact JSON, retaining warnings and interpretation limits. Global `--verbose` includes full metadata. `bundle` defaults to native annotated images and PDF text, returning page evidence directly while keeping full render diagnostics in its manifest. Use `--source all` for every stored text source, or `--layer background` for clean page images. Put `--text` before the command to indent JSON. Public page numbers start at 1. Search stays in the stored index; use `scan-pdfs` separately when needed.
 
 Common tasks:
 

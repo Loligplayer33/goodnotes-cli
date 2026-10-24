@@ -23,7 +23,7 @@ In another terminal, render or bundle the page you want an agent to inspect:
 
 ```sh
 uv run goodnotes render "Notebook name" --page 3 --layer native --output /tmp/page-3-native.png
-uv run goodnotes bundle "Notebook name" --pages 3 --layer native --output /tmp/page-3-study
+uv run goodnotes bundle "Notebook name" --pages 3 --output /tmp/page-3-study
 uv run goodnotes export "Notebook name" --pages 3 --layer native --output /tmp/page-3-native.pdf
 ```
 
@@ -37,7 +37,7 @@ The native engine opens only a disposable private scratch copy of the validated 
 
 ## Export page backgrounds
 
-The default `background` layer uses the PDF or image attachment assigned to each page:
+Standalone render/export default to `background`, using the PDF or image attachment assigned to each page. Bundle defaults to native ink; use `bundle --layer background` for clean page images:
 
 ```sh
 uv run goodnotes export "Notebook name" --output /tmp/notebook-backgrounds.pdf

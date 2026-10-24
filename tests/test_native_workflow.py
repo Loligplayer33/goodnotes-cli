@@ -289,7 +289,13 @@ def test_native_png_pdf_bundle_preserve_sources_and_readonly_cache(
     source, store = generated_source
     environment = _environment(tmp_path)
     original = _manifest(source)
-    captured = _command(["sync", "--library", str(source)], environment)
+    captured = _command(["--verbose", "sync", "--library", str(source)], environment)
+    brief_refresh = _command(["sync", "--library", str(source)], environment)
+    assert brief_refresh["snapshot_id"] == captured["snapshot_id"]
+    assert brief_refresh["captured_at"] == captured["captured_at"]
+    assert brief_refresh["source_changed_during_refresh"] is False
+    assert "snapshot" not in brief_refresh
+    assert "capture_stats" not in brief_refresh
     assert _manifest(source) == original
     cache = tmp_path / "cache"
     modes = {path: stat.S_IMODE(path.stat().st_mode) for path in [cache, *cache.rglob("*")]}
@@ -298,7 +304,7 @@ def test_native_png_pdf_bundle_preserve_sources_and_readonly_cache(
             path.chmod(mode & ~0o222)
         before = _manifest(cache)
         red_png = tmp_path / "red.png"
-        rendered = _command(_native_render(1, red_png), environment)
+        rendered = _command(["--verbose", *_native_render(1, red_png)], environment)
         assert rendered["snapshot"] == captured["snapshot_id"]
         assert rendered["native_annotations"]["rendered_strokes"] == 1
         assert rendered["native_annotations"]["coverage"] == (
@@ -334,12 +340,11 @@ def test_native_png_pdf_bundle_preserve_sources_and_readonly_cache(
             assert pdf[1].get_pixmap().pixel(60, 30)[:3] == (255, 0, 0)
         bundle = _command(
             [
+                "--verbose",
                 "bundle",
                 NOTEBOOK,
                 "--pages",
                 "2",
-                "--layer",
-                "native",
                 "--dpi",
                 "72",
                 "--output",
@@ -352,6 +357,59 @@ def test_native_png_pdf_bundle_preserve_sources_and_readonly_cache(
         assert entry["page"] == 2
         assert entry["render"]["native_annotations"]["rendered_strokes"] == 1
         assert _pixel(Path(bundle["directory"]) / entry["image"], 60, 90)[:3] == (0, 0, 255)
+        inline = _command(
+            [
+                "--expect-snapshot",
+                captured["snapshot_id"],
+                "bundle",
+                NOTEBOOK,
+                "--pages",
+                "2,1",
+                "--dpi",
+                "72",
+                "--max-chars",
+                "15",
+                "--output",
+                str(tmp_path / "inline-bundle"),
+            ],
+            environment,
+        )
+        full_inline = json.loads(Path(inline["manifest"]).read_text())
+        assert inline["layer"] == "native"
+        assert inline["document_id"] == NOTEBOOK
+        assert inline["snapshot"] == full_inline["snapshot"] == captured["snapshot_id"]
+        assert inline["captured_at"] == full_inline["captured_at"]
+        assert inline["text_source"] == full_inline["text_source"] == "pdf"
+        assert inline["truncated"] is full_inline["truncated"] is True
+        assert inline["pages"] == [2, 1]
+        assert [page["page_id"] for page in inline["page_evidence"]] == [
+            PAGE_IDS[1],
+            PAGE_IDS[0],
+        ]
+        for evidence, full in zip(inline["page_evidence"], full_inline["pages"], strict=True):
+            assert Path(evidence["image"]).is_absolute()
+            assert evidence["parts"] == full["text"]["parts"]
+            assert all(part["source"] == "pdf" for part in evidence["parts"])
+            assert evidence["image_source"] == full["render"]["source"]
+            assert evidence["includes_handwriting"] is True
+            assert evidence["annotation_status"] == "native-reconstructed-approximate"
+            assert evidence["native_annotations"]["rendered_objects"] == 1
+            assert evidence["native_annotations"]["rendered_strokes"] == 1
+            assert evidence["native_annotations"]["unsupported_objects"] == 0
+            assert evidence["native_annotations"]["full_fidelity_verified"] is False
+            assert evidence["native_annotations"]["coverage"] == (
+                "partial" if store.direct_identity else "supported-pen-records"
+            )
+            assert set(evidence["warnings"]) == set(
+                full["render"]["warnings"] + full["text"]["warnings"]
+            )
+            assert "descriptor_variants" in full["render"]["native_annotations"]
+            assert "descriptor_variants" not in evidence["native_annotations"]
+            if store.direct_identity:
+                assert full["render"]["native_annotations"]["unmodeled_descriptor_fields"] == [14]
+                assert any("field 14" in warning for warning in evidence["warnings"])
+        assert _pixel(Path(inline["page_evidence"][0]["image"]), 60, 90)[:3] == (0, 0, 255)
+        assert _pixel(Path(inline["page_evidence"][1]["image"]), 60, 30)[:3] == (255, 0, 0)
         assert _manifest(cache) == before
         assert _manifest(source) == original
         assert not list((tmp_path / "scratch").iterdir())
@@ -380,7 +438,7 @@ def test_native_reader_keeps_old_generation_until_render_finishes(
     environment = _environment(tmp_path)
     monkeypatch.setenv("GOODNOTES_SCRATCH_DIR", environment["GOODNOTES_SCRATCH_DIR"])
     cache = tmp_path / "cache"
-    first = _command(["sync", "--library", str(source)], environment)
+    first = _command(["--verbose", "sync", "--library", str(source)], environment)
     refresher: subprocess.Popen[str] | None = None
     try:
         with read_view(Settings(data_dir=cache)) as sandbox:
@@ -449,6 +507,7 @@ def test_watch_refreshes_native_wal_edits_moves_and_erasure_without_manual_sync(
             sys.executable,
             "-m",
             "goodnotes_cli",
+            "--verbose",
             "watch",
             "--library",
             str(source),

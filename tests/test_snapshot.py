@@ -4,6 +4,8 @@ import json
 import os
 import sqlite3
 import sys
+from collections.abc import Iterator
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -61,6 +63,17 @@ def hash_tree(root: Path) -> dict[str, str]:
         for path in sorted(root.rglob("*"))
         if path.is_file()
     }
+
+
+@pytest.fixture
+def wal_library(tmp_path: Path) -> Iterator[Path]:
+    source = make_library(tmp_path / "source")
+    with closing(sqlite3.connect(source / "Databases/projection.sqlite")) as writer:
+        writer.execute("PRAGMA journal_mode=WAL")
+        writer.execute("PRAGMA wal_autocheckpoint=0")
+        writer.execute("UPDATE item SET name=name")
+        writer.commit()
+        yield source
 
 
 def add_native_store(library: Path) -> Path:
@@ -445,6 +458,10 @@ def test_snapshot_consolidates_copied_wal_and_reads_committed_rows(
     wal_path = Path(f"{source_db}-wal")
     assert wal_path.is_file() and wal_path.stat().st_size > 0
     source_before = hash_tree(source_library)
+    metadata_before = {
+        path.relative_to(source_library): snapshot_module._stat_key(path.lstat())
+        for path in source_library.rglob("*")
+    }
     connection_targets: list[str] = []
     original_connect = snapshot_module.sqlite3.connect
 
@@ -464,10 +481,199 @@ def test_snapshot_consolidates_copied_wal_and_reads_committed_rows(
     assert names == ["first", "committed in wal"]
     assert wal_path.is_file() and wal_path.stat().st_size > 0
     assert hash_tree(source_library) == source_before
+    assert {
+        path.relative_to(source_library): snapshot_module._stat_key(path.lstat())
+        for path in source_library.rglob("*")
+    } == metadata_before
     assert connection_targets
     assert all(str(snapshot) in target for target in connection_targets)
     assert all(source_db.as_posix() not in target for target in connection_targets)
+    assert any("mode=rw" in target for target in connection_targets)
+    assert all(".consolidated" not in target for target in connection_targets)
     source_connection.close()
+
+
+def test_copied_wal_checkpoint_rebuilds_shm_before_opening_sqlite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, wal_library: Path
+) -> None:
+    source_library = wal_library
+    original_consolidate = snapshot_module._consolidate_copied_databases
+    original_connect = snapshot_module.sqlite3.connect
+    checked_staging = False
+
+    def replace_staging_shm(library: Path) -> None:
+        (library / "Databases" / "projection.sqlite-shm").write_bytes(b"stale copied index")
+        original_consolidate(library)
+
+    def check_connection(database: str, *args: Any, **kwargs: Any) -> sqlite3.Connection:
+        nonlocal checked_staging
+        if "mode=rw" in str(database):
+            checked_staging = True
+            assert not (tmp_path / "snapshot/Library/Databases/projection.sqlite-shm").exists()
+            assert (source_library / "Databases/projection.sqlite-shm").is_file()
+        return original_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(snapshot_module, "_consolidate_copied_databases", replace_staging_shm)
+    monkeypatch.setattr(snapshot_module.sqlite3, "connect", check_connection)
+    source_before = hash_tree(source_library)
+    snapshot = create_snapshot(source_library, tmp_path / "snapshot")
+    assert checked_staging
+    assert hash_tree(source_library) == source_before
+    with open_database(snapshot / "Library/Databases/projection.sqlite") as connection:
+        assert connection.execute("SELECT name FROM item").fetchone()[0] == "first"
+
+
+def test_copied_wal_checkpoint_accepts_read_only_source_files(
+    tmp_path: Path, wal_library: Path
+) -> None:
+    for path in (wal_library / "Databases").iterdir():
+        if path.is_file():
+            path.chmod(0o400)
+    source_before = hash_tree(wal_library)
+    metadata_before = {
+        path.relative_to(wal_library): snapshot_module._stat_key(path.lstat())
+        for path in wal_library.rglob("*")
+    }
+    snapshot = create_snapshot(wal_library, tmp_path / "snapshot")
+    assert hash_tree(wal_library) == source_before
+    assert {
+        path.relative_to(wal_library): snapshot_module._stat_key(path.lstat())
+        for path in wal_library.rglob("*")
+    } == metadata_before
+    copied_database = snapshot / "Library/Databases/projection.sqlite"
+    assert copied_database.stat().st_mode & 0o222 == 0
+    with open_database(copied_database) as connection:
+        assert connection.execute("SELECT name FROM item").fetchone()[0] == "first"
+
+
+@pytest.mark.parametrize(
+    ("failure", "message"),
+    [
+        ("busy", "checkpoint did not complete"),
+        ("incomplete", "checkpoint did not complete"),
+        ("not-wal", "checkpoint did not complete"),
+        ("mode", "remove copied SQLite WAL mode"),
+        ("sqlite-error", "Could not checkpoint copied SQLite database"),
+        ("leftover", "nonempty copied sidecar"),
+    ],
+)
+def test_copied_wal_checkpoint_failure_cleans_unpublished_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    wal_library: Path,
+    failure: str,
+    message: str,
+) -> None:
+    source_library = wal_library
+    source_before = hash_tree(source_library)
+    original_connect = snapshot_module.sqlite3.connect
+
+    class FaultyCheckpoint(sqlite3.Connection):
+        def execute(self, sql: str, *args: Any, **kwargs: Any) -> sqlite3.Cursor:
+            if sql == "PRAGMA main.wal_checkpoint(TRUNCATE)":
+                if failure == "sqlite-error":
+                    raise sqlite3.OperationalError("generated checkpoint error")
+                fault = {"busy": "1,3,2", "incomplete": "0,3,2", "not-wal": "0,-1,-1"}
+                if failure in fault:
+                    return super().execute(f"SELECT {fault[failure]}")
+            if sql == "PRAGMA main.journal_mode = DELETE" and failure == "mode":
+                return super().execute("SELECT 'wal'")
+            return super().execute(sql, *args, **kwargs)
+
+        def close(self) -> None:
+            super().close()
+            if failure == "leftover":
+                (tmp_path / "snapshot/Library/Databases/projection.sqlite-wal").write_bytes(
+                    b"unexpected retained WAL"
+                )
+
+    def faulty_connection(database: str, *args: Any, **kwargs: Any) -> sqlite3.Connection:
+        if "mode=rw" in str(database):
+            kwargs["factory"] = FaultyCheckpoint
+        return original_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(snapshot_module.sqlite3, "connect", faulty_connection)
+    destination = tmp_path / "snapshot"
+    with pytest.raises(GoodnotesError, match=message):
+        create_snapshot(source_library, destination)
+    assert not destination.exists()
+    assert hash_tree(source_library) == source_before
+
+
+def test_copied_wal_with_rollback_journal_keeps_backup_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, wal_library: Path
+) -> None:
+    source_library = wal_library
+    (source_library / "Databases/projection.sqlite-journal").touch()
+    source_before = hash_tree(source_library)
+
+    def no_checkpoint(database: Path) -> None:
+        raise AssertionError("A copied rollback journal must use the backup path")
+
+    monkeypatch.setattr(snapshot_module, "_checkpoint_copied_database", no_checkpoint)
+    snapshot = create_snapshot(source_library, tmp_path / "snapshot")
+    with open_database(snapshot / "Library/Databases/projection.sqlite") as connection:
+        assert connection.execute("SELECT name FROM item").fetchone()[0] == "first"
+    assert hash_tree(source_library) == source_before
+
+
+@pytest.mark.parametrize("stray_wal", [b"", b"not a valid WAL"])
+def test_delete_mode_database_with_stray_wal_keeps_backup_compatibility(
+    tmp_path: Path, stray_wal: bytes
+) -> None:
+    source_library = make_library(tmp_path / "source")
+    (source_library / "Databases/projection.sqlite-wal").write_bytes(stray_wal)
+    source_before = hash_tree(source_library)
+    metadata_before = {
+        path.relative_to(source_library): snapshot_module._stat_key(path.lstat())
+        for path in source_library.rglob("*")
+    }
+    snapshot = create_snapshot(source_library, tmp_path / "snapshot")
+    copied_database = snapshot / "Library/Databases/projection.sqlite"
+    assert not Path(f"{copied_database}-wal").exists()
+    with open_database(copied_database) as connection:
+        assert connection.execute("SELECT name FROM item").fetchone()[0] == "first"
+    assert hash_tree(source_library) == source_before
+    assert {
+        path.relative_to(source_library): snapshot_module._stat_key(path.lstat())
+        for path in source_library.rglob("*")
+    } == metadata_before
+
+
+@pytest.mark.parametrize("tail", ["torn", "reset"])
+def test_copied_wal_preserves_commits_with_unused_tail(tmp_path: Path, tail: str) -> None:
+    source_library = make_library(tmp_path / "source")
+    source_database = source_library / "Databases/projection.sqlite"
+    writer = sqlite3.connect(source_database)
+    try:
+        writer.execute("PRAGMA journal_mode=WAL")
+        writer.execute("PRAGMA wal_autocheckpoint=0")
+        writer.execute("CREATE TABLE payload (body BLOB)")
+        writer.execute("INSERT INTO payload VALUES (zeroblob(100000))")
+        writer.commit()
+        wal = Path(f"{source_database}-wal")
+        if tail == "reset":
+            previous_size = wal.stat().st_size
+            assert writer.execute("PRAGMA wal_checkpoint(RESTART)").fetchone()[0] == 0
+        writer.execute("INSERT INTO item VALUES ('committed before unused tail')")
+        writer.commit()
+        if tail == "reset":
+            assert wal.stat().st_size == previous_size
+        else:
+            with wal.open("ab") as stream:
+                stream.write(b"incomplete uncommitted frame")
+        source_before = hash_tree(source_library)
+        snapshot = create_snapshot(source_library, tmp_path / "snapshot")
+        with open_database(snapshot / "Library/Databases/projection.sqlite") as connection:
+            names = [row[0] for row in connection.execute("SELECT name FROM item ORDER BY rowid")]
+            assert names == [
+                "first",
+                "committed before unused tail",
+            ]
+            assert connection.execute("SELECT length(body) FROM payload").fetchone()[0] == 100000
+        assert hash_tree(source_library) == source_before
+    finally:
+        writer.close()
 
 
 def test_snapshot_consolidates_optional_fts_database_sidecars(tmp_path: Path) -> None:
@@ -491,6 +697,37 @@ def test_snapshot_consolidates_optional_fts_database_sidecars(tmp_path: Path) ->
             "synthetic text"
         )
     connection.close()
+
+
+def test_fts_wal_checkpoint_does_not_require_custom_virtual_table_tokenizer(
+    tmp_path: Path,
+) -> None:
+    source_library = make_library(tmp_path / "source")
+    fts_path = source_library / "Databases/fts.sqlite"
+    with closing(sqlite3.connect(fts_path)) as writer:
+        writer.execute("PRAGMA journal_mode=WAL")
+        writer.execute("PRAGMA wal_autocheckpoint=0")
+        writer.execute("CREATE TABLE text_cache (body TEXT)")
+        writer.execute("INSERT INTO text_cache VALUES ('ordinary stored row')")
+        writer.execute("PRAGMA writable_schema=ON")
+        writer.execute(
+            "INSERT INTO sqlite_master(type,name,tbl_name,rootpage,sql) "
+            "VALUES ('table','custom_fts','custom_fts',0,?)",
+            (
+                "CREATE VIRTUAL TABLE custom_fts USING "
+                "fts5(body, tokenize='unavailable_fixture_tokenizer')",
+            ),
+        )
+        writer.commit()
+        source_before = hash_tree(source_library)
+        snapshot = create_snapshot(source_library, tmp_path / "snapshot")
+        assert hash_tree(source_library) == source_before
+        with open_database(snapshot / "Library/Databases/fts.sqlite") as reader:
+            assert reader.execute("SELECT body FROM text_cache").fetchone()[0] == (
+                "ordinary stored row"
+            )
+            with pytest.raises(sqlite3.Error, match="tokenizer|vtable|module"):
+                reader.execute("SELECT * FROM custom_fts").fetchall()
 
 
 def test_snapshot_refuses_to_overwrite_existing_destination(tmp_path: Path) -> None:

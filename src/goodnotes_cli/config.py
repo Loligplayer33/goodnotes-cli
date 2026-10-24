@@ -35,6 +35,7 @@ class Settings:
     snapshot_id: str | None = None
     projection: Projection | None = None
     cache_dir: Path | None = None
+    brief: bool = False
 
     def load_sandbox(self) -> Sandbox:
         if self.sandbox is not None:

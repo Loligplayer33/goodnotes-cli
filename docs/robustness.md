@@ -12,6 +12,10 @@ Generated tests cover inventory reuse, cache metadata damage, forced refresh, so
 
 This remains a file-copy workflow, not a transaction coordinated with the Goodnotes app. A continuously changing source can make sync fail after three attempts.
 
+WAL consolidation checkpoints only an independent staging copy. The copied SHM index is discarded before opening that copy so SQLite can rebuild its index and checkpoint state. An incomplete or failed checkpoint fails capture and preserves the previous active view. Non-WAL databases and rollback-journal families use the existing backup path. Source files and completed snapshots are never opened for SQLite writes. SQLite determines the valid committed WAL prefix; successful consolidation and integrity checks do not prove that an invalid or torn tail contained no additional edits. This limitation also applies to the backup path.
+
+Generated snapshot tests cover stale SHM reconstruction, owner-read-only source files, incomplete checkpoints, failed journal-mode changes, nonempty leftover sidecars, rollback-journal fallback, stray WALs on non-WAL databases, valid commits before torn or reset WAL tails, and FTS databases whose custom tokenizer is unavailable. Source byte hashes and metadata stay unchanged; failed capture removes unpublished output. See [test_snapshot.py](../tests/test_snapshot.py).
+
 Incremental regression tests cover one changed WAL alongside a large unchanged SST, native CURRENT/manifest rollover and deletion, tampered cached bytes, mutation after reuse planning, and SQLite-family changes. Capture statistics report successful-attempt logical bytes, not physical allocation or work spent in failed attempts. See [snapshot tests](../tests/test_snapshot.py).
 
 ## Automatic refresh
@@ -89,6 +93,8 @@ See `test_register_rejects_pdf_page_count_mismatch`, `test_registered_pdf_must_m
 List and tree results return 100 items by default. `read` accepts at most 20 pages and limits combined text to 12,000 characters by default. `search` returns at most 20 short snippets. `bundle` accepts at most 10 pages and applies one 12,000-character default budget across their text. `read` and `bundle` set `truncated` when the budget cuts text.
 
 Render, export, and bundle output paths must be outside the snapshot and production Goodnotes locations. Existing files are not overwritten. A bundle is prepared in a temporary directory, then its image files and manifest are published into a newly reserved output directory. The manifest is published last. If another process creates the destination first, the CLI fails rather than replacing it.
+
+Concise responses preserve interpretation limits, with full metadata available through `--verbose` or explicit `--fields` projection. Bundle returns the same bounded text inline and in its full on-disk manifest. Generated output tests verify source labels, explicit nulls, warnings, coverage, page order, budgets, pagination, and invalid source rejection before side effects. Native workflow tests exercise default study bundles through the real optional engine with generated records. See [test_agent_output.py](../tests/test_agent_output.py) and [test_native_workflow.py](../tests/test_native_workflow.py).
 
 See `test_read_reports_budget_and_preserves_handwriting`, `test_bundle_budget_and_published_paths`, and `test_bundle_publisher_does_not_replace_racing_directory` in [test_cli.py](../tests/test_cli.py), plus `test_output_file_is_never_overwritten` and output-path checks in [test_documents.py](../tests/test_documents.py) and [test_safety.py](../tests/test_safety.py).
 

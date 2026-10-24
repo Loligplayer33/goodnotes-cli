@@ -40,11 +40,15 @@ def invoke(
     *,
     sandbox: Path | None = None,
     data_dir: Path | None = None,
+    verbose: bool = True,
 ) -> subprocess.CompletedProcess[str]:
+    """Exercise the full response contract unless a test requests concise defaults."""
     environment = dict(os.environ)
     environment.pop("GOODNOTES_SANDBOX", None)
     environment["GOODNOTES_DATA_DIR"] = str(data_dir or tmp_path / "state")
     prefix = ["--sandbox", str(sandbox)] if sandbox is not None else []
+    if verbose:
+        prefix.append("--verbose")
     return subprocess.run(
         [sys.executable, "-m", "goodnotes_cli", *prefix, *arguments],
         capture_output=True,
@@ -147,7 +151,16 @@ def test_bundle_output_permission_error_retains_operation_and_path(
     parent.chmod(0o500)
     try:
         response = invoke(
-            ["bundle", "doc-hostile", "--output", str(parent / "bundle")],
+            [
+                "bundle",
+                "doc-hostile",
+                "--layer",
+                "background",
+                "--source",
+                "all",
+                "--output",
+                str(parent / "bundle"),
+            ],
             tmp_path,
             sandbox=library_copy,
         )
@@ -345,7 +358,16 @@ def test_top_level_writers_can_project_snapshot(
     elif writer == "attach-pdf":
         arguments = ["attach-pdf", "doc-hostile", str(annotated_pdf)]
     else:
-        arguments = ["bundle", "doc-hostile", "--output", str(tmp_path / "bundle")]
+        arguments = [
+            "bundle",
+            "doc-hostile",
+            "--layer",
+            "background",
+            "--source",
+            "all",
+            "--output",
+            str(tmp_path / "bundle"),
+        ]
 
     data = successful(invoke(["--fields", "snapshot", *arguments], tmp_path, sandbox=library_copy))
 
@@ -786,7 +808,18 @@ def test_background_render_and_bundle(library_copy: Path, tmp_path: Path) -> Non
     assert image.width > 0
     bundle = successful(
         invoke(
-            ["bundle", "doc-hostile", "--pages", "1-2", "--output", str(tmp_path / "bundle")],
+            [
+                "bundle",
+                "doc-hostile",
+                "--pages",
+                "1-2",
+                "--layer",
+                "background",
+                "--source",
+                "all",
+                "--output",
+                str(tmp_path / "bundle"),
+            ],
             tmp_path,
             sandbox=library_copy,
         )
@@ -989,6 +1022,10 @@ def test_bundle_budget_and_published_paths(library_copy: Path, tmp_path: Path) -
                 "1-2",
                 "--max-chars",
                 "5",
+                "--layer",
+                "background",
+                "--source",
+                "all",
                 "--output",
                 str(tmp_path / "limited"),
             ],
@@ -1031,6 +1068,10 @@ def test_bundle_projects_top_level_fields_with_numeric_pages(
                 "pages,manifest",
                 "bundle",
                 "doc-hostile",
+                "--layer",
+                "background",
+                "--source",
+                "all",
                 "--pages",
                 "1-2",
                 "--output",

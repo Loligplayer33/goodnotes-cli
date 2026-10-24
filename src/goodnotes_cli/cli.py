@@ -27,6 +27,7 @@ from .errors import (
     TextIndexUnavailableError,
 )
 from .library import Library
+from .native import NativeError
 from .output import (
     Projection,
     bound_page_text,
@@ -134,6 +135,10 @@ def configure(
     ] = None,
     text: Annotated[bool, typer.Option("--text", help="Indent JSON for inspection.")] = False,
     json_output: Annotated[bool, typer.Option("--json", help="Compact JSON, the default.")] = False,
+    verbose: Annotated[
+        bool,
+        typer.Option("--verbose", help="Include full metadata and native format diagnostics."),
+    ] = False,
     fields: Annotated[
         str | None,
         typer.Option(
@@ -147,7 +152,14 @@ def configure(
         bool, typer.Option("--version", callback=version, is_eager=True, help="Print the version.")
     ] = False,
 ) -> None:
-    ctx.obj = Settings(sandbox, data_dir, text and not json_output, fields, expect_snapshot)
+    ctx.obj = Settings(
+        sandbox,
+        data_dir,
+        text and not json_output,
+        fields,
+        expect_snapshot,
+        brief=not verbose and fields is None,
+    )
 
 
 def settings(ctx: typer.Context) -> Settings:
@@ -562,19 +574,24 @@ def bundle(
     notebook: ItemSelector,
     output: Annotated[Path, typer.Option(help="New output directory.")],
     pages: str = "1",
-    layer: str = "background",
+    layer: str = "native",
     dpi: Annotated[int, typer.Option(min=72, max=300)] = 150,
     max_chars: Annotated[int, typer.Option(min=1, max=1000000)] = 12000,
+    source: Annotated[str, typer.Option(help="pdf, all, handwriting, or textbox text.")] = "pdf",
 ) -> None:
     """Save page images and source-labeled text.json in a new directory.
 
     Select up to 10 distinct pages with --pages, e.g. 1-3,7. One character budget
-    covers all text. --layer native reconstructs supported copied ink and reports
-    coverage; annotated requires attach-pdf. Text keeps its original source labels.
+    covers all text. Defaults to native ink images and PDF text. Native reconstruction
+    reports coverage; annotated requires attach-pdf. Text keeps its original source labels.
+    --source filters returned text only; the image still uses the selected layer.
+    Returns page evidence directly. Global --verbose includes full metadata.
 
     Example: goodnotes bundle "Course Notes" --pages 1-3 --output /tmp/course-pages
     """
 
+    if source not in {"all", "pdf", "handwriting", "textbox"}:
+        raise GoodnotesError("--source must be all, pdf, handwriting, or textbox.")
     cfg = settings(ctx)
     with repository(ctx) as lib:
         sandbox = lib.sandbox
@@ -593,7 +610,9 @@ def bundle(
                 rendered = render_page(
                     sandbox, all_pages[number - 1], temporary / filename, layer=layer, dpi=dpi
                 )
-                text = serializable(lib.read_page(notebook, number, max_chars=remaining))
+                text = serializable(
+                    lib.read_page(notebook, number, source=source, max_chars=remaining)
+                )
                 remaining -= sum(len(part["text"]) for part in text["parts"])
                 manifest.append(
                     {
@@ -604,17 +623,14 @@ def bundle(
                     }
                 )
             truncated = bound_page_text([entry["text"] for entry in manifest], max_chars)
-            (temporary / "text.json").write_text(
-                json.dumps(
-                    {
-                        "snapshot": cfg.snapshot_id,
-                        "captured_at": sandbox.captured_at,
-                        "pages": manifest,
-                        "truncated": truncated,
-                    },
-                    ensure_ascii=False,
-                )
-            )
+            text_manifest = {
+                "snapshot": cfg.snapshot_id,
+                "captured_at": sandbox.captured_at,
+                "pages": manifest,
+                "truncated": truncated,
+                "text_source": source,
+            }
+            (temporary / "text.json").write_text(json.dumps(text_manifest, ensure_ascii=False))
             publish_bundle(temporary, destination)
         except BaseException as exc:
             if temporary is not None:
@@ -624,22 +640,29 @@ def bundle(
                     destination.parent.rmdir()
                 except OSError:
                     pass
+            if isinstance(exc, NativeError):
+                exc.details["remedy"] = (
+                    f"{exc.details['remedy']} For page backgrounds without annotations, "
+                    "rerun bundle with --layer background."
+                )
             if isinstance(exc, OSError):
                 raise FilesystemAccessError.from_exception(
                     exc, operation="write_bundle_output", path=destination, kind="output"
                 ) from exc
             raise
-        emit(
-            {
-                "directory": destination,
-                "manifest": destination / "text.json",
-                "pages": selected,
-                "layer": layer,
-                "truncated": truncated,
-                "captured_at": sandbox.captured_at,
-            },
-            cfg,
-        )
+        response: dict[str, Any] = {
+            "directory": destination,
+            "manifest": destination / "text.json",
+            "pages": selected,
+            "layer": layer,
+            "truncated": truncated,
+            "captured_at": sandbox.captured_at,
+            "text_source": source,
+        }
+        response["page_evidence"] = [
+            {**entry, "image": str(destination / entry["image"])} for entry in manifest
+        ]
+        emit(response, cfg)
 
 
 def publish_bundle(temporary: Path, destination: Path) -> None:
@@ -793,7 +816,10 @@ def schema(
                     "NOTEBOOK --output FILE [--pages 1-3,7 --layer background|native|annotated]"
                 ),
                 "render": "NOTEBOOK --output PNG [--page N --layer LAYER --dpi N]",
-                "bundle": "NOTEBOOK --output DIR [--pages 1-3 --layer LAYER --dpi N --max-chars N]",
+                "bundle": (
+                    "NOTEBOOK --output DIR "
+                    "[--pages 1-3 --layer LAYER --dpi N --max-chars N --source SOURCE]"
+                ),
                 "attach-pdf": "NOTEBOOK PDF",
                 "doctor": "[--access-only --library PATH --scratch-dir PATH --output-dir PATH]",
                 "schema": "[COMMAND]",
@@ -812,6 +838,7 @@ def schema(
             ),
             "global_options": [
                 "--fields FIELDS",
+                "--verbose",
                 "--data-dir PATH",
                 "--sandbox PATH",
                 "--json",
@@ -828,6 +855,9 @@ def schema(
                 "For recent edits, sync once per request and pin its snapshot_id across reads.",
                 "Check source labels, coverage, warnings, and truncated when interpreting results.",
                 "--text indents JSON; --fields selects row fields or top-level keys.",
+                "Output keeps essential evidence by default; --verbose includes full metadata.",
+                "--fields selects from full rows or responses, overriding concise defaults.",
+                "bundle returns page evidence with native images and PDF text by default.",
                 "Source files are read-only; some commands write local copies or exports.",
             ],
             "annotations": (

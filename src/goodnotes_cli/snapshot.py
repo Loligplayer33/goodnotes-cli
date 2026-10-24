@@ -14,6 +14,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Iterable
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -406,8 +407,47 @@ def _verify_copy(destination_library: Path, entries: Iterable[_Entry]) -> None:
             raise GoodnotesError(f"Snapshot file verification failed: {target}")
 
 
+def _checkpoint_copied_database(database_path: Path) -> bool:
+    """Checkpoint unpublished staging WAL; return false for a non-WAL database."""
+
+    # A copied SHM caches another process's WAL index, checkpoint, and read marks.
+    # SQLite rebuilds it from the WAL; only this private staging file is removed.
+    try:
+        Path(f"{database_path}-shm").unlink(missing_ok=True)
+        # COW clones retain source permissions, including a read-only source
+        # copy. Only these independently owned staging files need write access.
+        for staging_file in (database_path, Path(f"{database_path}-wal")):
+            staging_file.chmod(staging_file.stat().st_mode | stat.S_IRUSR | stat.S_IWUSR)
+        uri = f"{database_path.resolve(strict=True).as_uri()}?mode=rw"
+        with closing(sqlite3.connect(uri, uri=True, isolation_level=None, timeout=0.0)) as conn:
+            if conn.execute("PRAGMA main.journal_mode").fetchone() != ("wal",):
+                return False
+            conn.execute("PRAGMA wal_autocheckpoint = 0")
+            result = conn.execute("PRAGMA main.wal_checkpoint(TRUNCATE)").fetchone()
+            if result != (0, 0, 0):
+                raise GoodnotesError(
+                    f"Copied SQLite WAL checkpoint did not complete: {database_path}"
+                )
+            mode = conn.execute("PRAGMA main.journal_mode = DELETE").fetchone()
+            if mode != ("delete",):
+                raise GoodnotesError(f"Could not remove copied SQLite WAL mode: {database_path}")
+        for suffix in _DATABASE_SIDECAR_SUFFIXES:
+            sidecar = Path(f"{database_path}{suffix}")
+            if sidecar.exists():
+                if sidecar.stat().st_size:
+                    raise GoodnotesError(
+                        f"SQLite checkpoint left a nonempty copied sidecar: {sidecar}"
+                    )
+                sidecar.unlink()
+        return True
+    except (OSError, sqlite3.Error) as exc:
+        raise GoodnotesError(
+            f"Could not checkpoint copied SQLite database: {database_path}"
+        ) from exc
+
+
 def _consolidate_copied_databases(library_copy: Path) -> None:
-    """Fold copied SQLite sidecars into copied database files only."""
+    """Fold sidecars into independent, unpublished staging database files only."""
 
     database_dir = library_copy / "Databases"
     for database_name in _DATABASE_NAMES:
@@ -417,6 +457,9 @@ def _consolidate_copied_databases(library_copy: Path) -> None:
         sidecars = [Path(f"{database_path}{suffix}") for suffix in _DATABASE_SIDECAR_SUFFIXES]
         if not any(sidecar.exists() for sidecar in sidecars):
             continue
+        if Path(f"{database_path}-wal").is_file() and not Path(f"{database_path}-journal").exists():
+            if _checkpoint_copied_database(database_path):
+                continue
 
         temporary_database = database_path.with_name(database_path.name + ".consolidated")
         temporary_sidecars = [

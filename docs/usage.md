@@ -18,7 +18,7 @@ uv run goodnotes sync --library /path/to/Library
 
 The folder must contain `Databases/` and `Attachments/`. `sync` captures changed files and reuses unchanged verified files. To rebuild even when the saved inventory appears unchanged, add `--force`.
 
-For agent conversations, sync once at the start of each request, then use its `snapshot_id` with `--expect-snapshot` across the request's reads and renders. This requires no persistent watcher. Do not refresh between commands in the same answer unless restarting against a newer generation.
+For agent conversations, sync once at the start of each request, then request a bundle. One bundle holds a single read view and needs no snapshot guard. If subsequent reads must match, use its returned `snapshot` with global `--expect-snapshot`. This requires no persistent watcher. Do not refresh between matching reads unless restarting against a newer generation.
 
 For optional continuous updates, leave this foreground command running in a separate terminal:
 
@@ -32,7 +32,7 @@ For actual pen annotations, install the optional native runtime described in [PD
 
 ```sh
 uv run goodnotes render "Notebook name" --page 3 --layer native --output /tmp/notes-page.png
-uv run goodnotes bundle "Notebook name" --pages 3 --layer native --output /tmp/notes-context
+uv run goodnotes bundle "Notebook name" --pages 3 --output /tmp/notes-context
 ```
 
 Inspect `native_annotations`, warnings, snapshot ID, and capture time before evaluating the image. Native reconstruction is approximate and reports unsupported objects; text recognition remains separate.
@@ -129,7 +129,7 @@ uv run goodnotes render "Notebook name" --page 3 --output /tmp/page-3.png
 uv run goodnotes bundle "Notebook name" --pages 1-3 --output /tmp/notebook-pages
 ```
 
-`export --pages` selects distinct one-based page numbers in the listed order, with no 20-page cap; omitting it exports all pages. These commands use the `background` layer by default. It contains each page's source attachment and does not add native Goodnotes ink. `bundle` accepts up to 10 pages and applies one character budget across their text. For annotated PDF output, follow [PDFs and handwriting](pdf-and-handwriting.md).
+`export --pages` selects distinct one-based page numbers in the listed order, with no 20-page cap; omitting it exports all pages. Standalone export/render use the `background` layer by default, which does not add native Goodnotes ink. Bundle defaults to native annotated images and PDF text, returning both directly in its response. It accepts up to 10 pages and applies one character budget across their text. Use `--source all` for all stored text sources, or `--layer background` for clean images. For native and annotated PDF output, follow [PDFs and handwriting](pdf-and-handwriting.md).
 
 Output paths must be new. The CLI does not replace an existing file or directory.
 
@@ -165,4 +165,4 @@ uv run goodnotes schema
 uv run goodnotes schema read
 ```
 
-The CLI emits JSON by default. `--text` indents that JSON; `--json` keeps it compact. Global options such as `--data-dir`, `--fields`, `--text`, and `--expect-snapshot` go before the command name. See the [agent guide](agent-guide.md) for operational guidance and the [command reference](commands.md) for all flags.
+The CLI emits concise JSON by default. Global `--verbose` includes full metadata; `--fields` projects the full field contract. `--text` indents JSON and `--json` keeps it compact. Global options go before the command name. See the [agent guide](agent-guide.md) for operational guidance and the [command reference](commands.md) for all flags.
