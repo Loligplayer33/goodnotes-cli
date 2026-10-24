@@ -21,6 +21,10 @@ git tag -a vX.Y.Z -m "Release vX.Y.Z"
 git push origin vX.Y.Z
 ```
 
-The tag starts the same CI checks. The workflow builds a source distribution and wheel, installs the wheel into a temporary environment, and runs `goodnotes schema` from outside the checkout. Only after those checks pass does it create a GitHub Release with the validated `.tar.gz` and `.whl` files attached. The release uses GitHub's generated release notes. It does not publish to PyPI.
+The tag starts the same CI checks. The workflow builds a source distribution and wheel, installs each into its own temporary environment, and runs `goodnotes schema` from outside the checkout for both installations. Only after those checks pass does it create a GitHub Release with the validated `.tar.gz` and `.whl` files attached. The release uses GitHub's generated release notes. It does not publish to PyPI.
+
+## Main branch checks
+
+Changes enter `main` through a pull request. No review approval is required, so a maintainer can merge their own pull request after CI passes. The branch requires current results for `Quality checks`, all four `Tests` jobs, and `Build and verify distributions`. The rules apply to administrators too. Force pushes and branch deletion are disabled.
 
 CI uses generated test fixtures and does not require the Goodnotes app or a real Goodnotes library.
