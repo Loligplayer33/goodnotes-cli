@@ -236,6 +236,8 @@ goodnotes doctor
 
 Reports active and deleted item counts, tree consistency issues, search-index availability, available content tables, page-metadata gaps, and warnings for the selected read view. It does not refresh the source library.
 
+`storage` contains the resolved managed `cache_dir`, selected `snapshot_path`, and `captured_at` from the snapshot marker. `cache_dir` is `null` for a caller-owned named snapshot; `captured_at` is `null` when an older marker has no capture time. The result also retains the generation ID as `snapshot`.
+
 ### schema
 
 ```text

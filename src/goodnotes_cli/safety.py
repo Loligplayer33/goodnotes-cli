@@ -76,6 +76,7 @@ class Sandbox:
     projection_path: Path
     fts_path: Path | None
     attachments_dir: Path
+    captured_at: str | None = None
 
     @classmethod
     def load(cls, path: str | Path) -> Sandbox:
@@ -101,6 +102,9 @@ class Sandbox:
             raise GoodnotesError(f"Snapshot marker is unreadable: {marker}") from exc
         if not isinstance(marker_data, dict) or marker_data.get("format_version") != 1:
             raise GoodnotesError(f"Unsupported or invalid snapshot marker: {marker}")
+        captured_at = marker_data.get("created_at_utc")
+        if captured_at is not None and not isinstance(captured_at, str):
+            raise GoodnotesError(f"Snapshot marker has an invalid capture time: {marker}")
 
         library_dir = root / "Library"
         database_dir = library_dir / "Databases"
@@ -128,6 +132,7 @@ class Sandbox:
             projection_path=projection_path,
             fts_path=fts_path if fts_path.exists() else None,
             attachments_dir=attachments_dir,
+            captured_at=captured_at,
         )
 
     def ensure_output(

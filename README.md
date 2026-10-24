@@ -72,6 +72,8 @@ You need macOS or Linux, Python 3.11 or newer, and [`uv`](https://docs.astral.sh
    uv run goodnotes --text read "Notebook name" --page 1
    ```
 
+After sync, browse and read commands need only read access to the cache. An agent can use that copy without access to the live Goodnotes library. `doctor` reports its location and capture time. See [restricted agent setup](docs/usage.md#read-access-for-an-agent) for permissions and custom cache locations.
+
 ## Working with results
 
 Commands return compact JSON by default. Put `--text` before the command to indent the JSON. Public page numbers start at 1. Search stays in the stored index; use `scan-pdfs` as a separate PDF-background check when needed.

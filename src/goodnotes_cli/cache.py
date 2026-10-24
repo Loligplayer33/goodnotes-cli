@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
-from .errors import GoodnotesError, StaleSnapshotError
+from .errors import CacheAccessError, GoodnotesError, StaleSnapshotError
 from .safety import (
     SNAPSHOT_MARKER,
     Sandbox,
@@ -106,38 +106,146 @@ def _prepare_state(data_dir: Path, source: Path | None = None) -> tuple[Path, Pa
     return state, snapshots
 
 
-@contextmanager
-def _file_lock(path: Path, *, exclusive: bool) -> Iterator[None]:
-    """Lock a persistent CLI-owned file without following a link."""
+def _lock_error(
+    path: Path,
+    operation: str,
+    message: str,
+    *,
+    exc: OSError | None = None,
+    missing_is_uninitialized: bool = False,
+    writer: bool,
+) -> CacheAccessError:
+    if exc is not None:
+        error = CacheAccessError.from_exception(
+            exc,
+            f"{message}: {path}",
+            operation=operation,
+            path=path,
+            cache_dir=path.parent,
+            missing_is_uninitialized=missing_is_uninitialized,
+            writer=writer,
+        )
+        assert error is not None
+        return error
+    return CacheAccessError(
+        "cache_invalid",
+        f"{message}: {path}",
+        operation=operation,
+        path=path,
+        cache_dir=path.parent,
+        writer=writer,
+    )
 
-    if path.is_symlink():
-        raise GoodnotesError(f"The cache lock must not be a symlink: {path}")
-    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+
+def _verify_lock_path(path: Path, opened: os.stat_result, *, operation: str) -> None:
+    try:
+        current = path.lstat()
+    except OSError as exc:
+        error = CacheAccessError.from_exception(
+            exc,
+            f"Could not verify cache lock after acquisition: {path}",
+            operation=operation,
+            path=path,
+            cache_dir=path.parent,
+            writer=operation != "read_view_lock",
+        )
+        assert error is not None
+        raise error from exc
+    if not stat.S_ISREG(current.st_mode) or (current.st_dev, current.st_ino) != (
+        opened.st_dev,
+        opened.st_ino,
+    ):
+        raise _lock_error(
+            path,
+            operation,
+            "The cache lock changed while it was being acquired",
+            writer=operation != "read_view_lock",
+        )
+
+
+@contextmanager
+def _file_lock(path: Path, *, exclusive: bool, create: bool = True) -> Iterator[None]:
+    """Lock a persistent CLI-owned file, optionally requiring an existing read-only open."""
+
+    operation = (
+        "read_view_lock"
+        if not create
+        else ("sync_lock" if path.name == _SYNC_LOCK else "sync_view_lock")
+    )
+    if not create and exclusive:
+        raise ValueError("An existing read-only cache lock can only be acquired shared.")
+
+    try:
+        before = path.lstat()
+    except FileNotFoundError as exc:
+        if not create:
+            raise _lock_error(
+                path,
+                operation,
+                "The existing cache view lock is missing",
+                exc=exc,
+                missing_is_uninitialized=True,
+                writer=False,
+            ) from exc
+        before = None
+    except OSError as exc:
+        raise _lock_error(
+            path,
+            operation,
+            "Could not inspect the cache lock",
+            exc=exc,
+            writer=create,
+        ) from exc
+    if before is not None and not stat.S_ISREG(before.st_mode):
+        raise _lock_error(
+            path,
+            operation,
+            "The cache lock must be a regular, non-symlink file",
+            writer=create,
+        )
+
+    flags = getattr(os, "O_NOFOLLOW", 0)
+    if create:
+        flags |= os.O_CREAT | os.O_RDWR
+    else:
+        # O_NONBLOCK prevents a raced replacement with a FIFO from hanging the reader.
+        flags |= os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags, 0o600)
     except OSError as exc:
-        raise GoodnotesError(f"Could not open cache lock: {path}") from exc
+        raise _lock_error(
+            path,
+            operation,
+            "Could not open the cache lock",
+            exc=exc,
+            missing_is_uninitialized=not create,
+            writer=create,
+        ) from exc
+
     try:
         opened = os.fstat(descriptor)
-        if not stat.S_ISREG(opened.st_mode):
-            raise GoodnotesError(f"The cache lock is not a regular file: {path}")
-        try:
-            current = path.lstat()
-        except OSError as exc:
-            raise GoodnotesError(f"Could not verify cache lock: {path}") from exc
-        if stat.S_ISLNK(current.st_mode) or (current.st_dev, current.st_ino) != (
-            opened.st_dev,
-            opened.st_ino,
+        if not stat.S_ISREG(opened.st_mode) or (
+            before is not None and (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino)
         ):
-            raise GoodnotesError(f"The cache lock changed while it was being opened: {path}")
+            raise _lock_error(
+                path,
+                operation,
+                "The cache lock is invalid or changed while it was being opened",
+                writer=create,
+            )
+        _verify_lock_path(path, opened, operation=operation)
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
         except OSError as exc:
-            raise GoodnotesError(f"Could not lock the CLI cache: {path}") from exc
-    except BaseException:
-        os.close(descriptor)
-        raise
-    try:
+            raise _lock_error(
+                path,
+                operation,
+                "Could not acquire the cache lock",
+                exc=exc,
+                writer=create,
+            ) from exc
+        # Recheck after flock in case the lock path changed while acquisition waited.
+        _verify_lock_path(path, opened, operation=operation)
         yield
     finally:
         os.close(descriptor)
@@ -635,7 +743,23 @@ def refresh_cache(
             f"Source Library directory does not exist: {requested_source}"
         ) from exc
     _require_directory(source, purpose="Source Library path")
-    state, snapshots = _prepare_state(Path(data_dir), source)
+    requested_data_dir = Path(data_dir).expanduser()
+    try:
+        state, snapshots = _prepare_state(requested_data_dir, source)
+    except GoodnotesError as exc:
+        error = CacheAccessError.from_exception(
+            exc,
+            str(exc),
+            operation="prepare_cache_directory",
+            path=requested_data_dir,
+            cache_dir=requested_data_dir,
+            missing_is_uninitialized=True,
+            writer=True,
+            only_if_os_error=True,
+        )
+        if error is None:
+            raise
+        raise error from exc
 
     with _file_lock(state / _SYNC_LOCK, exclusive=True):
         _validate_cache_marker(state, create=True)
@@ -769,14 +893,71 @@ def refresh_cache(
         )
 
 
+def _read_cache_state(requested: Path) -> Path:
+    if requested.is_symlink():
+        raise CacheAccessError(
+            "cache_invalid",
+            f"The CLI cache directory must not be a symlink: {requested}",
+            operation="resolve_cache_directory",
+            path=requested,
+            cache_dir=requested,
+        )
+    _require_not_production(requested.absolute(), purpose="CLI cache storage")
+    try:
+        state = requested.resolve(strict=True)
+        info = state.lstat()
+    except OSError as exc:
+        error = CacheAccessError.from_exception(
+            exc,
+            f"Could not resolve the CLI cache directory: {requested}",
+            operation="resolve_cache_directory",
+            path=requested,
+            cache_dir=requested,
+            missing_is_uninitialized=True,
+        )
+        assert error is not None
+        raise error from exc
+    if requested.is_symlink():
+        raise CacheAccessError(
+            "cache_invalid",
+            f"The CLI cache directory must not be a symlink: {requested}",
+            operation="resolve_cache_directory",
+            path=requested,
+            cache_dir=requested,
+        )
+    _require_not_production(state, purpose="CLI cache storage")
+    if not stat.S_ISDIR(info.st_mode):
+        raise CacheAccessError(
+            "cache_invalid",
+            f"The CLI cache path is not a directory: {state}",
+            operation="resolve_cache_directory",
+            path=state,
+            cache_dir=state,
+        )
+    return state
+
+
 @contextmanager
 def read_view(settings: Settings) -> Iterator[Sandbox]:
     """Resolve one snapshot under a shared lock and keep it protected through the read."""
 
+    settings.cache_dir = None
     explicit = getattr(settings, "sandbox", None)
     lock_state: Path | None = None
     if explicit is not None:
-        lock_state = _managed_state_for_explicit(Path(explicit))
+        try:
+            lock_state = _managed_state_for_explicit(Path(explicit))
+        except GoodnotesError as exc:
+            error = CacheAccessError.from_exception(
+                exc,
+                f"Could not inspect the cache for the explicit snapshot: {explicit}",
+                operation="resolve_explicit_sandbox",
+                path=Path(explicit),
+                only_if_os_error=True,
+            )
+            if error is None:
+                raise
+            raise error from exc
     else:
         configured = getattr(settings, "data_dir", None)
         state_requested = Path(configured).expanduser() if configured is not None else None
@@ -785,15 +966,9 @@ def read_view(settings: Settings) -> Iterator[Sandbox]:
             from .config import default_data_dir
 
             state_requested = default_data_dir().expanduser()
-        if state_requested.is_symlink():
-            raise GoodnotesError("The CLI cache directory must not be a symlink.")
-        _require_not_production(state_requested.resolve(strict=False), purpose="CLI cache storage")
-        if not state_requested.exists():
-            raise GoodnotesError("No local library. Run 'goodnotes sync' first.")
-        state = state_requested.resolve(strict=True)
-        _require_not_production(state, purpose="CLI cache storage")
-        _require_directory(state, purpose="CLI cache directory")
-        lock_state = state
+        lock_state = _read_cache_state(state_requested)
+    if explicit is not None and lock_state is not None:
+        lock_state = _read_cache_state(lock_state)
 
     if lock_state is None:
         sandbox = settings.load_sandbox()
@@ -807,19 +982,33 @@ def read_view(settings: Settings) -> Iterator[Sandbox]:
         return
 
     view_lock = lock_state / _VIEW_LOCK
-    if not lock_state.exists() or not lock_state.is_dir():
-        raise GoodnotesError(f"CLI cache directory does not exist: {lock_state}")
-    with _file_lock(view_lock, exclusive=False):
-        if (lock_state / "active.json").is_symlink():
-            raise GoodnotesError("The active library pointer must not be a symlink.")
+    settings.cache_dir = lock_state
+    with _file_lock(view_lock, exclusive=False, create=False):
         snapshots = lock_state / "snapshots"
-        if snapshots.is_symlink():
-            raise GoodnotesError("The snapshots directory must not be a symlink.")
-        sandbox = settings.load_sandbox()
+        try:
+            sandbox = settings.load_sandbox()
+        except CacheAccessError:
+            raise
+        except GoodnotesError as exc:
+            error = CacheAccessError.from_exception(
+                exc,
+                f"Could not resolve a valid managed cache snapshot: {exc}",
+                operation="resolve_read_view",
+                path=lock_state,
+                cache_dir=lock_state,
+            )
+            assert error is not None
+            raise error from exc
         if sandbox.root.parent != snapshots or (
             explicit is None and not _GENERATION.fullmatch(sandbox.root.name)
         ):
-            raise GoodnotesError("The resolved cache snapshot must be a direct generated child.")
+            raise CacheAccessError(
+                "cache_invalid",
+                "The resolved cache snapshot must be a direct generated child.",
+                operation="validate_active_snapshot",
+                path=sandbox.root,
+                cache_dir=lock_state,
+            )
         expected = getattr(settings, "expect_snapshot", None)
         if expected is not None and sandbox.root.name != expected:
             raise StaleSnapshotError(

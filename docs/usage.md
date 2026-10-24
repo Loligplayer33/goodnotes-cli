@@ -25,6 +25,22 @@ uv run goodnotes snapshot /path/to/Library /path/to/saved-copy
 uv run goodnotes --sandbox /path/to/saved-copy ls
 ```
 
+### Read access for an agent
+
+Install the CLI and run `sync` with a process that can read Goodnotes and write the CLI cache. An agent using the prepared copy needs read access to the installed CLI and cache. Browse commands create no cache files. Exports also need write access to their destination; `attach-pdf` needs write access to the cache's registration storage.
+
+The default cache is `~/.cache/goodnotes-cli`. To select another location, use the same `GOODNOTES_DATA_DIR` value or global `--data-dir` option for both setup and reading:
+
+```sh
+uv run goodnotes --data-dir /path/to/cli-cache sync
+.venv/bin/goodnotes --data-dir /path/to/cli-cache doctor
+.venv/bin/goodnotes --data-dir /path/to/cli-cache ls
+```
+
+The last two commands invoke the installed executable directly, so the agent does not need a package runner to update the environment. `doctor.storage` reports `cache_dir`, `snapshot_path`, and `captured_at`. Named snapshots have no managed `cache_dir`; old snapshot markers may have no capture time, reported as `null`.
+
+Grant access through your agent runner's permissions. The CLI keeps its per-user cache private and does not grant other system users access. If access fails, read the structured error's `details.path`, `operation`, and `remedy`. It distinguishes an uninitialized cache, denied access, and invalid cache state. It never switches to another directory or reads without locking. If a lock is missing, stop other CLI processes before running `sync` to repair the selected cache. Never delete or replace lock files while commands are running.
+
 ## 2. Find a notebook
 
 List items at the library root, or show folders and notebooks below it:

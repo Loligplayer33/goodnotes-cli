@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -13,6 +15,8 @@ from pathlib import Path
 import pymupdf
 import pytest
 from test_library import _create_snapshot
+
+import goodnotes_cli.cache as cache_module
 
 
 @pytest.fixture
@@ -52,6 +56,47 @@ def successful(result: subprocess.CompletedProcess[str]) -> dict:
     assert result.stderr == ""
     assert len(result.stdout.splitlines()) == 1
     return json.loads(result.stdout)
+
+
+def _tree_manifest(root: Path) -> tuple[tuple[object, ...], ...]:
+    entries: list[tuple[object, ...]] = []
+    paths = [root, *sorted(root.rglob("*"))]
+    for path in paths:
+        info = path.lstat()
+        is_file = stat.S_ISREG(info.st_mode)
+        digest = hashlib.sha256(path.read_bytes()).hexdigest() if is_file else None
+        entries.append(
+            (
+                path.relative_to(root).as_posix() if path != root else ".",
+                stat.S_IFMT(info.st_mode),
+                stat.S_IMODE(info.st_mode),
+                info.st_size,
+                info.st_mtime_ns,
+                info.st_ctime_ns,
+                digest,
+            )
+        )
+    return tuple(entries)
+
+
+def _set_tree_readonly(root: Path) -> None:
+    for path in sorted(root.rglob("*"), key=lambda item: len(item.parts), reverse=True):
+        mode = path.lstat().st_mode
+        if stat.S_ISDIR(mode):
+            path.chmod(0o555)
+        elif stat.S_ISREG(mode):
+            path.chmod(0o444)
+    root.chmod(0o555)
+
+
+def _restore_tree_writable(root: Path) -> None:
+    for path in sorted(root.rglob("*"), key=lambda item: len(item.parts), reverse=True):
+        mode = path.lstat().st_mode
+        if stat.S_ISDIR(mode):
+            path.chmod(0o700)
+        elif stat.S_ISREG(mode):
+            path.chmod(0o600)
+    root.chmod(0o700)
 
 
 def test_schema_needs_no_library(tmp_path: Path) -> None:
@@ -459,7 +504,12 @@ def test_missing_library_is_structured_stderr(tmp_path: Path) -> None:
     result = invoke(["ls"], tmp_path)
     assert result.returncode == 1
     assert result.stdout == ""
-    assert json.loads(result.stderr)["error"]["code"] == "operation_failed"
+    error = json.loads(result.stderr)["error"]
+    assert error["code"] == "cache_not_initialized"
+    details = error["details"]
+    assert {"operation", "path", "remedy"} <= details.keys()
+    assert details["path"] == str(tmp_path / "state")
+    assert "sync" in details["remedy"].casefold()
 
 
 @pytest.mark.parametrize("arguments", [["read"], ["ls", "--limit", "0"], ["unknown"]])
@@ -579,6 +629,60 @@ def test_sync_and_active_pointer_use_only_supplied_copy(library_copy: Path, tmp_
     assert Path(data["snapshot"]).is_relative_to(tmp_path / "state")
     listing = successful(invoke(["ls", "--limit", "1"], tmp_path))
     assert listing["items"]
+
+
+def test_managed_read_commands_work_with_a_readonly_cache(
+    library_copy: Path, tmp_path: Path
+) -> None:
+    state = tmp_path / "state"
+    captured = cache_module.refresh_cache(library_copy / "Library", state)
+    assert captured["captured_at"] is not None
+    source_before = _tree_manifest(library_copy)
+    export_path = tmp_path / "outside-cache.pdf"
+    commands = [
+        ["ls", "--limit", "1"],
+        ["tree", "--depth", "2"],
+        ["info", "doc-hostile"],
+        ["pages", "doc-hostile", "--with-recognition"],
+        ["read", "doc-hostile", "--page", "1", "--source", "handwriting"],
+        ["search", "generated query", "--notebook", "doc-hostile"],
+        ["scan-pdfs", "Synthetic PDF page", "--notebook", "doc-hostile", "--page-limit", "1"],
+        ["doctor"],
+        ["export", "doc-hostile", "--pages", "1", "--output", str(export_path)],
+    ]
+
+    try:
+        _set_tree_readonly(state)
+        if hasattr(os, "geteuid") and os.geteuid() != 0:
+            try:
+                writable_lock = os.open(state / cache_module._VIEW_LOCK, os.O_RDWR)
+            except PermissionError:
+                pass
+            else:
+                os.close(writable_lock)
+                pytest.fail("read-only fixture unexpectedly allowed a writable lock open")
+        cache_before = _tree_manifest(state)
+        doctor_result: dict | None = None
+        for arguments in commands:
+            result = invoke(arguments, tmp_path)
+            assert result.returncode == 0, f"{arguments}: {result.stderr}"
+            assert result.stderr == ""
+            assert len(result.stdout.splitlines()) == 1
+            data = json.loads(result.stdout)
+            if arguments[0] == "doctor":
+                doctor_result = data
+
+        assert doctor_result is not None
+        storage = doctor_result["storage"]
+        assert storage["cache_dir"] == str(state.resolve())
+        assert storage["snapshot_path"] == captured["snapshot"]
+        assert storage["captured_at"] == captured["captured_at"]
+        assert export_path.is_file()
+        assert export_path.parent == tmp_path
+        assert _tree_manifest(state) == cache_before
+        assert _tree_manifest(library_copy) == source_before
+    finally:
+        _restore_tree_writable(state)
 
 
 def test_bundle_budget_and_published_paths(library_copy: Path, tmp_path: Path) -> None:

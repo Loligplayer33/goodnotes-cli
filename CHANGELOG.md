@@ -11,6 +11,8 @@ Notable changes to the project are recorded here. Versions follow Semantic Versi
 
 ### Changed
 
+- Browse and read commands open the initialized cache lock read-only. Sync owns lock creation, so restricted agents need no cache write access to read notes.
+- `doctor` includes the selected cache directory, snapshot path, and capture time. Cache setup, permission, and validation errors include a specific path and remedy.
 - Reorganized the README around capabilities, setup, and a complete command index, with separate task and command references.
 - Added examples and usage limits to built-in command help. `schema COMMAND` now returns registered argument and option metadata without loading notes.
 - Updated task guidance for scoped search, explicit PDF-background scans, recognition status, and selected-page export.
