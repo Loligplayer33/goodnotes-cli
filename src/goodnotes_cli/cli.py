@@ -8,7 +8,7 @@ import shutil
 import sqlite3
 import tempfile
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from functools import wraps
 from pathlib import Path
 from typing import Annotated, Any, cast
@@ -20,7 +20,7 @@ from . import __version__
 from .cache import read_view, refresh_cache
 from .config import Settings, default_data_dir, default_library
 from .documents import export_pdf, register_annotated_pdf, render_page
-from .errors import GoodnotesError, TextIndexUnavailableError
+from .errors import CacheAccessError, GoodnotesError, TextIndexUnavailableError
 from .library import Library
 from .output import (
     Projection,
@@ -153,7 +153,17 @@ def repository(ctx: typer.Context) -> Iterator[Library]:
     cfg = settings(ctx)
     with read_view(cfg) as sandbox:
         cfg.snapshot_id = sandbox.root.name
-        with Library(sandbox) as lib:
+        with ExitStack() as stack:
+            try:
+                lib = stack.enter_context(Library(sandbox))
+            except sqlite3.Error as exc:
+                raise CacheAccessError(
+                    "cache_invalid",
+                    f"Could not read the copied library catalog: {sandbox.projection_path}",
+                    operation="read_snapshot_catalog",
+                    path=sandbox.projection_path,
+                    cache_dir=cfg.cache_dir,
+                ) from exc
             yield lib
 
 

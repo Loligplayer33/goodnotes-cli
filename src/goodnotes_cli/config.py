@@ -56,16 +56,14 @@ class Settings:
                 raise ValueError("not a regular file")
             contents = pointer.read_text(encoding="utf-8")
         except OSError as exc:
-            error = CacheAccessError.from_exception(
+            raise CacheAccessError.from_exception(
                 exc,
                 f"Could not read the active library pointer: {pointer}",
                 operation="read_active_pointer",
                 path=pointer,
                 cache_dir=pointer.parent,
                 missing_is_uninitialized=True,
-            )
-            assert error is not None
-            raise error from exc
+            ) from exc
         except ValueError as exc:
             raise invalid_pointer() from exc
         try:

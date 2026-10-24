@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
-from .errors import CacheAccessError, GoodnotesError, StaleSnapshotError
+from .errors import CacheAccessError, GoodnotesError, StaleSnapshotError, _os_cause
 from .safety import (
     SNAPSHOT_MARKER,
     Sandbox,
@@ -116,7 +116,7 @@ def _lock_error(
     writer: bool,
 ) -> CacheAccessError:
     if exc is not None:
-        error = CacheAccessError.from_exception(
+        return CacheAccessError.from_exception(
             exc,
             f"{message}: {path}",
             operation=operation,
@@ -125,8 +125,6 @@ def _lock_error(
             missing_is_uninitialized=missing_is_uninitialized,
             writer=writer,
         )
-        assert error is not None
-        return error
     return CacheAccessError(
         "cache_invalid",
         f"{message}: {path}",
@@ -141,16 +139,14 @@ def _verify_lock_path(path: Path, opened: os.stat_result, *, operation: str) -> 
     try:
         current = path.lstat()
     except OSError as exc:
-        error = CacheAccessError.from_exception(
+        raise CacheAccessError.from_exception(
             exc,
             f"Could not verify cache lock after acquisition: {path}",
             operation=operation,
             path=path,
             cache_dir=path.parent,
             writer=operation != "read_view_lock",
-        )
-        assert error is not None
-        raise error from exc
+        ) from exc
     if not stat.S_ISREG(current.st_mode) or (current.st_dev, current.st_ino) != (
         opened.st_dev,
         opened.st_ino,
@@ -747,7 +743,9 @@ def refresh_cache(
     try:
         state, snapshots = _prepare_state(requested_data_dir, source)
     except GoodnotesError as exc:
-        error = CacheAccessError.from_exception(
+        if _os_cause(exc) is None:
+            raise
+        raise CacheAccessError.from_exception(
             exc,
             str(exc),
             operation="prepare_cache_directory",
@@ -755,11 +753,7 @@ def refresh_cache(
             cache_dir=requested_data_dir,
             missing_is_uninitialized=True,
             writer=True,
-            only_if_os_error=True,
-        )
-        if error is None:
-            raise
-        raise error from exc
+        ) from exc
 
     with _file_lock(state / _SYNC_LOCK, exclusive=True):
         _validate_cache_marker(state, create=True)
@@ -907,16 +901,14 @@ def _read_cache_state(requested: Path) -> Path:
         state = requested.resolve(strict=True)
         info = state.lstat()
     except OSError as exc:
-        error = CacheAccessError.from_exception(
+        raise CacheAccessError.from_exception(
             exc,
             f"Could not resolve the CLI cache directory: {requested}",
             operation="resolve_cache_directory",
             path=requested,
             cache_dir=requested,
             missing_is_uninitialized=True,
-        )
-        assert error is not None
-        raise error from exc
+        ) from exc
     if requested.is_symlink():
         raise CacheAccessError(
             "cache_invalid",
@@ -947,17 +939,15 @@ def read_view(settings: Settings) -> Iterator[Sandbox]:
     if explicit is not None:
         try:
             lock_state = _managed_state_for_explicit(Path(explicit))
-        except GoodnotesError as exc:
-            error = CacheAccessError.from_exception(
+        except (GoodnotesError, OSError) as exc:
+            if _os_cause(exc) is None:
+                raise
+            raise CacheAccessError.from_exception(
                 exc,
                 f"Could not inspect the cache for the explicit snapshot: {explicit}",
                 operation="resolve_explicit_sandbox",
                 path=Path(explicit),
-                only_if_os_error=True,
-            )
-            if error is None:
-                raise
-            raise error from exc
+            ) from exc
     else:
         configured = getattr(settings, "data_dir", None)
         state_requested = Path(configured).expanduser() if configured is not None else None
@@ -989,16 +979,14 @@ def read_view(settings: Settings) -> Iterator[Sandbox]:
             sandbox = settings.load_sandbox()
         except CacheAccessError:
             raise
-        except GoodnotesError as exc:
-            error = CacheAccessError.from_exception(
+        except (GoodnotesError, OSError) as exc:
+            raise CacheAccessError.from_exception(
                 exc,
                 f"Could not resolve a valid managed cache snapshot: {exc}",
                 operation="resolve_read_view",
                 path=lock_state,
                 cache_dir=lock_state,
-            )
-            assert error is not None
-            raise error from exc
+            ) from exc
         if sandbox.root.parent != snapshots or (
             explicit is None and not _GENERATION.fullmatch(sandbox.root.name)
         ):

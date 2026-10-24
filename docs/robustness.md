@@ -28,6 +28,8 @@ Readers reject missing locks, denied access, symlinks, and non-regular lock file
 
 Cache access errors include a stable code and `details` with `operation`, `path`, and `remedy`. `cache_not_initialized` means setup or a required lock is missing, `cache_permission_denied` means the runner lacks access, and `cache_invalid` means the selected cache state failed validation. The CLI does not bypass locking or choose a different cache. Use the same `--data-dir` or `GOODNOTES_DATA_DIR` setting for setup and reading. See [agent setup](usage.md#read-access-for-an-agent).
 
+Generated tests exercise cache and source bytes and metadata before and after read-only commands, denied pointer and database access, malformed catalogs, missing-lock repair, unsafe lock files, replacement during acquisition, and interruption. The existing reader-versus-refresh tests also run through the read-only shared lock and ensure publication and pruning wait for readers. See [cache tests](../tests/test_cache.py) and [installed CLI tests](../tests/test_cli.py). Permission-mode assertions run as an ordinary user on macOS and Linux; root bypasses those permissions, so those denial cases skip when tests run as root.
+
 ## Interrupted refreshes and failed validation
 
 Refreshes capture into a staging directory and publish only after full validation. Ctrl-C removes the partial staging directory and leaves the prior active pointer unchanged. If the process is killed before cleanup, the next sync removes abandoned staging directories. A failed capture also preserves the previous active view. The tests simulate an interrupted capture and an abandoned staging directory; they do not send an operating-system SIGKILL to the process.

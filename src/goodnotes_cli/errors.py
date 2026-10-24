@@ -18,6 +18,15 @@ CacheAccessCode = Literal[
 ]
 
 
+def _os_cause(exc: BaseException) -> OSError | None:
+    """Return the underlying filesystem error from one existing exception chain."""
+
+    cause: BaseException | None = exc
+    while cause is not None and not isinstance(cause, OSError):
+        cause = cause.__cause__
+    return cause
+
+
 class CacheAccessError(GoodnotesError):
     """A cache access failure with structured operation and recovery context."""
 
@@ -84,16 +93,10 @@ class CacheAccessError(GoodnotesError):
         cache_dir: str | Path | None = None,
         missing_is_uninitialized: bool = False,
         writer: bool = False,
-        only_if_os_error: bool = False,
-    ) -> CacheAccessError | None:
-        """Classify one bounded cache setup/lock/pointer failure and its cause chain."""
+    ) -> CacheAccessError:
+        """Classify one cache setup, lock, or pointer failure and its cause chain."""
 
-        cause: BaseException | None = exc
-        while cause is not None and not isinstance(cause, OSError):
-            cause = cause.__cause__
-        os_error = cause
-        if os_error is None and only_if_os_error:
-            return None
+        os_error = _os_cause(exc)
         if isinstance(os_error, PermissionError):
             code: CacheAccessCode = "cache_permission_denied"
         elif isinstance(os_error, FileNotFoundError) and missing_is_uninitialized:

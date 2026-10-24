@@ -685,6 +685,86 @@ def test_managed_read_commands_work_with_a_readonly_cache(
         _restore_tree_writable(state)
 
 
+@pytest.mark.parametrize(
+    ("target_name", "expected_operation"),
+    [
+        ("projection.sqlite", "open_snapshot_database"),
+        ("fts.sqlite", "open_snapshot_database"),
+        ("snapshot-root", "resolve_read_view"),
+    ],
+)
+def test_unreadable_managed_database_has_structured_permission_error(
+    library_copy: Path, tmp_path: Path, target_name: str, expected_operation: str
+) -> None:
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        pytest.skip("chmod-based unreadable-file checks require a non-root process")
+
+    state = tmp_path / "state"
+    result = cache_module.refresh_cache(library_copy / "Library", state)
+    snapshot_root = Path(str(result["snapshot"]))
+    database_path = snapshot_root / "Library" / "Databases" / target_name
+    permission_target = snapshot_root if target_name == "snapshot-root" else database_path
+    expected_path = (
+        snapshot_root / "goodnotes-snapshot.json"
+        if target_name == "snapshot-root"
+        else database_path
+    )
+    if target_name != "snapshot-root":
+        assert database_path.is_file()
+    lock_fd = os.open(state / cache_module._VIEW_LOCK, os.O_RDONLY)
+    os.close(lock_fd)
+    source_before = _tree_manifest(library_copy)
+    pointer_before = (state / "active.json").read_bytes()
+    database_before = hashlib.sha256(
+        (snapshot_root / "Library" / "Databases" / "projection.sqlite").read_bytes()
+    ).hexdigest()
+    original_mode = stat.S_IMODE(permission_target.stat().st_mode)
+
+    try:
+        permission_target.chmod(0)
+        response = invoke(["doctor"], tmp_path)
+        assert response.returncode == 1
+        assert response.stdout == ""
+        error = json.loads(response.stderr)["error"]
+        assert error["code"] == "cache_permission_denied"
+        details = error["details"]
+        assert details["path"] == str(expected_path)
+        assert details["operation"] == expected_operation
+        assert {"operation", "path", "remedy"} <= details.keys()
+    finally:
+        permission_target.chmod(original_mode)
+
+    projection_path = snapshot_root / "Library" / "Databases" / "projection.sqlite"
+    assert hashlib.sha256(projection_path.read_bytes()).hexdigest() == database_before
+    assert (state / "active.json").read_bytes() == pointer_before
+    assert _tree_manifest(library_copy) == source_before
+
+
+def test_corrupt_managed_projection_has_structured_cache_error(
+    library_copy: Path, tmp_path: Path
+) -> None:
+    state = tmp_path / "state"
+    result = cache_module.refresh_cache(library_copy / "Library", state)
+    database_path = Path(str(result["snapshot"])) / "Library" / "Databases" / "projection.sqlite"
+    database_path.chmod(0o600)
+    database_path.write_bytes(b"generated invalid SQLite bytes")
+    source_before = _tree_manifest(library_copy)
+    pointer_before = (state / "active.json").read_bytes()
+
+    response = invoke(["doctor"], tmp_path)
+
+    assert response.returncode == 1
+    assert response.stdout == ""
+    error = json.loads(response.stderr)["error"]
+    assert error["code"] == "cache_invalid"
+    details = error["details"]
+    assert details["path"] == str(database_path)
+    assert details["operation"] == "read_snapshot_catalog"
+    assert {"operation", "path", "remedy"} <= details.keys()
+    assert (state / "active.json").read_bytes() == pointer_before
+    assert _tree_manifest(library_copy) == source_before
+
+
 def test_bundle_budget_and_published_paths(library_copy: Path, tmp_path: Path) -> None:
     data = successful(
         invoke(
