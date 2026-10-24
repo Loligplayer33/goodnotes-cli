@@ -34,7 +34,9 @@ def emit(value: Any, settings: Settings) -> None:
             raise GoodnotesError("--fields must contain at least one field name.")
         if isinstance(result, dict):
             for key in ("items", "pages", "hits"):
-                if isinstance(result.get(key), list):
+                if isinstance(result.get(key), list) and all(
+                    isinstance(row, dict) for row in result[key]
+                ):
                     for row in result[key]:
                         unknown = set(fields) - row.keys()
                         if unknown:

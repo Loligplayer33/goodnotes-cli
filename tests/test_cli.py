@@ -60,6 +60,76 @@ def test_schema_needs_no_library(tmp_path: Path) -> None:
     assert data["limits"]["read_pages"] == 20
 
 
+def test_schema_covers_every_registered_command(tmp_path: Path) -> None:
+    from typer.core import TyperGroup
+    from typer.main import get_command
+
+    from goodnotes_cli.cli import app
+
+    data = successful(invoke(["schema"], tmp_path))
+    group = get_command(app)
+    assert isinstance(group, TyperGroup)
+    assert set(data["commands"]) == set(group.commands)
+    assert "--version" in data["global_options"]
+    assert "--help" in data["global_options"]
+    assert not (tmp_path / "state").exists()
+
+
+@pytest.mark.parametrize(
+    "command_name",
+    [
+        "sync",
+        "snapshot",
+        "ls",
+        "tree",
+        "info",
+        "pages",
+        "read",
+        "search",
+        "scan-pdfs",
+        "export",
+        "render",
+        "attach-pdf",
+        "bundle",
+        "doctor",
+        "schema",
+    ],
+)
+def test_targeted_schema_and_help_need_no_library(command_name: str, tmp_path: Path) -> None:
+    data = successful(invoke(["schema", command_name], tmp_path))
+    assert data["command"] == command_name
+    assert any("--help" in p["flags"] for p in data["options"])
+    assert any(p.get("envvar") == "GOODNOTES_DATA_DIR" for p in data["global_options"])
+    help_result = invoke([command_name, "--help"], tmp_path)
+    assert help_result.returncode == 0
+    assert "Example:" in help_result.stdout
+    assert not (tmp_path / "state").exists()
+
+
+def test_targeted_schema_describes_actual_bounds_and_parameter_kinds(tmp_path: Path) -> None:
+    read = successful(invoke(["schema", "read"], tmp_path))
+    budget = next(p for p in read["options"] if p["name"] == "max_chars")
+    assert (budget["default"], budget["min"], budget["max"]) == (12000, 1, 1000000)
+    assert read["arguments"][0]["name"] == "notebook"
+    listing = successful(invoke(["schema", "ls"], tmp_path))
+    assert listing["arguments"] == []
+    folder = next(p for p in listing["options"] if p["name"] == "folder")
+    assert folder["flags"] == ["--folder"]
+    assert folder["default"] == "/"
+    capture = successful(invoke(["schema", "snapshot"], tmp_path))
+    assert [p["name"] for p in capture["arguments"]] == ["library", "destination"]
+    sync = successful(invoke(["schema", "sync"], tmp_path))
+    force = next(p for p in sync["options"] if p["name"] == "force")
+    assert force["flags"] == ["--force", "--no-force"]
+
+
+def test_unknown_schema_target_is_structured_argument_error(tmp_path: Path) -> None:
+    result = invoke(["schema", "missing"], tmp_path)
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert json.loads(result.stderr)["error"]["code"] == "invalid_arguments"
+
+
 def test_missing_library_is_structured_stderr(tmp_path: Path) -> None:
     result = invoke(["ls"], tmp_path)
     assert result.returncode == 1
@@ -226,6 +296,30 @@ def test_bundle_publisher_does_not_replace_racing_directory(tmp_path: Path) -> N
         publish_bundle(temporary, destination)
     assert destination.stat().st_ino == original_inode
     assert not list(destination.iterdir())
+
+
+def test_bundle_projects_top_level_fields_with_numeric_pages(
+    library_copy: Path, tmp_path: Path
+) -> None:
+    data = successful(
+        invoke(
+            [
+                "--fields",
+                "pages,manifest",
+                "bundle",
+                "doc-hostile",
+                "--pages",
+                "1-2",
+                "--output",
+                str(tmp_path / "projected-bundle"),
+            ],
+            tmp_path,
+            sandbox=library_copy,
+        )
+    )
+    assert set(data) == {"pages", "manifest", "snapshot"}
+    assert data["pages"] == [1, 2]
+    assert Path(data["manifest"]).is_file()
 
 
 def test_failed_refresh_preserves_active_view(library_copy: Path, tmp_path: Path) -> None:

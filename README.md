@@ -1,94 +1,97 @@
 # Goodnotes CLI
 
-A local, read-only command line tool for browsing a Goodnotes library. On macOS, `sync` discovers Goodnotes' local library and copies its files into the CLI cache. Other commands read the active copy to list notebooks, inspect pages, search stored text, and work with PDF pages. The CLI does not modify Goodnotes or its source library.
+Goodnotes CLI lets you browse, search, read, and export a local Goodnotes library from the command line. It reads a managed copy of the library and does not edit Goodnotes or its source files.
 
-The project requires Python 3.11 or newer. It uses Typer for commands, PyMuPDF for PDF work, Python's standard SQLite support for library data, and `uv` to manage dependencies in the project `.venv`.
+Live library discovery is for macOS. On other systems, point `sync --library` at an available copy of a Goodnotes `Library` folder that contains `Databases/` and `Attachments/`.
 
-## Install
+## What it can do
 
-From the repository directory, run:
+| Task | Support | Limit |
+| --- | --- | --- |
+| Browse notebooks and pages | Yes | Reads the last synced copy. Run `sync` again after Goodnotes changes the library. |
+| Search and read text | Yes | `read` returns PDF text, stored handwriting recognition candidates, and typed text. `search` checks indexed text from these sources when available. The CLI does not OCR images or render native ink. |
+| View and export page backgrounds | Yes | Uses each page's PDF or image background. Native Goodnotes ink is not included. |
+| View and export annotations | With a supplied PDF | You must export and register a PDF from Goodnotes. The CLI cannot verify that it includes annotations or that its page order matches. |
+| Edit Goodnotes notebooks | No | The CLI does not write to the Goodnotes library. |
 
-```sh
-uv sync
-uv run goodnotes --help
-```
+## On this page
 
-`uv sync` creates the project environment. Run project commands through `uv run`; there is no global install step.
+- [Commands](#commands)
+- [Quickstart](#quickstart)
+- [Working with results](#working-with-results)
+- [Documentation](#documentation)
 
-## Sync Goodnotes
+## Commands
 
-After installing the project, create or refresh the CLI's local copy:
+The complete option reference is in [Command reference](docs/commands.md). Each command also has built-in `--help`.
 
-```sh
-uv run goodnotes sync
-uv run goodnotes ls
-```
+| Group | Command | Purpose |
+| --- | --- | --- |
+| Setup | [`sync`](docs/commands.md#sync) | Create or refresh the managed copy. |
+| Setup | [`snapshot`](docs/commands.md#snapshot) | Save a separate copy of a Library folder. |
+| Setup | [`doctor`](docs/commands.md#doctor) | Check the current copy and available text sources. |
+| Setup | [`schema`](docs/commands.md#schema) | Print the machine-readable command contract without loading notes. |
+| Browse | [`ls`](docs/commands.md#ls) | List a folder's direct children. |
+| Browse | [`tree`](docs/commands.md#tree) | List folders and notebooks below a folder. |
+| Browse | [`info`](docs/commands.md#info) | Resolve a notebook name, path, or ID. |
+| Browse | [`pages`](docs/commands.md#pages) | List pages in their current notebook order. |
+| Read | [`read`](docs/commands.md#read) | Read text for one or more pages. |
+| Read | [`search`](docs/commands.md#search) | Find text in the stored search index. |
+| Read | [`scan-pdfs`](docs/commands.md#scan-pdfs) | Search PDF backgrounds when the index misses text. |
+| Export | [`export`](docs/commands.md#export) | Export notebook pages to a PDF. |
+| Export | [`render`](docs/commands.md#render) | Save one page as a PNG image. |
+| Export | [`bundle`](docs/commands.md#bundle) | Save page images with their text data. |
+| Export | [`attach-pdf`](docs/commands.md#attach-pdf) | Register a Goodnotes-exported PDF for annotated output. |
 
-`sync` discovers the macOS Goodnotes library, checks its file inventory and active cache metadata, and reuses the current copy when both match. If either changed, it makes an independent copy, validates it, and updates the CLI's active cache. On supported APFS volumes, copy-on-write clones reduce copying; other filesystems use ordinary independent copies. The CLI reads source files but never opens source SQLite databases or controls the Goodnotes app. Other commands use only copied databases in read-only mode. Run `sync` after Goodnotes changes the library to refresh the CLI's view. There is no background refresh.
+## Quickstart
 
-Use `uv run goodnotes sync --force` to rebuild and verify a fresh copy even when the metadata checks match. If the source changes during a capture attempt, `sync` retries and keeps the previous view if capture cannot succeed. `source_changed_during_refresh` compares source inventories taken before and after capture, including retries; when true, `sync` publishes the validated view with `captured_at` and a warning that it is valid as of that time. `false` means those inventories matched, not that the source stayed unchanged through return. Updates after the final check, including while waiting to publish, are detected by the next `sync`.
+You need Python 3.11 or newer and [`uv`](https://docs.astral.sh/uv/). From a terminal:
 
-The default cache is `~/.cache/goodnotes-cli`, based on `XDG_CACHE_HOME`. Set `GOODNOTES_DATA_DIR` or pass the global `--data-dir` option to choose another cache location. To select a library directory explicitly, pass `--library` to `sync`; it must contain `Databases/` and `Attachments/`:
+1. Clone the repository if you do not already have a checkout, then enter it:
 
-```sh
-uv run goodnotes --data-dir /path/to/cli-cache sync --library /path/to/Library
-```
+   ```sh
+   git clone https://github.com/Loligplayer33/goodnotes-cli.git
+   cd goodnotes-cli
+   ```
 
-## Browse and search
+2. Install the project environment:
 
-Once synced, commands use the active cache without a sandbox option. Pass a library notebook name or path where the command expects `NOTEBOOK`:
+   ```sh
+   uv sync
+   ```
 
-```sh
-uv run goodnotes doctor
-uv run goodnotes --text ls --limit 100
-uv run goodnotes tree --depth 2
-uv run goodnotes pages "Course Notes"
-uv run goodnotes read "Course Notes" --page 14
-uv run goodnotes read "Course Notes" --pages 1-4 --source handwriting --max-chars 12000
-uv run goodnotes search "lecture" --source all
-uv run goodnotes scan-pdfs "lecture" --folder "Course" --page-limit 200 --limit 20
-uv run goodnotes --fields name,path ls
-```
+3. Create or refresh the local read view. On macOS, the CLI finds the Goodnotes library automatically:
 
-Commands return compact JSON by default. Add the global `--text` option before the command to indent JSON for inspection. `--json` explicitly selects compact JSON. Global options such as `--data-dir`, `--fields`, `--text`, and `--expect-snapshot` go before the command name. List and tree results are bounded to 100 items by default. Use `--limit` and `--offset` to page through larger results. `--fields name,path` selects fields in list, page, and search result rows. Search performs literal, case-insensitive substring matching and returns up to 20 snippets by default. It reports `coverage: stored-index` and warnings when an indexed text source or page mapping is missing.
+   ```sh
+   uv run goodnotes sync
+   ```
 
-Browse results include the active snapshot ID as `snapshot`. Pass it back with the global `--expect-snapshot` option on later paginated requests. If a sync has published a different snapshot, the CLI returns a `stale_snapshot` error so you can restart pagination against one consistent view:
+   On another system, give `sync` the path to an available library copy:
 
-```sh
-uv run goodnotes --expect-snapshot SNAPSHOT_ID ls --limit 100 --offset 100
-```
+   ```sh
+   uv run goodnotes sync --library /path/to/Library
+   ```
 
-If indexed search misses text that is present in a copied PDF background, use `scan-pdfs`. It scans up to 200 pages by default, accepts `--page-limit` up to 250, and returns `next_page_offset` when more pages remain. Pass that value to `--page-offset` to continue. PDF scanning does not search handwriting or the stored index.
+4. List notebooks and read a page. Replace the example name with a notebook name from your library:
 
-Public page numbers start at 1. `read` defaults to page 1, accepts up to 20 requested pages per call, and caps total text at 12,000 characters by default. Set `--max-chars` to choose another cap. The result marks truncated content. `schema` prints the command contract without reading notebook data.
+   ```sh
+   uv run goodnotes --text ls
+   uv run goodnotes --text read "Notebook name" --page 1
+   ```
 
-Indented JSON keeps source labels so a reader can distinguish PDF text, stored handwriting recognition candidates, and typed text boxes. `read` uses indexed PDF text when available. If it is absent, it extracts text from the matching PDF background in the copied library. These routes do not decode native annotations; text flattened into an imported PDF may still be extracted. Image-only writing does not produce PDF text. Recognition candidates do not reproduce handwritten ink visually.
+## Working with results
 
-## Export and render
+Commands return compact JSON by default. Put `--text` before the command to indent the JSON for inspection. `--text` changes the formatting, not the kind of output. Public page numbers start at 1.
 
-The `background` layer follows each page's source attachment in the notebook's current order:
+For task workflows, see [Usage guide](docs/usage.md). For command options and limits, see [Command reference](docs/commands.md). Agents can use `uv run goodnotes schema` for the concise command contract; [Agent guide](docs/agent-guide.md) covers agent workflows and output handling.
 
-```sh
-uv run goodnotes export "Course Notes" --output /tmp/course.pdf --layer background
-uv run goodnotes render "Course Notes" --page 14 --output /tmp/page.png --layer background
-uv run goodnotes bundle "Course Notes" --pages 1-4 --max-chars 12000 --output /tmp/course-pages --layer background
-uv run goodnotes attach-pdf "Course Notes" /path/to/course-annotated.pdf
-uv run goodnotes export "Course Notes" --output /tmp/course-annotated.pdf --layer annotated
-```
+## Documentation
 
-`bundle` writes up to 10 page images and source-labeled text in `text.json`. Its 12,000-character default budget covers text across all selected pages; `--max-chars` changes the budget, and the result reports whether text was truncated. The `background` layer exports each page's available PDF background in notebook order. It does not overlay native Goodnotes ink. Marks already flattened into a source PDF remain part of that background.
-
-The CLI does not decode native Goodnotes ink. For an annotated layer, first export the notebook as a PDF from Goodnotes with both **Include Annotation** and **Include Page Background** enabled, then register that PDF with `attach-pdf`. Registration checks the PDF and page count, but cannot verify that annotations were included or that the PDF page order matches the notebook. Annotated render and export results report `includes_handwriting: null` and `annotation_status: user-provided-unverified`; they do not claim that ink is present. The CLI stores the PDF path and checks the file before use, so keep the PDF at that path and do not modify it after registration.
-
-Run `uv run goodnotes --help` or a subcommand's `--help` for all current options.
-
-Refreshes publish a new read view only after validation. A command keeps using the view it opened, even while a refresh copies changed files. The final pointer update and cleanup wait for current readers to finish. The managed cache keeps the active generation; named snapshots made with `snapshot LIBRARY DESTINATION` remain at the requested destination when stored outside the managed cache.
-
-## Project notes
-
-- [Architecture](docs/architecture.md) describes package boundaries and the cache safety rules.
-- [Agent guide](docs/agent-guide.md) covers safe development and private data handling.
-- [PDF and handwriting](docs/pdf-and-handwriting.md) explains background exports and annotated-PDF limits.
-- [Robustness](docs/robustness.md) maps concurrent updates, incomplete data, and output safeguards to their documented behavior.
-- [Contributing](CONTRIBUTING.md) lists setup and local checks.
+- [Usage guide](docs/usage.md) walks through sync, browsing, reading, search, and export tasks.
+- [Command reference](docs/commands.md) lists every command's arguments, options, and output notes.
+- [PDFs and handwriting](docs/pdf-and-handwriting.md) explains page backgrounds, native ink, and registered PDF exports.
+- [Agent guide](docs/agent-guide.md) covers agent workflows and output handling.
+- [Architecture](docs/architecture.md) describes how the local read view is built.
+- [Robustness](docs/robustness.md) records concurrent updates, incomplete data, and output safeguards.
+- [Contributing](CONTRIBUTING.md) lists development setup and local checks.
 - [Releases](docs/releases.md) describes the tagged release process.

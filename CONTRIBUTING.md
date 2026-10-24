@@ -1,10 +1,10 @@
 # Contributing
 
-Contributions should preserve the CLI's read-only boundary. `sync` may read Goodnotes files to create a verified local copy. Other commands read the active copy. Do not include real Goodnotes data in a patch.
+Contributions should preserve the CLI's read-only access to Goodnotes source files. `sync` reads source files to create or refresh a local copy. Other commands read the validated copy; commands that create PDFs, images, bundles, snapshots, or annotated-PDF registrations write to new CLI-owned paths. Do not include real notebook names, IDs, library paths, email addresses, or extracted note text in code, tests, logs, issues, or documentation.
 
-## Set up the project
+## Set up
 
-Install `uv`, then run the following from the repository root. `uv sync` creates and uses the project `.venv`.
+Install `uv`, then run these commands from the repository root. They create and use the project `.venv`:
 
 ```sh
 uv sync
@@ -12,13 +12,25 @@ uv run goodnotes --help
 uv run goodnotes schema
 ```
 
-Use `uv run` for project commands so Python packages stay inside the project environment. Do not install this project's dependencies globally.
+Use `uv run` for project commands. Do not install project dependencies globally. The package requires Python 3.11 or newer. Typer handles the CLI, PyMuPDF handles PDF work, and the standard library handles SQLite.
 
 ## Make a change
 
-Use synthetic data for tests and examples. Keep storage queries in the library or document modules, route active-cache and sandbox validation through `safety`, and keep command parsing and JSON formatting in the CLI. Preserve the source label for extracted text and the 1-based page numbering shown to users. For a development task that needs a pre-created private copy, pass it with the global `--sandbox` option before the command.
+Use generated fixtures for tests and examples. Never run a test or routine development check against a user's Goodnotes Library. If a manual check needs a pre-created private copy, keep it outside the repository and pass it with the global `--sandbox` option before the command. Do not commit the copy or its extracted contents.
 
-Before changing a command, check its current help output and update this repository's docs if the public interface changes. Full reconstruction of native Goodnotes handwriting is still pending, so describe that capability only when the code supports it.
+Keep the implementation within its package boundary:
+
+| Area | Responsibility |
+| --- | --- |
+| `library` | Read SQLite rows and map folders, notebooks, pages, text, and search results. |
+| `documents` | Resolve copied PDF pages, render pages, and export PDFs. |
+| `cache` and `safety` | Validate snapshots, cache transitions, locks, and safe paths. |
+| `snapshot` | Copy, verify, and mark a Library snapshot. |
+| `cli` and `output` | Parse commands and format structured output and errors. |
+
+Preserve text-source labels and one-based public page numbers. Keep operations on source SQLite databases out of the code; commands should read the validated copy. Before changing a command, inspect `uv run goodnotes COMMAND --help` and `uv run goodnotes schema [COMMAND]`. Update the [command reference](docs/commands.md) when the public interface changes, and update the [README](README.md) for changes to the quickstart or normal user workflow. Keep user-facing operating steps in the [agent guide](docs/agent-guide.md).
+
+See [Architecture](docs/architecture.md) for package responsibilities and the cache/read lifecycle. See [Robustness](docs/robustness.md) for safety behavior and the scenario-to-test map.
 
 ## Run checks
 
@@ -30,8 +42,8 @@ uv run ruff check .
 uv run mypy src/goodnotes_cli
 ```
 
-Tests must use generated fixtures. A sandbox smoke test may use a private copy kept outside the repository. Never commit that copy or its extracted contents.
+Tests must use generated fixtures. Before submitting, review the diff and `git status` for private data, generated output, and machine-specific paths.
 
 ## Submit a change
 
-Describe the behavior that changed and include the checks you ran. Before submitting, review the diff and `git status` for private data, generated output, and machine-specific paths.
+Describe the behavior that changed and list the checks you ran. Full reconstruction of native Goodnotes handwriting remains unsupported; describe a capability only when the code provides it.

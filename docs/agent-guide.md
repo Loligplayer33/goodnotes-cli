@@ -1,46 +1,24 @@
 # Agent guide
 
-This repository builds a local CLI for reading a Goodnotes library through a verified copy. Use generated fixtures for development and tests. Do not add real notebook names, identifiers, library paths, email addresses, or extracted note text to code, tests, logs, issues, or docs.
+Use `uv run goodnotes` from the repository root. Start with `uv run goodnotes schema [COMMAND]` for the machine-readable contract or `uv run goodnotes COMMAND --help` for human-readable options. Put global options such as `--sandbox`, `--fields`, and `--expect-snapshot` before the command. See the [command reference](commands.md) for every command, option, default, and bound.
 
-## Set up and inspect
+## Choose a way to inspect the notebook
 
-Run commands through `uv` so project dependencies stay in `.venv`:
+1. Use `info`, `ls`, or `tree` to find a notebook. Use `pages` to get its current one-based page numbers. Select by exact UUID, full path, or unique exact name. If a name is ambiguous, use a full path or UUID.
+2. Use `read` for text from selected pages. Keep the `source` labels and warnings with the text. `handwriting` contains Goodnotes recognition candidates, not a visual transcription of ink. `pdf` text may come from the search index or a mapped PDF background in the copy. `textbox` is typed page text.
+3. Use `search` for a literal, case-insensitive search of the stored index. Check `coverage` and `warnings` before treating no hits as evidence that text is absent. If the index may be incomplete, use `scan-pdfs` to search copied PDF backgrounds. That scan does not search handwriting, the stored index, or a PDF registered with `attach-pdf`. Continue while `next_page_offset` is present, and account for warnings about missing, unmapped, unreadable, or truncated pages.
+4. For visual inspection, use `render` for one page or `bundle` for up to ten pages. The default `background` layer shows PDF backgrounds and does not overlay native Goodnotes ink. An `annotated` layer requires a PDF supplied by the user and registered with `attach-pdf`. Registration is tied to the current snapshot generation. The CLI verifies the file and page count, but cannot verify annotation inclusion or page order; preserve `annotation_status: "user-provided-unverified"` and the warnings with any conclusion.
 
-```sh
-uv sync
-uv run goodnotes --help
-uv run goodnotes schema
-uv run pytest
-```
+## Keep results comparable
 
-The normal user workflow starts with `uv run goodnotes sync`, then browse commands read the active cache. Agents should not run sync against a user's Goodnotes Library during routine tests. `schema` describes the command contract without loading notebook data. Use `--sandbox PATH` only for an explicit development read view. A managed cache snapshot passed with `--sandbox` can be removed after a later sync; create a named snapshot outside the managed cache if a task needs a persistent copy.
+For a paginated sequence, read the `snapshot` ID from its cache-backed result and pass it before every command as `--expect-snapshot ID`. Follow `next_offset` with `--offset`, or `next_page_offset` with `--page-offset` for `scan-pdfs`. If the CLI returns `stale_snapshot`, restart the sequence against the new view. Do not combine pages from different snapshot IDs. The `snapshot` value returned by `sync` or the standalone `snapshot` command is a path; use `snapshot_id` from `sync` if needed, or the generation ID from a cache-backed read result.
 
-## Preserve the read boundary
+Use `--fields` only with keys present at the selected output level. It filters object rows under `items`, `pages`, or `hits`, including empty row arrays, while preserving surrounding metadata. Otherwise it filters top-level keys. Cache-backed commands always retain `snapshot`. Keep source labels whenever they affect the strength of a conclusion.
 
-`sync` is the only normal command that reads source Library files. It never opens a source SQLite database, controls the Goodnotes app, or writes to its library. Other commands read the validated active copy. Tests should call `sync` only with generated fixtures. If a task explicitly requires a private copy, keep it outside the repository and do not copy its contents into examples or test output.
+## Handle output and failures
 
-The cache has two persistent locks. `.sync.lock` serializes refreshes. `.view.lock` protects active pointer resolution and each command's complete read, then lets sync publish and prune after readers finish. Keep the shared view lock through the final database or attachment read. Do not move a Goodnotes-side lock or SQLite connection into this design. Commands do not refresh in the background.
+Successful data responses are JSON on stdout. `--text` only indents the JSON. Expected runtime errors are JSON on stderr and exit with code `1`; invalid command syntax and parser-checked bounds exit with code `2`. Page-expression and other application-checked errors are runtime errors. An interrupt or broken pipe exits with code `130`. Read stderr for the error message instead of treating an empty stdout as a result.
 
-When source and active-cache stat inventories match, sync reuses that generation without hashing all file contents. Changed cache metadata triggers recapture. Use `sync --force` to bypass reuse and create a fully verified generation even when the inventories match. Changed files are cloned with copy-on-write where supported or copied independently, then validated.
+Choose a new destination for `export`, `render`, and `bundle`; the CLI refuses to overwrite existing outputs, and output paths must stay outside the snapshot and production Goodnotes locations. `sync` refreshes the managed cache, `snapshot` creates an independent copy, and `attach-pdf` writes registration metadata beside the snapshot. These commands have different effects; consult the [command reference](commands.md) before using them.
 
-If a source change overlaps a capture attempt, sync retries. If no attempt succeeds, it keeps the prior active view. After capture, sync compares the source inventory from before capture with a final inventory. This check includes any earlier capture attempts and runs before sync waits for `.view.lock` to publish. If the inventories differ, sync publishes the validated view and returns `source_changed_during_refresh: true`, `captured_at`, and a warning. If they match, the flag is false; this does not mean the source stayed unchanged through command return. Updates after the final check, including while waiting to publish, are detected by the next sync. Sync omits the reusable source fingerprint after a mismatch, so the next sync captures a fresh view. `captured_at` is the validated view's capture time. Staging left by a process kill is removed on the next sync; Ctrl-C cleans the partial capture.
-
-## Work with results
-
-The CLI emits compact JSON by default. `--text` indents that JSON; `--json` selects compact JSON. Global options such as `--data-dir`, `--sandbox`, `--fields`, `--text`, `--json`, and `--expect-snapshot` go before the command. `--fields` selects columns from `ls`, `pages`, and `search` rows.
-
-Page numbers are 1-based. `ls`, `tree`, `pages`, and `search` have bounded results with offset pagination. `scan-pdfs` has a page offset cursor. Each paged result includes its snapshot generation ID in `snapshot`. Pass that value to the global `--expect-snapshot ID` option on later pages. If sync changes the active view, the CLI returns a `stale_snapshot` error; restart pagination against the new snapshot rather than combining generations.
-
-`read` defaults to page 1, accepts at most 20 distinct pages, and caps combined text at 12,000 characters by default. `bundle` accepts at most 10 pages and uses one character budget across their text. Both report truncation. `search` returns short snippets and identifies its coverage as `stored-index`. Use `scan-pdfs` to search copied PDF backgrounds that the index missed. It does not search handwriting or the stored index. `--page-limit` defaults to 200 and cannot exceed 250; continue with `next_page_offset`.
-
-## Keep text sources clear
-
-The CLI labels text as PDF, handwriting, or textbox data. `read` uses indexed PDF text when available and can extract text from a mapped PDF background in the copy when the index misses it. Neither route decodes native annotations. Text flattened into an imported PDF may still be extracted. Image-only writing produces no PDF text. Handwriting values are stored recognition candidates, not a visual transcription of ink.
-
-The `background` layer assembles available PDF pages in current notebook order and does not overlay native Goodnotes ink. The `annotated` layer requires a user-exported PDF registered with `attach-pdf`. The checks confirm page count and file integrity but cannot verify annotation inclusion or page order. Annotated results report `includes_handwriting: null` and `annotation_status: user-provided-unverified`. Keep the registered PDF available and unchanged.
-
-## Extend the package
-
-Keep SQLite queries in `library`, PDF handling in `documents`, cache checks and locks in `cache` and `safety`, and command parsing and output formatting in `cli` and `output`. Preserve source labels and 1-based public page numbers. Add generated fixtures for behavior that depends on ordering, source labels, cache transitions, or safety boundaries. Check command help and update the public docs when the interface changes.
-
-Run focused tests and required checks before reporting a change. Check `git status` and the diff for private data, generated output, and machine-specific paths. See [Robustness and failure behavior](robustness.md) for scenario-to-test coverage and [Contributing](../CONTRIBUTING.md) for local checks.
+For source and annotation details, see [PDF and handwriting](pdf-and-handwriting.md). For development and tests, see [Contributing](../CONTRIBUTING.md).
