@@ -979,7 +979,7 @@ def read_view(settings: Settings) -> Iterator[Sandbox]:
             sandbox = settings.load_sandbox()
         except CacheAccessError:
             raise
-        except (GoodnotesError, OSError) as exc:
+        except (GoodnotesError, OSError, RuntimeError) as exc:
             raise CacheAccessError.from_exception(
                 exc,
                 f"Could not resolve a valid managed cache snapshot: {exc}",

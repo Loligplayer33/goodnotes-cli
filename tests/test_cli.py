@@ -579,6 +579,38 @@ def test_symlink_loop_in_cache_ancestor_returns_structured_error_without_mutatio
     assert not (tmp_path / "state").exists()
 
 
+def test_symlink_loop_in_managed_snapshot_pointer_returns_structured_error(
+    library_copy: Path, tmp_path: Path
+) -> None:
+    state = tmp_path / "state"
+    cache_module.refresh_cache(library_copy / "Library", state)
+    snapshots = state / "snapshots"
+    loop_a, loop_b = snapshots / "cycle-a", snapshots / "cycle-b"
+    loop_a.symlink_to(loop_b, target_is_directory=True)
+    loop_b.symlink_to(loop_a, target_is_directory=True)
+    pointer = state / "active.json"
+    data = json.loads(pointer.read_text())
+    data["snapshot"] = str(loop_a / "child")
+    pointer.write_text(json.dumps(data))
+    pointer_before = pointer.read_bytes()
+    source_before = _tree_manifest(library_copy)
+    entries_before = _top_level_manifest(snapshots)
+
+    result = invoke(["ls"], tmp_path)
+
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert "Traceback" not in result.stderr
+    error = json.loads(result.stderr)["error"]
+    assert error["code"] == "cache_invalid"
+    assert error["details"]["operation"] == "resolve_read_view"
+    assert error["details"]["path"] == str(state)
+    assert error["details"]["remedy"]
+    assert pointer.read_bytes() == pointer_before
+    assert _top_level_manifest(snapshots) == entries_before
+    assert _tree_manifest(library_copy) == source_before
+
+
 @pytest.mark.parametrize("arguments", [["read"], ["ls", "--limit", "0"], ["unknown"]])
 def test_argument_errors_are_structured(arguments: list[str], tmp_path: Path) -> None:
     result = invoke(arguments, tmp_path)
