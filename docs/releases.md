@@ -25,6 +25,15 @@ The tag starts the same CI checks. The workflow builds a source distribution and
 
 ## Main branch checks
 
-Changes enter `main` through a pull request. No review approval is required, so a maintainer can merge their own pull request after CI passes. The branch requires current results for `Quality checks`, all four `Tests` jobs, and `Build and verify distributions`. The rules apply to administrators too. Force pushes and branch deletion are disabled.
+Changes enter `main` through a pull request. No review approval is required, so a maintainer can merge their own pull request after CI passes. The branch must be up to date with `main` and pass these GitHub Actions checks:
+
+- `Quality checks`
+- `Tests (ubuntu-latest, Python 3.11)`
+- `Tests (ubuntu-latest, Python 3.12)`
+- `Tests (ubuntu-latest, Python 3.13)`
+- `Tests (macos-latest, Python 3.12)`
+- `Build and verify distributions`
+
+The rules apply to administrators too. Force pushes and branch deletion are disabled.
 
 CI uses generated test fixtures and does not require the Goodnotes app or a real Goodnotes library.
