@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Iterable
 from dataclasses import asdict, is_dataclass
+from dataclasses import fields as dataclass_fields
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +13,63 @@ import typer
 
 from .config import Settings
 from .errors import GoodnotesError
+from .models import Item, Page, PageText, SearchHit
+
+_ROW_MODELS = {
+    "ls": ("items", Item),
+    "tree": ("items", Item),
+    "pages": ("pages", Page),
+    "read": ("pages", PageText),
+    "search": ("hits", SearchHit),
+    "scan-pdfs": ("hits", SearchHit),
+}
+
+
+def output_contract(command_name: str) -> dict[str, Any] | None:
+    """Describe field projection for commands with a shared row model."""
+    if command_name == "info":
+        return {
+            "projection": "response",
+            "fields": [field.name for field in dataclass_fields(Item)] + ["snapshot"],
+            "example": 'goodnotes --fields id,name,path info "Course Notes"',
+        }
+    model = _ROW_MODELS.get(command_name)
+    if model is None:
+        return None
+    key, row_model = model
+    fields = [field.name for field in dataclass_fields(row_model)]
+    if command_name in {"search", "scan-pdfs"}:
+        fields.append("snippet")
+    result: dict[str, Any] = {
+        "projection": f"{key}[]",
+        "fields": fields,
+        "metadata": "Sibling metadata, including snapshot, is retained automatically.",
+    }
+    if command_name == "pages":
+        result["optional_fields"] = {"recognition": "Requires --with-recognition."}
+        result["example"] = (
+            'goodnotes --fields number,recognition pages "Course Notes" --with-recognition'
+        )
+    elif command_name in {"ls", "tree"}:
+        result["example"] = f"goodnotes --fields id,name,kind,path {command_name}"
+    elif command_name == "read":
+        result["example"] = (
+            'goodnotes --fields page,parts,warnings,truncated read "Course Notes" --page 1'
+        )
+    else:
+        result["example"] = f'goodnotes --fields path,page,source,text {command_name} "term"'
+    return result
+
+
+def _unknown_fields(fields: list[str], available: Iterable[str], level: str) -> None:
+    keys = set(available)
+    unknown = set(fields) - keys
+    if unknown:
+        raise GoodnotesError(
+            f"Unknown output fields: {', '.join(sorted(unknown))}. "
+            f"Select fields from {level}: {', '.join(sorted(keys))}. "
+            "Snapshot is retained automatically."
+        )
 
 
 def serializable(value: Any) -> Any:
@@ -28,6 +86,8 @@ def serializable(value: Any) -> Any:
 
 def emit(value: Any, settings: Settings) -> None:
     result = serializable(value)
+    if settings.snapshot_id is not None and isinstance(result, dict):
+        result["snapshot"] = settings.snapshot_id
     if settings.fields:
         fields = [field.strip() for field in settings.fields.split(",") if field.strip()]
         if not fields:
@@ -38,17 +98,11 @@ def emit(value: Any, settings: Settings) -> None:
                     isinstance(row, dict) for row in result[key]
                 ):
                     for row in result[key]:
-                        unknown = set(fields) - row.keys()
-                        if unknown:
-                            raise GoodnotesError(
-                                f"Unknown output fields: {', '.join(sorted(unknown))}"
-                            )
+                        _unknown_fields(fields, row.keys(), f"{key}[]")
                     result[key] = [{field: row[field] for field in fields} for row in result[key]]
                     break
             else:
-                unknown = set(fields) - result.keys()
-                if unknown:
-                    raise GoodnotesError(f"Unknown output fields: {', '.join(sorted(unknown))}")
+                _unknown_fields(fields, result.keys(), "the response object")
                 result = {field: result[field] for field in fields}
     if settings.snapshot_id is not None and isinstance(result, dict):
         result["snapshot"] = settings.snapshot_id

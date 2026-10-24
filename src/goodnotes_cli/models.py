@@ -1,6 +1,7 @@
 """Values shared by the storage, document, and command modules."""
 
 from dataclasses import dataclass, field
+from typing import Literal
 
 
 @dataclass(frozen=True)
@@ -45,6 +46,17 @@ class PageText:
     parts: list[TextPart] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     truncated: bool = False
+
+
+@dataclass(frozen=True)
+class RecognitionStatus:
+    """Stored handwriting-index metadata for one active page."""
+
+    source: str
+    text_rows: int | None
+    text_chars: int | None
+    availability: Literal["stored-text", "no-stored-text", "unavailable"]
+    index_state: Literal["pending", "not-pending", "unknown"]
 
 
 @dataclass(frozen=True)

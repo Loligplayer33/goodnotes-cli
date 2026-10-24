@@ -60,6 +60,171 @@ def test_schema_needs_no_library(tmp_path: Path) -> None:
     assert data["limits"]["read_pages"] == 20
 
 
+def test_schema_explains_field_projection_without_loading_notes(tmp_path: Path) -> None:
+    reading = successful(invoke(["schema", "read"], tmp_path))
+    assert reading["output"]["projection"] == "pages[]"
+    assert "parts" in reading["output"]["fields"]
+    assert "page_id" in reading["output"]["fields"]
+    pages = successful(invoke(["schema", "pages"], tmp_path))
+    assert "number" in pages["output"]["fields"]
+    assert "recognition" in pages["output"]["optional_fields"]
+    assert not (tmp_path / "state").exists()
+
+
+def test_field_errors_show_the_projection_level_and_valid_keys(
+    library_copy: Path, tmp_path: Path
+) -> None:
+    result = invoke(
+        ["--fields", "pages,snapshot", "read", "doc-hostile", "--page", "1"],
+        tmp_path,
+        sandbox=library_copy,
+    )
+    assert result.returncode == 1
+    assert result.stdout == ""
+    message = json.loads(result.stderr)["error"]["message"]
+    assert "pages[]" in message
+    assert "page_id" in message
+    assert "parts" in message
+    assert "retained automatically" in message
+
+
+def test_top_level_field_selection_accepts_and_retains_snapshot(
+    library_copy: Path, tmp_path: Path
+) -> None:
+    data = successful(
+        invoke(["--fields", "id,snapshot", "info", "doc-hostile"], tmp_path, sandbox=library_copy)
+    )
+    assert data == {"id": "doc-hostile", "snapshot": library_copy.name}
+
+
+@pytest.mark.parametrize("command", ["search", "scan-pdfs"])
+def test_search_scope_options_are_exclusive_before_loading_a_library(
+    command: str, tmp_path: Path
+) -> None:
+    result = invoke([command, "term", "--folder", "/", "--notebook", "Notebook"], tmp_path)
+    assert result.returncode == 1
+    assert "Use --folder or --notebook" in json.loads(result.stderr)["error"]["message"]
+    assert not (tmp_path / "state").exists()
+
+
+def test_export_selects_pages_in_listed_order(library_copy: Path, tmp_path: Path) -> None:
+    target = tmp_path / "selected.pdf"
+    data = successful(
+        invoke(
+            ["export", "doc-hostile", "--pages", "3,1", "--output", str(target)],
+            tmp_path,
+            sandbox=library_copy,
+        )
+    )
+    assert data["pages"] == 2
+    assert data["selected_pages"] == [3, 1]
+    assert data["includes_handwriting"] is False
+    with pymupdf.open(target) as document:
+        assert document.page_count == 2
+        assert "Synthetic PDF page 1" in document[0].get_text()
+        assert "Synthetic PDF page 9" in document[1].get_text()
+
+
+@pytest.mark.parametrize("expression", ["", "0", "1,1", "3-1", "1,4"])
+def test_export_rejects_invalid_page_selections_without_creating_output(
+    expression: str, library_copy: Path, tmp_path: Path
+) -> None:
+    target = tmp_path / "invalid.pdf"
+    result = invoke(
+        ["export", "doc-hostile", "--pages", expression, "--output", str(target)],
+        tmp_path,
+        sandbox=library_copy,
+    )
+    assert result.returncode == 1
+    assert json.loads(result.stderr)["error"]["code"] == "operation_failed"
+    assert not target.exists()
+
+
+def test_notebook_search_does_not_confuse_metadata_with_text_coverage(
+    library_copy: Path, tmp_path: Path
+) -> None:
+    with sqlite3.connect(library_copy / "Library/Databases/fts.sqlite") as db:
+        db.execute("DELETE FROM pdf_text_content")
+    data = successful(
+        invoke(
+            ["search", "Synthetic", "--notebook", "doc-hostile", "--source", "pdf"],
+            tmp_path,
+            sandbox=library_copy,
+        )
+    )
+    assert data["hits"] == []
+    assert data["coverage"] == "stored-index"
+    details = data["coverage_detail"]
+    assert details["scope"]["notebook_id"] == "doc-hostile"
+    assert details["active_pages"] == 3
+    assert details["page_meta"]["mapped_active_pages"] == 3
+    assert details["sources"]["pdf"]["pages_with_stored_nonempty_text"] == 0
+    assert details["sources"]["pdf"]["metadata_without_nonempty_text_pages"] == 2
+    assert details["completeness"] == "unknown"
+    assert "scan-pdfs" in json.dumps(details["next_steps"])
+
+
+def test_notebook_pdf_scan_distinguishes_window_end_from_complete_coverage(
+    library_copy: Path, tmp_path: Path
+) -> None:
+    arguments = ["scan-pdfs", "Synthetic PDF", "--notebook", "doc-hostile", "--limit", "100"]
+    first = successful(invoke([*arguments, "--page-limit", "2"], tmp_path, sandbox=library_copy))
+    assert first["scope"]["notebook_id"] == "doc-hostile"
+    assert first["total_pages"] == 3
+    assert first["pages_scanned"] == 2
+    assert first["next_page_offset"] == 2
+    assert first["stop_reason"] == "page-limit"
+    assert first["scan_complete"] is False
+    assert first["coverage_complete"] is False
+    final = successful(invoke([*arguments, "--page-offset", "2"], tmp_path, sandbox=library_copy))
+    assert final["scan_complete"] is True
+    assert final["coverage_complete"] is False
+    assert final["next_page_offset"] is None
+    complete = successful(invoke(arguments, tmp_path, sandbox=library_copy))
+    assert complete["coverage_complete"] is True
+    assert complete["extraction_issues"] == []
+    assert [hit["page"] for hit in complete["hits"]] == [1, 2, 3]
+
+
+@pytest.mark.parametrize("command", ["search", "scan-pdfs"])
+def test_notebook_passed_as_folder_has_actionable_error(
+    command: str, library_copy: Path, tmp_path: Path
+) -> None:
+    result = invoke([command, "phrase", "--folder", "doc-hostile"], tmp_path, sandbox=library_copy)
+    assert result.returncode == 1
+    assert "--notebook" in json.loads(result.stderr)["error"]["message"]
+
+
+def test_recognition_discovery_is_metadata_only_and_marks_pending_empty_pages(
+    library_copy: Path, tmp_path: Path
+) -> None:
+    with sqlite3.connect(library_copy / "Library/Databases/projection.sqlite") as db:
+        db.execute("ALTER TABLE pages ADD COLUMN needs_index INTEGER")
+        db.execute("UPDATE pages SET needs_index = 1 WHERE id = 'page-30'")
+    data = successful(
+        invoke(
+            ["--fields", "number,recognition", "pages", "doc-hostile", "--with-recognition"],
+            tmp_path,
+            sandbox=library_copy,
+        )
+    )
+    assert data["annotation_count_source"] == "projection.notes_items"
+    assert data["snapshot"] == library_copy.name
+    assert [page["recognition"]["text_rows"] for page in data["pages"]] == [2, 1, 0]
+    assert data["pages"][0]["recognition"]["availability"] == "stored-text"
+    assert data["pages"][2]["recognition"]["index_state"] == "pending"
+    assert "Straße" not in json.dumps(data)
+    reading = successful(
+        invoke(
+            ["read", "doc-hostile", "--page", "3", "--source", "handwriting"],
+            tmp_path,
+            sandbox=library_copy,
+        )
+    )
+    assert reading["pages"][0]["parts"] == []
+    assert "index" in " ".join(reading["pages"][0]["warnings"]).casefold()
+
+
 def test_schema_covers_every_registered_command(tmp_path: Path) -> None:
     from typer.core import TyperGroup
     from typer.main import get_command
