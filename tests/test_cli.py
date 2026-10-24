@@ -99,6 +99,19 @@ def _top_level_manifest(root: Path) -> tuple[tuple[object, ...], ...]:
     )
 
 
+def _resolution_error_path(path: Path, *, runtime_fallback: Path | None = None) -> Path:
+    fallback = runtime_fallback or path
+    try:
+        path.resolve(strict=True)
+    except OSError as exc:
+        if exc.filename is not None:
+            return Path(os.fsdecode(exc.filename))
+        return fallback
+    except RuntimeError:
+        return fallback
+    pytest.fail(f"strict path resolution unexpectedly succeeded: {path}")
+
+
 def _set_tree_readonly(root: Path) -> None:
     for path in sorted(root.rglob("*"), key=lambda item: len(item.parts), reverse=True):
         mode = path.lstat().st_mode
@@ -555,15 +568,16 @@ def test_symlink_loop_in_cache_ancestor_returns_structured_error_without_mutatio
     if case == "sync":
         arguments = ["sync", "--library", str(library_copy / "Library")]
         result = invoke(arguments, tmp_path, data_dir=data_dir)
+        # The writer reports the requested cache path if parent setup fails.
         expected_path = data_dir
     elif case == "explicit_sandbox":
         arguments = ["ls"]
         result = invoke(arguments, tmp_path, sandbox=explicit_sandbox)
-        expected_path = explicit_sandbox
+        expected_path = _resolution_error_path(explicit_sandbox, runtime_fallback=explicit_sandbox)
     else:
         arguments = ["ls"]
         result = invoke(arguments, tmp_path, data_dir=data_dir)
-        expected_path = data_dir
+        expected_path = _resolution_error_path(data_dir, runtime_fallback=data_dir)
 
     assert result.returncode == 1
     assert result.stdout == ""
@@ -590,7 +604,8 @@ def test_symlink_loop_in_managed_snapshot_pointer_returns_structured_error(
     loop_b.symlink_to(loop_a, target_is_directory=True)
     pointer = state / "active.json"
     data = json.loads(pointer.read_text())
-    data["snapshot"] = str(loop_a / "child")
+    pointer_target = loop_a / "child"
+    data["snapshot"] = str(pointer_target)
     pointer.write_text(json.dumps(data))
     pointer_before = pointer.read_bytes()
     source_before = _tree_manifest(library_copy)
@@ -604,7 +619,8 @@ def test_symlink_loop_in_managed_snapshot_pointer_returns_structured_error(
     error = json.loads(result.stderr)["error"]
     assert error["code"] == "cache_invalid"
     assert error["details"]["operation"] == "resolve_read_view"
-    assert error["details"]["path"] == str(state)
+    expected_path = _resolution_error_path(pointer_target, runtime_fallback=state)
+    assert error["details"]["path"] == str(expected_path)
     assert error["details"]["remedy"]
     assert pointer.read_bytes() == pointer_before
     assert _top_level_manifest(snapshots) == entries_before

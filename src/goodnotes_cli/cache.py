@@ -685,7 +685,9 @@ def _managed_state_for_explicit(path: Path) -> Path | None:
     # Normalize dot segments and parent aliases before deciding whether this is a
     # managed generation. Otherwise an explicit path such as
     # snapshots/<generation>/../<generation> can bypass the shared view lock.
-    resolved = requested.resolve(strict=False)
+    # An explicit sandbox must already exist. Strict resolution also rejects symlink
+    # loops instead of leaving an unresolved path that could bypass managed-state checks.
+    resolved = requested.resolve(strict=True)
     if resolved.parent.name != "snapshots":
         return None
     resolved_state = resolved.parent.parent.resolve(strict=False)
