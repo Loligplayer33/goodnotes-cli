@@ -6,7 +6,8 @@ import json
 import multiprocessing
 import os
 import sqlite3
-from collections.abc import Iterator
+import stat
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -72,6 +73,15 @@ def _assert_cache_access_error(error: GoodnotesError, *, code: str, path: Path) 
     return details
 
 
+def _expected_permission_path(action: Callable[[], object]) -> str:
+    try:
+        action()
+    except PermissionError as exc:
+        assert exc.filename is not None
+        return os.fsdecode(exc.filename)
+    pytest.fail("expected the mode-000 parent to deny filesystem access")
+
+
 def test_refresh_skips_capture_when_source_inventory_is_unchanged(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -90,6 +100,73 @@ def test_refresh_skips_capture_when_source_inventory_is_unchanged(
     assert second["snapshot"] == first["snapshot"]
     assert second["snapshot_id"] == first["snapshot_id"]
     assert second["captured_at"] == first["captured_at"]
+
+
+@pytest.mark.parametrize(
+    ("action", "expected_operation"),
+    [
+        ("read", "resolve_cache_directory"),
+        ("sync", "prepare_cache_directory"),
+    ],
+)
+def test_unsearchable_cache_parent_returns_structured_permission_error(
+    tmp_path: Path, action: str, expected_operation: str
+) -> None:
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        pytest.skip("chmod-based parent access checks require a non-root process")
+
+    source = make_library(tmp_path / "source")
+    inaccessible_parent = tmp_path / "inaccessible-parent"
+    inaccessible_parent.mkdir()
+    data_dir = inaccessible_parent / "cache"
+    original_mode = stat.S_IMODE(inaccessible_parent.stat().st_mode)
+    source_before = {
+        path.relative_to(source): (
+            path.stat().st_size,
+            path.stat().st_mtime_ns,
+            path.stat().st_ctime_ns,
+            hashlib.sha256(path.read_bytes()).hexdigest(),
+        )
+        for path in source.rglob("*")
+        if path.is_file()
+    }
+
+    inaccessible_parent.chmod(0)
+    try:
+        expected_path = _expected_permission_path(
+            lambda: data_dir.stat() if action == "read" else os.mkdir(data_dir, 0o700)
+        )
+        with pytest.raises(GoodnotesError) as error:
+            if action == "read":
+                with cache_module.read_view(Settings(data_dir=data_dir)):
+                    pass
+            else:
+                cache_module.refresh_cache(source, data_dir)
+
+        details = _assert_cache_access_error(
+            error.value, code="cache_permission_denied", path=Path(expected_path)
+        )
+        assert details["operation"] == expected_operation
+        if action == "read":
+            assert "read/search access" in details["remedy"].casefold()
+        else:
+            assert "sync" in details["remedy"].casefold()
+            assert "write/search access" in details["remedy"].casefold()
+    finally:
+        inaccessible_parent.chmod(original_mode)
+
+    source_after = {
+        path.relative_to(source): (
+            path.stat().st_size,
+            path.stat().st_mtime_ns,
+            path.stat().st_ctime_ns,
+            hashlib.sha256(path.read_bytes()).hexdigest(),
+        )
+        for path in source.rglob("*")
+        if path.is_file()
+    }
+    assert source_after == source_before
+    assert not data_dir.exists()
 
 
 def test_same_size_cached_attachment_replacement_triggers_refresh(tmp_path: Path) -> None:

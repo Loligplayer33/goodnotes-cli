@@ -742,8 +742,8 @@ def refresh_cache(
     requested_data_dir = Path(data_dir).expanduser()
     try:
         state, snapshots = _prepare_state(requested_data_dir, source)
-    except GoodnotesError as exc:
-        if _os_cause(exc) is None:
+    except (GoodnotesError, OSError, RuntimeError) as exc:
+        if not isinstance(exc, RuntimeError) and _os_cause(exc) is None:
             raise
         raise CacheAccessError.from_exception(
             exc,
@@ -888,19 +888,27 @@ def refresh_cache(
 
 
 def _read_cache_state(requested: Path) -> Path:
-    if requested.is_symlink():
-        raise CacheAccessError(
-            "cache_invalid",
-            f"The CLI cache directory must not be a symlink: {requested}",
-            operation="resolve_cache_directory",
-            path=requested,
-            cache_dir=requested,
-        )
-    _require_not_production(requested.absolute(), purpose="CLI cache storage")
     try:
+        if requested.is_symlink():
+            raise CacheAccessError(
+                "cache_invalid",
+                f"The CLI cache directory must not be a symlink: {requested}",
+                operation="resolve_cache_directory",
+                path=requested,
+                cache_dir=requested,
+            )
+        _require_not_production(requested.absolute(), purpose="CLI cache storage")
         state = requested.resolve(strict=True)
         info = state.lstat()
-    except OSError as exc:
+        if requested.is_symlink():
+            raise CacheAccessError(
+                "cache_invalid",
+                f"The CLI cache directory must not be a symlink: {requested}",
+                operation="resolve_cache_directory",
+                path=requested,
+                cache_dir=requested,
+            )
+    except (OSError, RuntimeError) as exc:
         raise CacheAccessError.from_exception(
             exc,
             f"Could not resolve the CLI cache directory: {requested}",
@@ -909,14 +917,6 @@ def _read_cache_state(requested: Path) -> Path:
             cache_dir=requested,
             missing_is_uninitialized=True,
         ) from exc
-    if requested.is_symlink():
-        raise CacheAccessError(
-            "cache_invalid",
-            f"The CLI cache directory must not be a symlink: {requested}",
-            operation="resolve_cache_directory",
-            path=requested,
-            cache_dir=requested,
-        )
     _require_not_production(state, purpose="CLI cache storage")
     if not stat.S_ISDIR(info.st_mode):
         raise CacheAccessError(
@@ -939,8 +939,8 @@ def read_view(settings: Settings) -> Iterator[Sandbox]:
     if explicit is not None:
         try:
             lock_state = _managed_state_for_explicit(Path(explicit))
-        except (GoodnotesError, OSError) as exc:
-            if _os_cause(exc) is None:
+        except (GoodnotesError, OSError, RuntimeError) as exc:
+            if not isinstance(exc, RuntimeError) and _os_cause(exc) is None:
                 raise
             raise CacheAccessError.from_exception(
                 exc,

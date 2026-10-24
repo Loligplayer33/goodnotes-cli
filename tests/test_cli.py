@@ -35,11 +35,15 @@ def library_copy(tmp_path: Path) -> Path:
 
 
 def invoke(
-    arguments: list[str], tmp_path: Path, *, sandbox: Path | None = None
+    arguments: list[str],
+    tmp_path: Path,
+    *,
+    sandbox: Path | None = None,
+    data_dir: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     environment = dict(os.environ)
     environment.pop("GOODNOTES_SANDBOX", None)
-    environment["GOODNOTES_DATA_DIR"] = str(tmp_path / "state")
+    environment["GOODNOTES_DATA_DIR"] = str(data_dir or tmp_path / "state")
     prefix = ["--sandbox", str(sandbox)] if sandbox is not None else []
     return subprocess.run(
         [sys.executable, "-m", "goodnotes_cli", *prefix, *arguments],
@@ -77,6 +81,22 @@ def _tree_manifest(root: Path) -> tuple[tuple[object, ...], ...]:
             )
         )
     return tuple(entries)
+
+
+def _top_level_manifest(root: Path) -> tuple[tuple[object, ...], ...]:
+    return tuple(
+        sorted(
+            (
+                path.name,
+                path.lstat().st_mode,
+                path.lstat().st_size,
+                path.lstat().st_mtime_ns,
+                path.lstat().st_ctime_ns,
+                os.readlink(path) if path.is_symlink() else None,
+            )
+            for path in root.iterdir()
+        )
+    )
 
 
 def _set_tree_readonly(root: Path) -> None:
@@ -510,6 +530,53 @@ def test_missing_library_is_structured_stderr(tmp_path: Path) -> None:
     assert {"operation", "path", "remedy"} <= details.keys()
     assert details["path"] == str(tmp_path / "state")
     assert "sync" in details["remedy"].casefold()
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_operation"),
+    [
+        ("read", "resolve_cache_directory"),
+        ("sync", "prepare_cache_directory"),
+        ("explicit_sandbox", "resolve_explicit_sandbox"),
+    ],
+)
+def test_symlink_loop_in_cache_ancestor_returns_structured_error_without_mutation(
+    library_copy: Path, tmp_path: Path, case: str, expected_operation: str
+) -> None:
+    loop_a = tmp_path / "loop-a"
+    loop_b = tmp_path / "loop-b"
+    loop_a.symlink_to(loop_b, target_is_directory=True)
+    loop_b.symlink_to(loop_a, target_is_directory=True)
+    data_dir = loop_a / "cache"
+    explicit_sandbox = data_dir / "snapshots" / "generated-snapshot"
+    source_before = _tree_manifest(library_copy)
+    fixture_before = _top_level_manifest(tmp_path)
+
+    if case == "sync":
+        arguments = ["sync", "--library", str(library_copy / "Library")]
+        result = invoke(arguments, tmp_path, data_dir=data_dir)
+        expected_path = data_dir
+    elif case == "explicit_sandbox":
+        arguments = ["ls"]
+        result = invoke(arguments, tmp_path, sandbox=explicit_sandbox)
+        expected_path = explicit_sandbox
+    else:
+        arguments = ["ls"]
+        result = invoke(arguments, tmp_path, data_dir=data_dir)
+        expected_path = data_dir
+
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert "Traceback" not in result.stderr
+    error = json.loads(result.stderr)["error"]
+    assert error["code"] == "cache_invalid"
+    details = error["details"]
+    assert details["operation"] == expected_operation
+    assert details["path"] == str(expected_path)
+    assert {"operation", "path", "remedy"} <= details.keys()
+    assert _tree_manifest(library_copy) == source_before
+    assert _top_level_manifest(tmp_path) == fixture_before
+    assert not (tmp_path / "state").exists()
 
 
 @pytest.mark.parametrize("arguments", [["read"], ["ls", "--limit", "0"], ["unknown"]])
