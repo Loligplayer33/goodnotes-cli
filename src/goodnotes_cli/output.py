@@ -89,6 +89,7 @@ _PROJECTIONS: dict[str, _ProjectionSpec] = {
             "includes_handwriting",
             "annotation_status",
             "warnings",
+            "snapshot",
         )
     ),
     "render": _ProjectionSpec(
@@ -103,10 +104,13 @@ _PROJECTIONS: dict[str, _ProjectionSpec] = {
             "includes_handwriting",
             "annotation_status",
             "warnings",
+            "snapshot",
         )
     ),
-    "attach-pdf": _ProjectionSpec(("document_id", "path", "pages", "registered", "warnings")),
-    "bundle": _ProjectionSpec(("directory", "manifest", "pages", "layer", "truncated")),
+    "attach-pdf": _ProjectionSpec(
+        ("document_id", "path", "pages", "registered", "warnings", "snapshot")
+    ),
+    "bundle": _ProjectionSpec(("directory", "manifest", "pages", "layer", "truncated", "snapshot")),
 }
 
 

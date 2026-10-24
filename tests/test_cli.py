@@ -147,6 +147,34 @@ def test_invalid_fields_preflight_all_writers(
     _assert_invalid_fields_are_rejected_before_write_command(writer, library_copy, tmp_path)
 
 
+@pytest.mark.parametrize("writer", ["export", "render", "attach-pdf", "bundle"])
+def test_top_level_writers_can_project_snapshot(
+    writer: str, library_copy: Path, tmp_path: Path
+) -> None:
+    annotated_pdf = tmp_path / "annotated.pdf"
+    document = pymupdf.open()
+    for _ in range(3):
+        document.new_page()
+    document.save(annotated_pdf)
+    document.close()
+
+    schema = successful(invoke(["schema", writer], tmp_path))
+    assert "snapshot" in schema["output"]["fields"]
+
+    if writer == "export":
+        arguments = ["export", "doc-hostile", "--output", str(tmp_path / "out.pdf")]
+    elif writer == "render":
+        arguments = ["render", "doc-hostile", "--output", str(tmp_path / "out.png")]
+    elif writer == "attach-pdf":
+        arguments = ["attach-pdf", "doc-hostile", str(annotated_pdf)]
+    else:
+        arguments = ["bundle", "doc-hostile", "--output", str(tmp_path / "bundle")]
+
+    data = successful(invoke(["--fields", "snapshot", *arguments], tmp_path, sandbox=library_copy))
+
+    assert data == {"snapshot": library_copy.name}
+
+
 def test_sync_projection_can_select_an_absent_optional_warning_key(
     library_copy: Path, tmp_path: Path
 ) -> None:

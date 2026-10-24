@@ -1,14 +1,14 @@
-"""Read-only, set-oriented queries for stored text-index metadata."""
+"""Read-only queries for stored text, verified PDF bindings, and index diagnostics."""
 
 from __future__ import annotations
 
 import sqlite3
 from collections.abc import Iterator, Mapping
-from typing import Any, TypeVar
+from typing import Any, Literal, TypedDict, TypeVar
 
 from .models import PageRef
 
-_SQL_BIND_LIMIT = 400
+SQL_BIND_LIMIT = 400
 _TEXT_TABLES = {
     "handwriting": "annotation_text_content",
     "textbox": "textbox_text_content",
@@ -16,6 +16,24 @@ _TEXT_TABLES = {
 }
 _TEXT_LABELS = {"handwriting": "Handwriting", "textbox": "Textbox", "pdf": "PDF"}
 _Value = TypeVar("_Value")
+
+
+class _PDFPageBinding(TypedDict):
+    document_id: str
+    attachment_id: str | None
+    pdf_page_no: int | None
+    state: Literal["unknown", "stored-text", "no-stored-text"]
+    text_ids: list[int]
+    text_rows: int | None
+    text_chars: int | None
+    metadata_has_mapping: bool
+    mismatched_direct_pointer: bool
+    reason: str | None
+
+
+class _PDFPageBindings(TypedDict):
+    available: bool
+    pages: dict[str, _PDFPageBinding]
 
 
 def table_exists(connection: sqlite3.Connection | None, name: str) -> bool:
@@ -177,9 +195,9 @@ def matches_pdf_identity(row: Mapping[str, Any], page_ref: PageRef) -> bool:
     )
 
 
-def pdf_page_bindings(fts: sqlite3.Connection | None, page_refs: list[PageRef]) -> dict[str, Any]:
+def pdf_page_bindings(fts: sqlite3.Connection | None, page_refs: list[PageRef]) -> _PDFPageBindings:
     """Bind active pages to indexed PDF rows only when full PDF identity matches."""
-    bindings: dict[str, dict[str, Any]] = {
+    bindings: dict[str, _PDFPageBinding] = {
         ref.page_id: {
             "document_id": ref.document_id,
             "attachment_id": ref.attachment_id,
@@ -194,7 +212,7 @@ def pdf_page_bindings(fts: sqlite3.Connection | None, page_refs: list[PageRef]) 
         }
         for ref in page_refs
     }
-    unavailable = {"available": False, "pages": bindings}
+    unavailable: _PDFPageBindings = {"available": False, "pages": bindings}
     if not pdf_identity_schema_available(fts) or fts is None:
         return unavailable
 
@@ -284,7 +302,7 @@ def pdf_page_bindings(fts: sqlite3.Connection | None, page_refs: list[PageRef]) 
     eligible_refs = [
         page_ref for page_ref in eligible.values() if not candidate_lengths[page_ref.page_id]
     ]
-    ref_batch_size = max(1, _SQL_BIND_LIMIT // 4)
+    ref_batch_size = max(1, SQL_BIND_LIMIT // 4)
     page_meta_filter = page_meta_live_filter(page_meta_columns, alias="p")
     for start in range(0, len(eligible_refs), ref_batch_size):
         ref_batch = eligible_refs[start : start + ref_batch_size]
@@ -539,7 +557,7 @@ def page_meta_live_filter(columns: set[str], *, alias: str) -> str:
 
 def search_pdf_rows(
     fts: sqlite3.Connection,
-    binding_result: dict[str, Any],
+    binding_result: _PDFPageBindings,
     query: str,
     document_ids: list[str] | None = None,
 ) -> Iterator[sqlite3.Row]:
@@ -560,7 +578,7 @@ def search_pdf_rows(
         and (selected_documents is None or binding["document_id"] in selected_documents)
         for text_id in binding["text_ids"]
     ]
-    batch_size = max(1, _SQL_BIND_LIMIT // 6)
+    batch_size = max(1, SQL_BIND_LIMIT // 6)
     for batch in batches(bound_rows, batch_size):
         values_sql = ", ".join("(?, ?, ?, ?, ?)" for _ in batch)
         parameters = tuple(value for row in batch for value in row) + (query,)
@@ -588,6 +606,6 @@ def id_batches(values: list[str]) -> Iterator[list[str]]:
     yield from batches(values)
 
 
-def batches(values: list[_Value], size: int = _SQL_BIND_LIMIT) -> Iterator[list[_Value]]:
+def batches(values: list[_Value], size: int = SQL_BIND_LIMIT) -> Iterator[list[_Value]]:
     for start in range(0, len(values), size):
         yield values[start : start + size]

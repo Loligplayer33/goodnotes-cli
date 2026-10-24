@@ -747,7 +747,7 @@ class Library:
             raise TextIndexUnavailableError(
                 "The requested search index content table is unavailable."
             )
-        pdf_bindings: dict[str, Any] | None = None
+        pdf_bindings: text_index._PDFPageBindings | None = None
         if "pdf" in available:
             pdf_bindings = text_index.pdf_page_bindings(
                 self._fts, self._page_refs_for_notebooks(notebook_ids)
@@ -1665,7 +1665,7 @@ class Library:
         assert self._fts is not None
         if document_ids is None:
             document_ids = sorted(self._notebook_ids_under(None))
-        if len(document_ids) > 400:
+        if len(document_ids) > text_index.SQL_BIND_LIMIT:
             for batch in text_index.id_batches(document_ids):
                 yield from self._search_rows(source, query, batch)
             return

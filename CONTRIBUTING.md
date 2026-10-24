@@ -25,7 +25,7 @@ Keep the implementation within its package boundary:
 | Area | Responsibility |
 | --- | --- |
 | `library` | Read SQLite rows and map folders, notebooks, pages, text, and search results. |
-| `text_index` | Query stored-text counts and mapping diagnostics using connections owned by `library`. |
+| `text_index` | Query raw stored-text rows, verified PDF bindings, and index diagnostics using connections owned by `library`. |
 | `documents` | Resolve copied PDF pages, render pages, and export PDFs. |
 | `cache` and `safety` | Validate snapshots, cache transitions, locks, and safe paths. |
 | `snapshot` | Copy, verify, and mark a Library snapshot. |
