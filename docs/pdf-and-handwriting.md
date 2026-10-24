@@ -26,7 +26,7 @@ uv run goodnotes read "Notebook name" --page 3 --source handwriting
 
 The metadata reports counts for stored handwriting text and whether indexing is `pending`, `not-pending`, or `unknown`. Availability is `stored-text`, `no-stored-text`, or `unavailable`. `no-stored-text` describes this copy's index; it does not show that the page has no ink. An unavailable count is unknown, not zero. A pending-index warning may appear on `read` even when it returns no candidate text.
 
-`read --source handwriting` returns stored recognition candidates. It preserves candidate delimiters such as `|`; interpret the text as a cleaned recognition reading, not an exact quote or visual transcription. The CLI does not perform handwriting recognition or reconstruct ink from these candidates.
+`read --source handwriting` returns stored recognition candidates and preserves their raw delimiters and alternatives. Label any cleaned reconstruction as an interpretation rather than an exact quote or visual transcription. `not-pending` does not verify freshness or accuracy. The CLI does not perform handwriting recognition or reconstruct ink from these candidates.
 
 ## Export with annotations
 

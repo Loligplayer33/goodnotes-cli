@@ -6,9 +6,13 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .errors import GoodnotesError
 from .safety import Sandbox
+
+if TYPE_CHECKING:
+    from .output import Projection
 
 
 def default_data_dir() -> Path:
@@ -28,6 +32,7 @@ class Settings:
     fields: str | None = None
     expect_snapshot: str | None = None
     snapshot_id: str | None = None
+    projection: Projection | None = None
 
     def load_sandbox(self) -> Sandbox:
         if self.sandbox is not None:

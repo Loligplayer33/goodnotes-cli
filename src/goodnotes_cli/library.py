@@ -15,8 +15,8 @@ from typing import TYPE_CHECKING, Any
 import pymupdf
 
 from . import text_index
-from .errors import GoodnotesError
-from .models import Item, Page, PageText, RecognitionStatus, SearchHit, TextPart
+from .errors import GoodnotesError, TextIndexUnavailableError
+from .models import Item, Page, PageRef, PageText, RecognitionStatus, SearchHit, TextPart
 from .safety import open_database
 
 if TYPE_CHECKING:
@@ -32,7 +32,6 @@ _TEXT_TABLES = {
 }
 _MAX_PDF_FALLBACK_BYTES = 128 * 1024 * 1024
 _MAX_PDF_FALLBACK_TEXT = 100_000
-_SQL_ID_BATCH = 400
 
 
 @dataclass(frozen=True)
@@ -264,11 +263,17 @@ class Library:
             truncated = truncated or omitted
 
         if not truncated and "pdf" in selected_sources:
-            pdf_parts, remaining, omitted, indexed = self._read_pdf_text_for_page(
-                selected.id, item.id, remaining
+            page_refs = self._page_refs_for_notebooks({item.id}, page_ids={selected.id})
+            page_ref = (
+                page_refs[0] if page_refs else PageRef(document_id=item.id, page_id=selected.id)
+            )
+            pdf_parts, remaining, omitted, indexed, mapping_warning = self._read_pdf_text_for_page(
+                page_ref, remaining
             )
             parts.extend(pdf_parts)
             truncated = truncated or omitted
+            if mapping_warning:
+                warnings.append(mapping_warning)
             if indexed:
                 warnings.append(
                     "PDF text comes from the indexed PDF layer and may omit annotations."
@@ -329,6 +334,15 @@ class Library:
         if "pdf" in selected_sources and not text_index.page_meta_supports_pdf_mapping(self._fts):
             warnings.append(
                 "Indexed PDF text cannot be mapped because usable `page_meta` mapping is "
+                "unavailable in the search index."
+            )
+        if (
+            "pdf" in selected_sources
+            and self._table_exists(self._fts, "pdf_text_content")
+            and not text_index.pdf_identity_schema_available(self._fts)
+        ):
+            warnings.append(
+                "Indexed PDF text cannot be verified because full PDF page identity columns are "
                 "unavailable in the search index."
             )
         return warnings
@@ -468,11 +482,7 @@ class Library:
         if source not in {"all", *_TEXT_TABLES}:
             raise GoodnotesError("Coverage source must be all, handwriting, pdf, or textbox.")
         scope, _, notebook_ids = self._resolve_text_scope(folder, notebook)
-        page_refs = [
-            (document_id, page_id)
-            for document_id, page_id in self._page_numbers
-            if document_id in notebook_ids
-        ]
+        page_refs = self._page_refs_for_notebooks(notebook_ids)
         requested_sources = list(_TEXT_TABLES) if source == "all" else [source]
         details = text_index.coverage(self._fts, page_refs, requested_sources)
         mapping = details["page_meta"]
@@ -509,7 +519,7 @@ class Library:
 
         if source in {"all", "handwriting"}:
             recognition = self._recognition_status_for_page_ids(
-                [page_id for _, page_id in page_refs]
+                [page_ref.page_id for page_ref in page_refs]
             )
             pending_pages = sum(
                 1 for status in recognition.values() if status.index_state == "pending"
@@ -539,9 +549,86 @@ class Library:
             "page_meta": mapping,
             "sources": source_details,
             "completeness": "unknown",
-            "warnings": _unique(warnings),
-            "next_steps": _unique(next_steps)[:5],
+            "warnings": list(dict.fromkeys(warnings)),
+            "next_steps": list(dict.fromkeys(next_steps))[:5],
         }
+
+    def _page_refs_for_notebooks(
+        self, notebook_ids: set[str], *, page_ids: set[str] | None = None
+    ) -> list[PageRef]:
+        """Read active page identities and current PDF mappings from the projection."""
+        if not notebook_ids:
+            return []
+        assert self._projection is not None
+        page_columns = text_index.table_columns(self._projection, "pages")
+        template_columns = (
+            text_index.table_columns(self._projection, "templates")
+            if self._table_exists(self._projection, "templates")
+            else set()
+        )
+        has_projection_mapping = {"template_id", "id", "document_id"} <= page_columns and {
+            "id",
+            "document_id",
+            "attachment_id",
+            "page_number",
+        } <= template_columns
+        if has_projection_mapping:
+            identity = "t.attachment_id AS attachment_id, t.page_number AS page_number"
+            template_join = (
+                "LEFT JOIN templates AS t ON t.id = p.template_id AND t.document_id = p.document_id"
+            )
+        else:
+            identity = "NULL AS attachment_id, NULL AS page_number"
+            template_join = ""
+        order = (
+            "p.document_id, p.position, p.id"
+            if "position" in page_columns
+            else "p.document_id, p.id"
+        )
+        requested_pages = sorted(page_ids) if page_ids is not None else []
+        page_batches = (
+            list(text_index.batches(requested_pages, 300)) if page_ids is not None else [None]
+        )
+        result: list[PageRef] = []
+        for notebook_batch in text_index.id_batches(sorted(notebook_ids)):
+            document_placeholders = ", ".join("?" for _ in notebook_batch)
+            for page_batch in page_batches:
+                page_filter = ""
+                parameters: tuple[Any, ...] = tuple(notebook_batch)
+                if page_batch is not None:
+                    page_placeholders = ", ".join("?" for _ in page_batch)
+                    page_filter = f"AND p.id IN ({page_placeholders})"
+                    parameters += tuple(page_batch)
+                rows = self._projection.execute(
+                    f"""
+                    SELECT p.id AS page_id, p.document_id, {identity}
+                    FROM pages AS p
+                    {template_join}
+                    WHERE p.document_id IN ({document_placeholders})
+                      AND COALESCE(p.deleted, 0) = 0 {page_filter}
+                    ORDER BY {order}
+                    """,
+                    parameters,
+                )
+                for row in rows:
+                    attachment_id = row["attachment_id"]
+                    attachment_id = str(attachment_id) if attachment_id else None
+                    pdf_page_no: int | None
+                    try:
+                        pdf_page_no = int(row["page_number"])
+                        if pdf_page_no < 1:
+                            pdf_page_no = None
+                    except (TypeError, ValueError):
+                        pdf_page_no = None
+                    result.append(
+                        PageRef(
+                            document_id=row["document_id"],
+                            page_id=row["page_id"],
+                            attachment_id=attachment_id,
+                            pdf_page_no=pdf_page_no,
+                        )
+                    )
+        return result
 
     def _resolve_text_scope(
         self, folder: str | Item, notebook: str | Item | None
@@ -631,7 +718,7 @@ class Library:
             raise GoodnotesError("Search source must be all, handwriting, pdf, or textbox.")
         _, _, notebook_ids = self._resolve_text_scope(folder, notebook)
         if self._fts is None:
-            raise GoodnotesError("The sandbox has no search index.")
+            raise TextIndexUnavailableError("The sandbox has no search index.")
 
         selected_sources = list(_TEXT_TABLES) if source == "all" else [source]
         missing_sources = [
@@ -641,16 +728,15 @@ class Library:
         ]
         if source != "all" and missing_sources:
             label = _TEXT_TABLES[source][1]
-            raise GoodnotesError(f"{label} text is unavailable in this search index.")
+            raise TextIndexUnavailableError(f"{label} text is unavailable in this search index.")
         if source == "all" and len(missing_sources) == len(selected_sources):
-            raise GoodnotesError("The search index has no available text content tables.")
+            raise TextIndexUnavailableError(
+                "The search index has no available text content tables."
+            )
         if not text_index.page_meta_supports_search(self._fts):
-            if source == "all":
-                return []
-            raise GoodnotesError(
+            raise TextIndexUnavailableError(
                 "Search results cannot be mapped because usable page metadata is missing."
             )
-
         if not notebook_ids:
             return []
 
@@ -658,64 +744,106 @@ class Library:
             item_source for item_source in selected_sources if item_source not in missing_sources
         ]
         if not available:
-            raise GoodnotesError("The requested search index content table is unavailable.")
+            raise TextIndexUnavailableError(
+                "The requested search index content table is unavailable."
+            )
+        pdf_bindings: dict[str, Any] | None = None
+        if "pdf" in available:
+            pdf_bindings = text_index.pdf_page_bindings(
+                self._fts, self._page_refs_for_notebooks(notebook_ids)
+            )
+            if not pdf_bindings["available"]:
+                if source == "pdf":
+                    raise TextIndexUnavailableError(
+                        "PDF text cannot be searched because full page identity mapping is "
+                        "unavailable in this search index."
+                    )
+                available.remove("pdf")
+            elif (
+                source == "pdf"
+                and pdf_bindings["pages"]
+                and not any(
+                    binding["state"] != "unknown" for binding in pdf_bindings["pages"].values()
+                )
+            ):
+                raise TextIndexUnavailableError(
+                    "PDF text cannot be searched because active pages have no verifiable "
+                    "identity mapping in this search index."
+                )
+        if not available:
+            raise TextIndexUnavailableError("The requested text index mappings are unavailable.")
 
         source_order = {"handwriting": 0, "pdf": 1, "textbox": 2}
         candidates: list[_SearchCandidate] = []
         retained_keys: set[tuple[str, str, int, bytes]] = set()
         sequence = 0
+        notebook_batches = list(text_index.id_batches(sorted(notebook_ids)))
         # Each source cursor orders by text_id, and a page/source fixes the other
         # sort fields. Thus a later exact duplicate can never outrank its first row;
         # keys for candidates outside the retained top-K set need not be kept.
         for item_source in available:
-            for notebook_batch in _chunks(sorted(notebook_ids)):
-                for row in self._search_rows(item_source, query, notebook_batch):
-                    document_id = row["document_id"]
-                    page_id = row["page_id"]
-                    page_number = self._page_number_for_id(document_id, page_id)
-                    if page_number is None:
-                        continue
-                    entry = self._entries.get(("notebook", document_id))
-                    path = self._paths.get(("notebook", document_id))
-                    if entry is None or path is None:
-                        continue
-                    text = row["text"]
-                    digest = hashlib.blake2b(
-                        text.encode("utf-8", errors="surrogatepass"), digest_size=16
-                    ).digest()
-                    duplicate_key = (page_id, item_source, len(text), digest)
-                    if duplicate_key in retained_keys:
-                        continue
-                    sort_key = (
-                        path.casefold(),
-                        page_number,
-                        source_order[item_source],
-                        int(row["sort_id"] or 0),
+            if item_source == "pdf":
+                assert pdf_bindings is not None
+                rows = (
+                    row
+                    for notebook_batch in notebook_batches
+                    for row in text_index.search_pdf_rows(
+                        self._fts, pdf_bindings, query, notebook_batch
                     )
-                    candidate = _SearchCandidate(
-                        sort_key=sort_key,
-                        sequence=sequence,
-                        duplicate_key=duplicate_key,
-                        hit=SearchHit(
-                            document_id=document_id,
-                            path=path,
-                            page=page_number,
-                            page_id=page_id,
-                            source=item_source,
-                            text=text,
-                        ),
-                    )
-                    sequence += 1
-                    if len(candidates) < limit:
-                        heapq.heappush(candidates, candidate)
-                        retained_keys.add(duplicate_key)
-                    elif (candidate.sort_key, candidate.sequence) < (
-                        candidates[0].sort_key,
-                        candidates[0].sequence,
-                    ):
-                        evicted = heapq.heapreplace(candidates, candidate)
-                        retained_keys.remove(evicted.duplicate_key)
-                        retained_keys.add(duplicate_key)
+                )
+            else:
+                rows = (
+                    row
+                    for notebook_batch in notebook_batches
+                    for row in self._search_rows(item_source, query, notebook_batch)
+                )
+            for row in rows:
+                document_id = row["document_id"]
+                page_id = row["page_id"]
+                page_number = self._page_number_for_id(document_id, page_id)
+                if page_number is None:
+                    continue
+                entry = self._entries.get(("notebook", document_id))
+                path = self._paths.get(("notebook", document_id))
+                if entry is None or path is None:
+                    continue
+                text = row["text"]
+                digest = hashlib.blake2b(
+                    text.encode("utf-8", errors="surrogatepass"), digest_size=16
+                ).digest()
+                duplicate_key = (page_id, item_source, len(text), digest)
+                if duplicate_key in retained_keys:
+                    continue
+                sort_key = (
+                    path.casefold(),
+                    page_number,
+                    source_order[item_source],
+                    int(row["sort_id"] or 0),
+                )
+                candidate = _SearchCandidate(
+                    sort_key=sort_key,
+                    sequence=sequence,
+                    duplicate_key=duplicate_key,
+                    hit=SearchHit(
+                        document_id=document_id,
+                        path=path,
+                        page=page_number,
+                        page_id=page_id,
+                        source=item_source,
+                        text=text,
+                    ),
+                )
+                sequence += 1
+                if len(candidates) < limit:
+                    heapq.heappush(candidates, candidate)
+                    retained_keys.add(duplicate_key)
+                elif (candidate.sort_key, candidate.sequence) < (
+                    candidates[0].sort_key,
+                    candidates[0].sequence,
+                ):
+                    evicted = heapq.heapreplace(candidates, candidate)
+                    retained_keys.remove(evicted.duplicate_key)
+                    retained_keys.add(duplicate_key)
         return [
             candidate.hit
             for candidate in sorted(candidates, key=lambda x: (x.sort_key, x.sequence))
@@ -938,18 +1066,28 @@ class Library:
             warnings.append(
                 f"{self._links_to_deleted_count} active links to deleted items were ignored."
             )
+        page_meta_available = text_index.page_meta_supports_search(self._fts)
         page_meta_ids: set[str] = set()
-        if self._fts is not None and text_index.page_meta_supports_search(self._fts):
+        if self._fts is not None and page_meta_available:
             page_meta_ids = {
                 row[0] for row in self._fts.execute("SELECT page_id FROM page_meta").fetchall()
             }
-        active_page_ids = set(self._page_numbers_by_id())
-        pages_without_metadata = len(active_page_ids - page_meta_ids)
-        metadata_without_pages = len(page_meta_ids - active_page_ids)
-        if pages_without_metadata:
-            warnings.append(f"{pages_without_metadata} active pages have no index metadata row.")
-        if metadata_without_pages:
-            warnings.append(f"{metadata_without_pages} index metadata rows have no active page.")
+        if page_meta_available:
+            active_page_ids = set(self._page_numbers_by_id())
+            pages_without_metadata: int | None = len(active_page_ids - page_meta_ids)
+            metadata_without_pages: int | None = len(page_meta_ids - active_page_ids)
+            if pages_without_metadata:
+                warnings.append(
+                    f"{pages_without_metadata} active pages have no index metadata row."
+                )
+            if metadata_without_pages:
+                warnings.append(
+                    f"{metadata_without_pages} index metadata rows have no active page."
+                )
+        else:
+            pages_without_metadata = None
+            metadata_without_pages = None
+            warnings.append("Page-to-index metadata coverage is unavailable for this snapshot.")
         return {
             "active_folders": active_folders,
             "active_notebooks": active_notebooks,
@@ -967,7 +1105,7 @@ class Library:
             "pages_without_index_metadata": pages_without_metadata,
             "index_metadata_without_active_pages": metadata_without_pages,
             "search_index_available": bool(
-                self._fts is not None and fts_tables and self._table_exists(self._fts, "page_meta")
+                self._fts is not None and fts_tables and page_meta_available
             ),
             "search_content_tables": fts_tables,
             "warnings": warnings,
@@ -1282,10 +1420,6 @@ class Library:
                     pdf_page = candidate_page
             except (TypeError, ValueError):
                 pdf_page = None
-        if pdf_page is None:
-            mapping = self._page_template_mapping(row["id"])
-            if mapping is not None:
-                pdf_page = mapping[1]
 
         return Page(
             id=row["id"],
@@ -1391,7 +1525,12 @@ class Library:
         return text, warning, truncated
 
     def _page_template_mapping(self, page_id: str) -> tuple[str, int] | None:
-        if self._fts is None or not self._table_exists(self._fts, "page_meta"):
+        if (
+            self._fts is None
+            or not self._table_exists(self._fts, "page_meta")
+            or "template_attachment_id_and_page_no"
+            not in text_index.table_columns(self._fts, "page_meta")
+        ):
             return None
         row = self._fts.execute(
             "SELECT template_attachment_id_and_page_no FROM page_meta WHERE page_id = ?",
@@ -1411,69 +1550,87 @@ class Library:
         return attachment_id, page_number
 
     def _read_pdf_text_for_page(
-        self, page_id: str, document_id: str, budget: int | None
-    ) -> tuple[list[TextPart], int | None, bool, bool]:
-        """Read PDF index rows, loading no more than the remaining page text budget."""
-        if (
-            self._fts is None
-            or not self._table_exists(self._fts, "pdf_text_content")
-            or not self._table_exists(self._fts, "page_meta")
-        ):
-            return [], budget, False, False
-
-        mapping = self._fts.execute(
-            "SELECT pdf_text_id, template_attachment_id_and_page_no "
-            "FROM page_meta WHERE page_id = ?",
-            (page_id,),
-        ).fetchone()
-        if mapping is None:
-            return [], budget, False, False
-        if mapping["pdf_text_id"] is not None:
-            rows = self._fts.execute(
-                """
-                SELECT text_id, length(text) AS text_length
-                FROM pdf_text_content
-                WHERE text_id = ? AND COALESCE(text, '') <> ''
-                ORDER BY text_id
-                """,
-                (mapping["pdf_text_id"],),
+        self, page_ref: PageRef, budget: int | None
+    ) -> tuple[list[TextPart], int | None, bool, bool, str | None]:
+        """Read PDF index rows that match the projection-derived page identity."""
+        if self._fts is None or not self._table_exists(self._fts, "pdf_text_content"):
+            return [], budget, False, False, None
+        binding_result = text_index.pdf_page_bindings(self._fts, [page_ref])
+        if not binding_result["available"]:
+            return (
+                [],
+                budget,
+                False,
+                False,
+                "Indexed PDF text identity could not be verified; only confined copied "
+                "background text can be used.",
             )
-        elif mapping["template_attachment_id_and_page_no"] and self._table_exists(
-            self._fts, "template_meta"
-        ):
-            rows = self._fts.execute(
-                """
-                SELECT DISTINCT content.text_id, length(content.text) AS text_length
-                FROM template_meta AS template
-                JOIN pdf_text_content AS content
-                  ON content.attachment_id = template.attachment_id
-                 AND content.pdf_page_no = template.pdf_page_no
-                 AND content.document_id = ?
-                WHERE template.attachment_id || '_' || template.pdf_page_no = ?
-                  AND COALESCE(content.text, '') <> ''
-                ORDER BY content.text_id
-                """,
-                (document_id, mapping["template_attachment_id_and_page_no"]),
+        binding = binding_result["pages"][page_ref.page_id]
+        if binding["state"] == "unknown":
+            return (
+                [],
+                budget,
+                False,
+                False,
+                "Indexed PDF text mapping could not be verified for this page; only confined "
+                "copied background text can be used.",
             )
-        else:
-            return [], budget, False, False
+        mapping_warning = None
+        if binding["mismatched_direct_pointer"]:
+            mapping_warning = (
+                "A stored PDF text pointer did not match the current page identity and was ignored."
+            )
+        text_ids = binding["text_ids"]
+        if not text_ids:
+            return [], budget, False, False, mapping_warning
 
+        assert self._fts is not None
+        indexed_rows: list[sqlite3.Row] = []
+        for batch in text_index.batches(text_ids):
+            placeholders = ", ".join("?" for _ in batch)
+            indexed_rows.extend(
+                self._fts.execute(
+                    f"""
+                    SELECT text_id, length(text) AS text_length
+                    FROM pdf_text_content
+                    WHERE text_id IN ({placeholders})
+                      AND document_id = ? AND attachment_id = ? AND pdf_page_no = ?
+                      AND COALESCE(text, '') <> ''
+                    ORDER BY text_id
+                    """,
+                    (*batch, page_ref.document_id, page_ref.attachment_id, page_ref.pdf_page_no),
+                ).fetchall()
+            )
         parts: list[TextPart] = []
         found = False
-        for row in rows:
+        for row in indexed_rows:
             found = True
             if budget is not None and budget == 0:
-                return parts, budget, True, found
+                return parts, budget, True, found, mapping_warning
             if budget is None:
                 content = self._fts.execute(
-                    "SELECT text FROM pdf_text_content WHERE text_id = ?", (row["text_id"],)
+                    "SELECT text FROM pdf_text_content WHERE text_id = ? AND document_id = ? "
+                    "AND attachment_id = ? AND pdf_page_no = ?",
+                    (
+                        row["text_id"],
+                        page_ref.document_id,
+                        page_ref.attachment_id,
+                        page_ref.pdf_page_no,
+                    ),
                 ).fetchone()
                 text = content[0] if content is not None else ""
                 part_truncated = False
             else:
                 content = self._fts.execute(
-                    "SELECT substr(text, 1, ?) FROM pdf_text_content WHERE text_id = ?",
-                    (budget + 1, row["text_id"]),
+                    "SELECT substr(text, 1, ?) FROM pdf_text_content WHERE text_id = ? "
+                    "AND document_id = ? AND attachment_id = ? AND pdf_page_no = ?",
+                    (
+                        budget + 1,
+                        row["text_id"],
+                        page_ref.document_id,
+                        page_ref.attachment_id,
+                        page_ref.pdf_page_no,
+                    ),
                 ).fetchone()
                 text = content[0] if content is not None else ""
                 part_truncated = int(row["text_length"] or 0) > budget or len(text) > budget
@@ -1484,8 +1641,8 @@ class Library:
             if budget is not None:
                 budget = max(0, budget - len(text))
             if part_truncated:
-                return parts, budget, True, found
-        return parts, budget, False, found
+                return parts, budget, True, found, mapping_warning
+        return parts, budget, False, found, mapping_warning
 
     def _notebook_ids_under(self, parent_key: tuple[str, str] | None) -> set[str]:
         ids: set[str] = set()
@@ -1504,101 +1661,41 @@ class Library:
     def _search_rows(
         self, source: str, query: str, document_ids: list[str] | None = None
     ) -> Iterator[sqlite3.Row]:
+        """Search handwriting or textbox rows for a bounded notebook-id set."""
         assert self._fts is not None
         if document_ids is None:
             document_ids = sorted(self._notebook_ids_under(None))
-        if len(document_ids) > _SQL_ID_BATCH:
-            for batch in _chunks(document_ids):
+        if len(document_ids) > 400:
+            for batch in text_index.id_batches(document_ids):
                 yield from self._search_rows(source, query, batch)
             return
         if not document_ids or not text_index.page_meta_supports_search(self._fts):
             return
-        page_meta_columns = text_index.table_columns(self._fts, "page_meta")
-        mapping_filter = text_index.page_meta_live_filter(page_meta_columns, alias="p")
-        scope = ", ".join("?" for _ in document_ids)
-        if source == "handwriting":
-            if not self._table_exists(self._fts, "annotation_text_content") or not {
-                "page_id",
-                "text_id",
-                "text",
-            } <= text_index.table_columns(self._fts, "annotation_text_content"):
-                return
-            yield from self._fts.execute(
-                f"""
-                SELECT p.document_id, a.page_id, a.text, a.text_id AS sort_id
-                FROM annotation_text_content AS a
-                JOIN page_meta AS p ON p.page_id = a.page_id
-                WHERE p.document_id IN ({scope}) {mapping_filter}
-                  AND instr(casefold(a.text), casefold(?)) > 0
-                ORDER BY a.text_id
-                """,
-                (*document_ids, query),
-            )
+        if source not in {"handwriting", "textbox"}:
             return
-        if source == "textbox":
-            if not self._table_exists(self._fts, "textbox_text_content") or not {
-                "page_id",
-                "text_id",
-                "text",
-            } <= text_index.table_columns(self._fts, "textbox_text_content"):
-                return
-            yield from self._fts.execute(
-                f"""
-                SELECT p.document_id, t.page_id, t.text, t.text_id AS sort_id
-                FROM textbox_text_content AS t
-                JOIN page_meta AS p ON p.page_id = t.page_id
-                WHERE p.document_id IN ({scope}) {mapping_filter}
-                  AND instr(casefold(t.text), casefold(?)) > 0
-                ORDER BY t.text_id
-                """,
-                (*document_ids, query),
-            )
-            return
-        if not self._table_exists(self._fts, "pdf_text_content") or not {
+        table = _TEXT_TABLES[source][0]
+        if not self._table_exists(self._fts, table) or not {
+            "page_id",
             "text_id",
             "text",
-        } <= text_index.table_columns(self._fts, "pdf_text_content"):
+        } <= text_index.table_columns(self._fts, table):
             return
-        if "pdf_text_id" in page_meta_columns:
-            yield from self._fts.execute(
-                f"""
-                SELECT p.document_id, p.page_id, content.text, content.text_id AS sort_id
-                FROM page_meta AS p
-                JOIN pdf_text_content AS content ON content.text_id = p.pdf_text_id
-                WHERE p.document_id IN ({scope}) {mapping_filter}
-                  AND instr(casefold(content.text), casefold(?)) > 0
-                ORDER BY content.text_id
-                """,
-                (*document_ids, query),
-            )
-        template_columns = text_index.table_columns(self._fts, "template_meta")
-        pdf_columns = text_index.table_columns(self._fts, "pdf_text_content")
-        if (
-            self._table_exists(self._fts, "template_meta")
-            and "template_attachment_id_and_page_no" in page_meta_columns
-            and "pdf_text_id" in page_meta_columns
-            and {"attachment_id", "pdf_page_no"} <= template_columns
-            and {"attachment_id", "pdf_page_no", "document_id"} <= pdf_columns
-        ):
-            yield from self._fts.execute(
-                f"""
-                SELECT DISTINCT p.document_id, p.page_id, content.text,
-                                content.text_id AS sort_id
-                FROM page_meta AS p
-                JOIN template_meta AS template
-                  ON p.template_attachment_id_and_page_no =
-                     template.attachment_id || '_' || template.pdf_page_no
-                JOIN pdf_text_content AS content
-                  ON content.attachment_id = template.attachment_id
-                 AND content.pdf_page_no = template.pdf_page_no
-                 AND content.document_id = p.document_id
-                WHERE p.document_id IN ({scope}) {mapping_filter}
-                  AND p.pdf_text_id IS NULL
-                  AND instr(casefold(content.text), casefold(?)) > 0
-                ORDER BY content.text_id
-                """,
-                (*document_ids, query),
-            )
+        alias = "a" if source == "handwriting" else "t"
+        scope = ", ".join("?" for _ in document_ids)
+        page_meta_columns = text_index.table_columns(self._fts, "page_meta")
+        mapping_filter = text_index.page_meta_live_filter(page_meta_columns, alias="p")
+        yield from self._fts.execute(
+            f"""
+            SELECT p.document_id, {alias}.page_id, {alias}.text,
+                   {alias}.text_id AS sort_id
+            FROM {table} AS {alias}
+            JOIN page_meta AS p ON p.page_id = {alias}.page_id
+            WHERE p.document_id IN ({scope}) {mapping_filter}
+              AND instr(casefold({alias}.text), casefold(?)) > 0
+            ORDER BY {alias}.text_id
+            """,
+            (*document_ids, query),
+        )
 
     def _page_number_for_id(self, document_id: str, page_id: str) -> int | None:
         return self._page_numbers.get((document_id, page_id))
@@ -1623,12 +1720,3 @@ def _join_path(parent: str, child: str) -> str:
     if not child:
         return parent
     return f"{parent}/{child}"
-
-
-def _chunks(values: list[str], size: int = _SQL_ID_BATCH) -> Iterator[list[str]]:
-    for start in range(0, len(values), size):
-        yield values[start : start + size]
-
-
-def _unique(values: list[str]) -> list[str]:
-    return list(dict.fromkeys(values))

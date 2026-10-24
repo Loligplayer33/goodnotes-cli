@@ -9,7 +9,7 @@ from pathlib import Path
 import pymupdf
 import pytest
 
-from goodnotes_cli.errors import GoodnotesError
+from goodnotes_cli.errors import GoodnotesError, TextIndexUnavailableError
 from goodnotes_cli.library import Library
 from goodnotes_cli.safety import Sandbox
 
@@ -607,7 +607,8 @@ def test_missing_page_metadata_warns_about_stored_index_coverage(tmp_path: Path)
         warnings = library.text_warnings()
         assert len(warnings) == 1
         assert "Stored-index search cannot map" in warnings[0]
-        assert library.search("STRASSE") == []
+        with pytest.raises(GoodnotesError, match="page metadata"):
+            library.search("STRASSE")
         with pytest.raises(GoodnotesError, match="page metadata is missing"):
             library.search("STRASSE", source="handwriting")
 
@@ -740,6 +741,7 @@ def test_search_coverage_does_not_count_pdf_metadata_without_content(tmp_path: P
     assert sandbox.fts_path is not None
     with sqlite3.connect(sandbox.fts_path) as db:
         db.execute("UPDATE page_meta SET pdf_text_id = 999 WHERE page_id = 'page-02'")
+        db.execute("DELETE FROM pdf_text_content WHERE text_id = 101")
 
     with Library(sandbox) as library:
         details = library.search_coverage(source="pdf", notebook="doc-hostile")
@@ -747,10 +749,125 @@ def test_search_coverage_does_not_count_pdf_metadata_without_content(tmp_path: P
         assert pdf["availability"] == "available"
         assert pdf["pages_with_stored_nonempty_text"] == 1
         assert pdf["metadata_without_nonempty_text_pages"] == 1
+        assert pdf["mismatched_direct_pointers"] == 1
         assert details["page_meta"]["mapped_active_pages"] == 3
         assert details["completeness"] == "unknown"
         assert any("no non-empty indexed PDF text" in warning for warning in details["warnings"])
         assert library.search("direct PDF phrase", source="pdf", notebook="doc-hostile") == []
+
+
+def test_pdf_direct_pointer_must_match_projection_identity(tmp_path: Path) -> None:
+    sandbox = _create_snapshot(tmp_path / "snapshot")
+    assert sandbox.fts_path is not None
+    with sqlite3.connect(sandbox.fts_path) as db:
+        db.execute("UPDATE page_meta SET pdf_text_id = 102 WHERE page_id = 'page-02'")
+
+    with Library(sandbox) as library:
+        first_page = library.read_page("doc-hostile", 1, source="pdf")
+        assert [part.text for part in first_page.parts] == ["direct PDF phrase"]
+        assert any(
+            "did not match the current page identity" in warning for warning in first_page.warnings
+        )
+        direct_hits = library.search("direct PDF phrase", source="pdf", notebook="doc-hostile")
+        wrong_page_hits = library.search("mapped PDF phrase", source="pdf", notebook="doc-hostile")
+        assert [(hit.page, hit.text) for hit in direct_hits] == [(1, "direct PDF phrase")]
+        assert [(hit.page, hit.text) for hit in wrong_page_hits] == [(2, "mapped PDF phrase")]
+        coverage = library.search_coverage(source="pdf", notebook="doc-hostile")
+        assert coverage["sources"]["pdf"]["pages_with_stored_nonempty_text"] == 2
+        assert coverage["sources"]["pdf"]["mismatched_direct_pointers"] == 1
+
+
+def test_direct_only_pdf_metadata_uses_projection_identity(tmp_path: Path) -> None:
+    sandbox = _create_snapshot(tmp_path / "snapshot")
+    assert sandbox.fts_path is not None
+    with sqlite3.connect(sandbox.fts_path) as db:
+        db.execute("DROP TABLE page_meta")
+        db.execute(
+            "CREATE TABLE page_meta (page_id TEXT PRIMARY KEY, document_id TEXT, "
+            "pdf_text_id INTEGER)"
+        )
+        db.executemany(
+            "INSERT INTO page_meta VALUES (?, ?, ?)",
+            [
+                ("page-02", "doc-hostile", 101),
+                ("page-10", "doc-hostile", None),
+                ("page-30", "doc-hostile", None),
+            ],
+        )
+
+    with Library(sandbox) as library:
+        page_text = library.read_page("doc-hostile", 1, source="pdf")
+        assert [part.text for part in page_text.parts] == ["direct PDF phrase"]
+        hits = library.search("mapped PDF phrase", source="pdf", notebook="doc-hostile")
+        assert [(hit.page, hit.text) for hit in hits] == [(2, "mapped PDF phrase")]
+        coverage = library.search_coverage(source="pdf", notebook="doc-hostile")
+        assert coverage["sources"]["pdf"]["availability"] == "available"
+        assert coverage["sources"]["pdf"]["pages_with_stored_nonempty_text"] == 2
+
+
+def test_pdf_search_reports_unverifiable_projection_mapping(tmp_path: Path) -> None:
+    sandbox = _create_snapshot(tmp_path / "snapshot")
+    with sqlite3.connect(sandbox.projection_path) as db:
+        db.execute("UPDATE templates SET attachment_id = NULL, page_number = NULL")
+
+    with Library(sandbox) as library:
+        with pytest.raises(TextIndexUnavailableError, match="no verifiable identity mapping"):
+            library.search("mapped PDF phrase", source="pdf", notebook="doc-hostile")
+        with pytest.raises(GoodnotesError, match="Search source"):
+            library.search("mapped PDF phrase", source="invalid", notebook="doc-hostile")
+
+
+def test_pdf_binding_uses_bounded_indexed_identity_joins(tmp_path: Path) -> None:
+    sandbox = _create_snapshot(tmp_path / "snapshot")
+    page_rows = []
+    template_rows = []
+    meta_rows = []
+    pdf_rows = []
+    for index in range(120):
+        page_id = f"bulk-page-{index:03}"
+        template_id = f"bulk-template-{index:03}"
+        attachment_id = f"bulk-attachment-{index:03}"
+        position = f"bulk-{index:03}"
+        page_no = index + 1
+        page_rows.append((page_id, "doc-hostile", template_id, position, f"group-{index}", 0))
+        template_rows.append((template_id, "doc-hostile", attachment_id, page_no, 600, 800))
+        meta_rows.append(
+            (
+                page_id,
+                "doc-hostile",
+                position,
+                None,
+                f"{attachment_id}_{page_no}",
+                0,
+                0,
+            )
+        )
+        pdf_rows.append(
+            (1000 + index, "bulk indexed phrase", attachment_id, page_no, "doc-hostile")
+        )
+    with sqlite3.connect(sandbox.projection_path) as db:
+        db.executemany("INSERT INTO pages VALUES (?, ?, ?, ?, ?, ?)", page_rows)
+        db.executemany("INSERT INTO templates VALUES (?, ?, ?, ?, ?, ?)", template_rows)
+    assert sandbox.fts_path is not None
+    with sqlite3.connect(sandbox.fts_path) as db:
+        db.execute(
+            "CREATE INDEX pdf_identity_idx "
+            "ON pdf_text_content(document_id, attachment_id, pdf_page_no)"
+        )
+        db.executemany("INSERT INTO page_meta VALUES (?, ?, ?, ?, ?, ?, ?)", meta_rows)
+        db.executemany("INSERT INTO pdf_text_content VALUES (?, ?, ?, ?, ?)", pdf_rows)
+
+    with Library(sandbox) as library:
+        assert library._fts is not None
+        statements: list[str] = []
+        library._fts.set_trace_callback(statements.append)
+        coverage = library.search_coverage(source="pdf", notebook="doc-hostile")
+        assert coverage["sources"]["pdf"]["pages_with_stored_nonempty_text"] == 122
+        identity_queries = [statement for statement in statements if "WITH expected(" in statement]
+        assert len(identity_queries) == 2
+        assert all("template_meta" not in statement for statement in identity_queries)
+        plan = library._fts.execute(f"EXPLAIN QUERY PLAN {identity_queries[0]}").fetchall()
+        assert any("pdf_identity_idx" in row[3] for row in plan)
 
 
 def test_pdf_search_coverage_suggests_scoped_background_scan(tmp_path: Path) -> None:
@@ -846,6 +963,42 @@ def test_recognition_status_marks_missing_store_or_table_unavailable(tmp_path: P
         status = no_table.recognition_status("doc-hostile")["page-02"]
         assert status.availability == "unavailable"
         assert status.text_rows is None
+
+
+def test_partial_page_metadata_is_safe_for_pdf_read_and_doctor(tmp_path: Path) -> None:
+    sandbox = _create_snapshot(tmp_path / "partial")
+    assert sandbox.fts_path is not None
+    with sqlite3.connect(sandbox.fts_path) as db:
+        db.execute("DROP TABLE page_meta")
+        db.execute("CREATE TABLE page_meta (page_id TEXT PRIMARY KEY, document_id TEXT)")
+        db.executemany(
+            "INSERT INTO page_meta VALUES (?, ?)",
+            [
+                ("page-02", "doc-hostile"),
+                ("page-10", "doc-hostile"),
+                ("page-30", "doc-hostile"),
+            ],
+        )
+
+    with Library(sandbox) as library:
+        page_text = library.read_page("doc-hostile", 3, source="pdf")
+        assert page_text.parts[0].text == "Copied attachment fallback text"
+        assert not any("page_meta" in warning for warning in page_text.warnings)
+        assert library._page_template_mapping("page-30") is None
+        stats = library.stats()
+        assert stats["pages_without_index_metadata"] == 0
+        assert stats["search_index_available"] is True
+
+    no_metadata = _create_snapshot(tmp_path / "missing")
+    assert no_metadata.fts_path is not None
+    with sqlite3.connect(no_metadata.fts_path) as db:
+        db.execute("DROP TABLE page_meta")
+    with Library(no_metadata) as library:
+        stats = library.stats()
+        assert stats["pages_without_index_metadata"] is None
+        assert stats["index_metadata_without_active_pages"] is None
+        assert stats["search_index_available"] is False
+        assert any("metadata coverage is unavailable" in warning for warning in stats["warnings"])
 
 
 def test_search_coverage_is_batched_metadata_only_and_handles_missing_tables(

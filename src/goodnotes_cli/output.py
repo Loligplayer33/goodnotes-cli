@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from dataclasses import fields as dataclass_fields
 from pathlib import Path
 from typing import Any
@@ -15,50 +15,150 @@ from .config import Settings
 from .errors import GoodnotesError
 from .models import Item, Page, PageText, SearchHit
 
-_ROW_MODELS = {
-    "ls": ("items", Item),
-    "tree": ("items", Item),
-    "pages": ("pages", Page),
-    "read": ("pages", PageText),
-    "search": ("hits", SearchHit),
-    "scan-pdfs": ("hits", SearchHit),
+
+@dataclass(frozen=True)
+class Projection:
+    """Command identity and enabled flags used to validate a field projection."""
+
+    command_name: str
+    enabled_options: frozenset[str] = frozenset()
+
+
+@dataclass(frozen=True)
+class _ProjectionSpec:
+    fields: tuple[str, ...]
+    row_key: str | None = None
+    optional_fields: tuple[str, ...] = ()
+    conditional_fields: tuple[tuple[str, str], ...] = ()
+    example: str | None = None
+
+
+def _model_fields(model: type[Any]) -> tuple[str, ...]:
+    return tuple(field.name for field in dataclass_fields(model))
+
+
+_ITEM_FIELDS = _model_fields(Item)
+_PROJECTIONS: dict[str, _ProjectionSpec] = {
+    "ls": _ProjectionSpec(
+        _model_fields(Item),
+        row_key="items",
+        example="goodnotes --fields id,name,kind,path ls",
+    ),
+    "tree": _ProjectionSpec(
+        _model_fields(Item),
+        row_key="items",
+        example="goodnotes --fields id,name,kind,path tree",
+    ),
+    "info": _ProjectionSpec(
+        (*_ITEM_FIELDS, "snapshot"), example='goodnotes --fields id,name,path info "Course Notes"'
+    ),
+    "pages": _ProjectionSpec(
+        _model_fields(Page),
+        row_key="pages",
+        conditional_fields=(("recognition", "with_recognition"),),
+        example='goodnotes --fields number,recognition pages "Course Notes" --with-recognition',
+    ),
+    "read": _ProjectionSpec(
+        _model_fields(PageText),
+        row_key="pages",
+        example='goodnotes --fields page,parts,warnings,truncated read "Course Notes" --page 1',
+    ),
+    "search": _ProjectionSpec(
+        (*_model_fields(SearchHit), "snippet"),
+        row_key="hits",
+        example='goodnotes --fields path,page,source,text search "term"',
+    ),
+    "scan-pdfs": _ProjectionSpec(
+        (*_model_fields(SearchHit), "snippet"),
+        row_key="hits",
+        example='goodnotes --fields path,page,source,text scan-pdfs "term"',
+    ),
+    "sync": _ProjectionSpec(
+        ("status", "snapshot", "snapshot_id", "checked_at", "source_changed_during_refresh"),
+        optional_fields=("captured_at", "warnings"),
+    ),
+    "snapshot": _ProjectionSpec(("snapshot", "status")),
+    "export": _ProjectionSpec(
+        (
+            "path",
+            "document_id",
+            "pages",
+            "selected_pages",
+            "layer",
+            "source",
+            "includes_handwriting",
+            "annotation_status",
+            "warnings",
+        )
+    ),
+    "render": _ProjectionSpec(
+        (
+            "path",
+            "document_id",
+            "page",
+            "source_page",
+            "dpi",
+            "layer",
+            "source",
+            "includes_handwriting",
+            "annotation_status",
+            "warnings",
+        )
+    ),
+    "attach-pdf": _ProjectionSpec(("document_id", "path", "pages", "registered", "warnings")),
+    "bundle": _ProjectionSpec(("directory", "manifest", "pages", "layer", "truncated")),
 }
 
 
 def output_contract(command_name: str) -> dict[str, Any] | None:
-    """Describe field projection for commands with a shared row model."""
-    if command_name == "info":
-        return {
-            "projection": "response",
-            "fields": [field.name for field in dataclass_fields(Item)] + ["snapshot"],
-            "example": 'goodnotes --fields id,name,path info "Course Notes"',
-        }
-    model = _ROW_MODELS.get(command_name)
-    if model is None:
+    """Describe the command's supported response or row projection."""
+    spec = _PROJECTIONS.get(command_name)
+    if spec is None:
         return None
-    key, row_model = model
-    fields = [field.name for field in dataclass_fields(row_model)]
-    if command_name in {"search", "scan-pdfs"}:
-        fields.append("snippet")
-    result: dict[str, Any] = {
-        "projection": f"{key}[]",
-        "fields": fields,
+    if spec.row_key is None:
+        result: dict[str, Any] = {"projection": "response", "fields": list(spec.fields)}
+        if spec.optional_fields:
+            result["optional_fields"] = {
+                field: "May be absent from a successful response." for field in spec.optional_fields
+            }
+        if spec.example is not None:
+            result["example"] = spec.example
+        return result
+
+    row_result: dict[str, Any] = {
+        "projection": f"{spec.row_key}[]",
+        "fields": list(spec.fields),
         "metadata": "Sibling metadata, including snapshot, is retained automatically.",
     }
-    if command_name == "pages":
-        result["optional_fields"] = {"recognition": "Requires --with-recognition."}
-        result["example"] = (
-            'goodnotes --fields number,recognition pages "Course Notes" --with-recognition'
+    if spec.conditional_fields:
+        row_result["optional_fields"] = {
+            field: f"Requires --{option.replace('_', '-')}"
+            for field, option in spec.conditional_fields
+        }
+    if spec.example is not None:
+        row_result["example"] = spec.example
+    return row_result
+
+
+def validate_projection(raw_fields: str | None, projection: Projection) -> list[str] | None:
+    """Validate fields before a command runs and return their parsed order."""
+    fields = _parse_fields(raw_fields)
+    if fields is None:
+        return None
+    spec = _PROJECTIONS.get(projection.command_name)
+    if spec is not None:
+        available = set(spec.fields) | set(spec.optional_fields)
+        available.update(
+            field
+            for field, option in spec.conditional_fields
+            if option in projection.enabled_options
         )
-    elif command_name in {"ls", "tree"}:
-        result["example"] = f"goodnotes --fields id,name,kind,path {command_name}"
-    elif command_name == "read":
-        result["example"] = (
-            'goodnotes --fields page,parts,warnings,truncated read "Course Notes" --page 1'
+        _unknown_fields(
+            fields,
+            available,
+            f"{spec.row_key}[]" if spec.row_key else "the response object",
         )
-    else:
-        result["example"] = f'goodnotes --fields path,page,source,text {command_name} "term"'
-    return result
+    return fields
 
 
 def _unknown_fields(fields: list[str], available: Iterable[str], level: str) -> None:
@@ -88,22 +188,31 @@ def emit(value: Any, settings: Settings) -> None:
     result = serializable(value)
     if settings.snapshot_id is not None and isinstance(result, dict):
         result["snapshot"] = settings.snapshot_id
-    if settings.fields:
-        fields = [field.strip() for field in settings.fields.split(",") if field.strip()]
-        if not fields:
-            raise GoodnotesError("--fields must contain at least one field name.")
+    projection = settings.projection
+    fields = (
+        validate_projection(settings.fields, projection)
+        if projection is not None
+        else _parse_fields(settings.fields)
+    )
+    if fields is not None:
         if isinstance(result, dict):
-            for key in ("items", "pages", "hits"):
-                if isinstance(result.get(key), list) and all(
-                    isinstance(row, dict) for row in result[key]
-                ):
-                    for row in result[key]:
-                        _unknown_fields(fields, row.keys(), f"{key}[]")
-                    result[key] = [{field: row[field] for field in fields} for row in result[key]]
-                    break
+            spec = _PROJECTIONS.get(projection.command_name) if projection is not None else None
+            if (
+                spec is not None
+                and spec.row_key is not None
+                and isinstance(result.get(spec.row_key), list)
+            ):
+                rows = result[spec.row_key]
+                if not all(isinstance(row, dict) for row in rows):
+                    raise GoodnotesError(f"Expected {spec.row_key} rows in the command response.")
+                result[spec.row_key] = [
+                    {field: row[field] for field in fields if field in row} for row in rows
+                ]
+            elif spec is not None and spec.row_key is None:
+                result = {field: result[field] for field in fields if field in result}
             else:
                 _unknown_fields(fields, result.keys(), "the response object")
-                result = {field: result[field] for field in fields}
+                result = {field: result[field] for field in fields if field in result}
     if settings.snapshot_id is not None and isinstance(result, dict):
         result["snapshot"] = settings.snapshot_id
     typer.echo(
@@ -173,7 +282,24 @@ def snippet_hits(hits: Any, query: str) -> list[dict[str, Any]]:
     return rows
 
 
-def emit_error(code: str, message: str) -> None:
+def emit_error(code: str, message: str, *, details: dict[str, Any] | None = None) -> None:
+    """Emit a structured error, optionally with machine-readable recovery context."""
+    error: dict[str, Any] = {"code": code, "message": message}
+    if details is not None:
+        error["details"] = serializable(details)
     typer.echo(
-        json.dumps({"error": {"code": code, "message": message}}, separators=(",", ":")), err=True
+        json.dumps(
+            {"error": error},
+            separators=(",", ":"),
+        ),
+        err=True,
     )
+
+
+def _parse_fields(raw_fields: str | None) -> list[str] | None:
+    if raw_fields is None:
+        return None
+    fields = [field.strip() for field in raw_fields.split(",") if field.strip()]
+    if not fields:
+        raise GoodnotesError("--fields must contain at least one field name.")
+    return fields

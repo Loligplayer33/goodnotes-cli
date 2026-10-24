@@ -11,7 +11,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from functools import wraps
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, cast
 
 import typer
 from typer.core import TyperGroup
@@ -20,9 +20,10 @@ from . import __version__
 from .cache import read_view, refresh_cache
 from .config import Settings, default_data_dir, default_library
 from .documents import export_pdf, register_annotated_pdf, render_page
-from .errors import GoodnotesError
+from .errors import GoodnotesError, TextIndexUnavailableError
 from .library import Library
 from .output import (
+    Projection,
     bound_page_text,
     emit,
     emit_error,
@@ -30,6 +31,7 @@ from .output import (
     select_pages,
     serializable,
     snippet_hits,
+    validate_projection,
     window,
 )
 from .snapshot import create_snapshot
@@ -74,8 +76,23 @@ app = typer.Typer(
 
 def command(*args: Any, **kwargs: Any) -> Any:
     def decorate(function: Any) -> Any:
+        command_name = (
+            args[0]
+            if args and isinstance(args[0], str)
+            else kwargs.get("name") or function.__name__.replace("_", "-")
+        )
+
         @wraps(function)
         def checked(*fargs: Any, **fkwargs: Any) -> Any:
+            ctx = cast(typer.Context | None, fkwargs.get("ctx") or (fargs[0] if fargs else None))
+            if ctx is not None and hasattr(ctx, "params") and isinstance(ctx.obj, Settings):
+                cfg = settings(ctx)
+                projection = Projection(
+                    command_name,
+                    frozenset(name for name, value in ctx.params.items() if value is True),
+                )
+                cfg.projection = projection
+                validate_projection(cfg.fields, projection)
             try:
                 return function(*fargs, **fkwargs)
             except (OSError, sqlite3.Error, ValueError) as exc:
@@ -311,13 +328,27 @@ def search(
     """
     selected_folder = _search_folder(folder, notebook)
     with repository(ctx) as lib:
-        hits = lib.search(
-            query,
-            folder=selected_folder,
-            notebook=notebook,
-            source=source,
-            limit=offset + limit + 1,
-        )
+        try:
+            hits = lib.search(
+                query,
+                folder=selected_folder,
+                notebook=notebook,
+                source=source,
+                limit=offset + limit + 1,
+            )
+        except TextIndexUnavailableError as exc:
+            coverage = lib.search_coverage(folder=selected_folder, notebook=notebook, source=source)
+            warnings = coverage.pop("warnings", [])
+            emit_error(
+                "operation_failed",
+                str(exc),
+                details={
+                    "coverage": "stored-index",
+                    "coverage_detail": coverage,
+                    "warnings": warnings,
+                },
+            )
+            raise SystemExit(1) from None
         selected = snippet_hits(hits[offset : offset + limit], query)
         coverage = lib.search_coverage(folder=selected_folder, notebook=notebook, source=source)
         warnings = coverage.pop("warnings")
@@ -476,12 +507,14 @@ def bundle(
     cfg = settings(ctx)
     with repository(ctx) as lib:
         sandbox = lib.sandbox
+        all_pages = lib.pages(notebook)
+        selected = select_pages(pages, len(all_pages), maximum=10)
         destination = sandbox.ensure_output(output)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        temporary = Path(tempfile.mkdtemp(prefix=".goodnotes-bundle-", dir=destination.parent))
+        parent_existed = destination.parent.exists()
+        temporary: Path | None = None
         try:
-            all_pages = lib.pages(notebook)
-            selected = select_pages(pages, len(all_pages), maximum=10)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            temporary = Path(tempfile.mkdtemp(prefix=".goodnotes-bundle-", dir=destination.parent))
             manifest = []
             remaining = max_chars
             for number in selected:
@@ -505,7 +538,13 @@ def bundle(
             )
             publish_bundle(temporary, destination)
         except BaseException:
-            shutil.rmtree(temporary, ignore_errors=True)
+            if temporary is not None:
+                shutil.rmtree(temporary, ignore_errors=True)
+            if not parent_existed:
+                try:
+                    destination.parent.rmdir()
+                except OSError:
+                    pass
             raise
         emit(
             {

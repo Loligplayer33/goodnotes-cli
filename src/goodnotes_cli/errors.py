@@ -9,3 +9,7 @@ class StaleSnapshotError(GoodnotesError):
     """A continuation expects a different generation than the active read view."""
 
     code = "stale_snapshot"
+
+
+class TextIndexUnavailableError(GoodnotesError):
+    """The requested stored text index cannot answer this search request."""

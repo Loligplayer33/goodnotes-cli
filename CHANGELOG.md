@@ -20,6 +20,11 @@ Notable changes to the project are recorded here. Versions follow Semantic Versi
 
 - Field selection on bundle results now handles numeric page lists without crashing.
 - Field-selection errors identify the response level and valid keys. Snapshot metadata is selectable on top-level responses and always retained.
+- Invalid field projections fail before files or cache state are written, including when row results are empty.
+- Indexed PDF text is checked against the current page's document, attachment, and PDF page before reading, searching, or counting it.
+- Partial index schemas report unavailable mappings instead of crashing, and missing metadata is reported as unknown when it cannot be inspected.
+- Explicit managed-copy paths containing `..` retain the reader lock during refresh and pruning.
+- Whole-library PDF diagnostics use indexed identity lookups instead of repeated template scans.
 
 ## [0.1.0] - 2026-10-24
 

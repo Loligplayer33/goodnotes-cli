@@ -30,6 +30,16 @@ class Page:
 
 
 @dataclass(frozen=True)
+class PageRef:
+    """Projection-derived identity for one active page and its PDF background."""
+
+    document_id: str
+    page_id: str
+    attachment_id: str | None = None
+    pdf_page_no: int | None = None
+
+
+@dataclass(frozen=True)
 class TextPart:
     source: str
     text: str

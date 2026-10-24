@@ -46,7 +46,7 @@ These options are accepted before a command. They apply only where the command u
 
 `GOODNOTES_DATA_DIR` takes precedence over the default cache path; `--data-dir` overrides the environment. The same precedence applies to `GOODNOTES_SANDBOX` and `--sandbox`.
 
-Field selection filters object rows while keeping surrounding metadata, including warnings and pagination. Empty row arrays stay empty. Responses without object-row arrays, such as `bundle`, use top-level selection. Cache-backed commands always retain `snapshot`. Use `schema COMMAND` to see the projection level and valid row fields; the `pages` schema marks `recognition` as optional and requires `--with-recognition` to select it.
+Field selection filters object rows while keeping surrounding metadata, including warnings and pagination. Empty row arrays stay empty and still validate requested field names. Responses without object-row arrays, such as `bundle`, use top-level selection. Valid optional response keys are omitted when absent. Cache-backed commands always retain `snapshot`. Declared fields are checked before commands write outputs or cache state. Use `schema COMMAND` for field names; selecting `recognition` requires `pages --with-recognition`.
 
 ## Names, folders, and pages
 
@@ -246,6 +246,6 @@ Prints the command contract without loading notebook data. With no command, it r
 
 ## Output, errors, and pagination
 
-Successful commands that return data write one JSON value to stdout. Compact JSON is the default; `--text` indents it. Help and version output are plain text. Expected runtime errors write `{"error":{"code":"...","message":"..."}}` to stderr and exit `1`. Invalid command syntax or parser-checked option bounds exit `2` with `invalid_arguments`; application-checked values such as an invalid page expression are runtime errors and exit `1`. Keyboard interruption or a broken pipe exits `130`.
+Successful commands that return data write one JSON value to stdout. Compact JSON is the default; `--text` indents it. Help and version output are plain text. Expected runtime errors write `{"error":{"code":"...","message":"..."}}` to stderr and exit `1`. Errors may include `details` with recovery context; unavailable-index search errors include scoped coverage and PDF fallback guidance. Invalid command syntax or parser-checked option bounds exit `2` with `invalid_arguments`; application-checked values such as an invalid page expression are runtime errors and exit `1`. Keyboard interruption or a broken pipe exits `130`.
 
 Cache-backed commands include the read-view generation ID as `snapshot`. For `ls`, `tree`, `pages`, and `search`, pass `next_offset` as the next `--offset`. For `scan-pdfs`, pass `next_page_offset` as the next `--page-offset`. Include the same generation ID with global `--expect-snapshot ID` on every request in a multi-call sequence. If the command returns `stale_snapshot`, restart the sequence against the new view; do not combine results from different generations. The `snapshot` field from `sync` is a filesystem path; use its `snapshot_id` field for the generation ID. The standalone `snapshot` command's `snapshot` field is also a destination path.

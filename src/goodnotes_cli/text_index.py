@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Iterator
-from typing import Any
+from collections.abc import Iterator, Mapping
+from typing import Any, TypeVar
 
-_SQL_ID_BATCH = 400
+from .models import PageRef
+
+_SQL_BIND_LIMIT = 400
 _TEXT_TABLES = {
     "handwriting": "annotation_text_content",
     "textbox": "textbox_text_content",
     "pdf": "pdf_text_content",
 }
 _TEXT_LABELS = {"handwriting": "Handwriting", "textbox": "Textbox", "pdf": "PDF"}
+_Value = TypeVar("_Value")
 
 
 def table_exists(connection: sqlite3.Connection | None, name: str) -> bool:
@@ -30,6 +33,19 @@ def table_columns(connection: sqlite3.Connection, table: str) -> set[str]:
     return {str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
 
 
+def _parse_template_mapping(value: Any) -> tuple[str, int] | None:
+    if not isinstance(value, str) or not value:
+        return None
+    attachment_id, separator, page_text = value.rpartition("_")
+    if not separator or not attachment_id:
+        return None
+    try:
+        page_number = int(page_text)
+    except (TypeError, ValueError):
+        return None
+    return (attachment_id, page_number) if page_number > 0 else None
+
+
 def page_meta_supports_search(connection: sqlite3.Connection | None) -> bool:
     return (
         connection is not None
@@ -43,16 +59,23 @@ def page_meta_supports_search(connection: sqlite3.Connection | None) -> bool:
 
 
 def page_meta_supports_pdf_mapping(connection: sqlite3.Connection | None) -> bool:
+    """Whether page ids can be mapped to the current document catalog."""
+    return page_meta_supports_search(connection)
+
+
+def pdf_identity_schema_available(connection: sqlite3.Connection | None) -> bool:
     return (
         connection is not None
-        and table_exists(connection, "page_meta")
+        and page_meta_supports_pdf_mapping(connection)
+        and table_exists(connection, "pdf_text_content")
         and {
-            "page_id",
+            "text_id",
+            "text",
             "document_id",
-            "pdf_text_id",
-            "template_attachment_id_and_page_no",
+            "attachment_id",
+            "pdf_page_no",
         }
-        <= table_columns(connection, "page_meta")
+        <= table_columns(connection, "pdf_text_content")
     )
 
 
@@ -79,7 +102,7 @@ def recognition_status(
         return {}
     needs_index_by_page: dict[str, Any] = {}
     if "needs_index" in table_columns(projection, "pages"):
-        for batch in _chunks(page_ids):
+        for batch in id_batches(page_ids):
             placeholders = ", ".join("?" for _ in batch)
             rows = projection.execute(
                 f"SELECT id, needs_index FROM pages WHERE id IN ({placeholders})",
@@ -93,7 +116,7 @@ def recognition_status(
         columns = table_columns(fts, "annotation_text_content")
         content_available = {"page_id", "text"} <= columns
         if content_available:
-            for batch in _chunks(page_ids):
+            for batch in id_batches(page_ids):
                 placeholders = ", ".join("?" for _ in batch)
                 rows = fts.execute(
                     f"""
@@ -139,9 +162,183 @@ def recognition_status(
     return result
 
 
+def matches_pdf_identity(row: Mapping[str, Any], page_ref: PageRef) -> bool:
+    """Match one stored PDF row to the identity derived from the projection."""
+    if not page_ref.attachment_id or page_ref.pdf_page_no is None:
+        return False
+    try:
+        content_page = int(row["pdf_page_no"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    return (
+        row["document_id"] == page_ref.document_id
+        and row["attachment_id"] == page_ref.attachment_id
+        and content_page == page_ref.pdf_page_no
+    )
+
+
+def pdf_page_bindings(fts: sqlite3.Connection | None, page_refs: list[PageRef]) -> dict[str, Any]:
+    """Bind active pages to indexed PDF rows only when full PDF identity matches."""
+    bindings: dict[str, dict[str, Any]] = {
+        ref.page_id: {
+            "document_id": ref.document_id,
+            "attachment_id": ref.attachment_id,
+            "pdf_page_no": ref.pdf_page_no,
+            "state": "unknown",
+            "text_ids": [],
+            "text_rows": None,
+            "text_chars": None,
+            "metadata_has_mapping": False,
+            "mismatched_direct_pointer": False,
+            "reason": "mapping-unavailable",
+        }
+        for ref in page_refs
+    }
+    unavailable = {"available": False, "pages": bindings}
+    if not pdf_identity_schema_available(fts) or fts is None:
+        return unavailable
+
+    page_meta_columns = table_columns(fts, "page_meta")
+    selected = ["page_id", "document_id"]
+    for optional in (
+        "pdf_text_id",
+        "template_attachment_id_and_page_no",
+        "is_doc_deleted",
+        "is_page_deleted",
+    ):
+        if optional in page_meta_columns:
+            selected.append(optional)
+    metadata_by_page: dict[str, sqlite3.Row] = {}
+    page_ids = [ref.page_id for ref in page_refs]
+    for page_id_batch in id_batches(page_ids):
+        placeholders = ", ".join("?" for _ in page_id_batch)
+        rows = fts.execute(
+            f"SELECT {', '.join(selected)} FROM page_meta WHERE page_id IN ({placeholders})",
+            page_id_batch,
+        )
+        metadata_by_page.update({row["page_id"]: row for row in rows})
+
+    eligible: dict[str, PageRef] = {}
+    direct_id_to_pages: dict[Any, list[PageRef]] = {}
+    for page_ref in page_refs:
+        binding = bindings[page_ref.page_id]
+        if not page_ref.attachment_id or page_ref.pdf_page_no is None:
+            binding["reason"] = "projection-pdf-identity-unavailable"
+            continue
+        metadata = metadata_by_page.get(page_ref.page_id)
+        if metadata is None:
+            binding["reason"] = "page-metadata-missing"
+            continue
+        if metadata["document_id"] != page_ref.document_id:
+            binding["reason"] = "page-metadata-document-mismatch"
+            binding["mismatched_direct_pointer"] = bool(
+                "pdf_text_id" in page_meta_columns and metadata["pdf_text_id"] is not None
+            )
+            continue
+        if ("is_doc_deleted" in page_meta_columns and bool(metadata["is_doc_deleted"])) or (
+            "is_page_deleted" in page_meta_columns and bool(metadata["is_page_deleted"])
+        ):
+            binding["reason"] = "page-metadata-marks-page-deleted"
+            continue
+        template_mapping = (
+            metadata["template_attachment_id_and_page_no"]
+            if ("template_attachment_id_and_page_no" in page_meta_columns)
+            else None
+        )
+        if template_mapping:
+            parsed = _parse_template_mapping(template_mapping)
+            if parsed is None or parsed != (page_ref.attachment_id, page_ref.pdf_page_no):
+                binding["reason"] = "page-metadata-pdf-identity-mismatch"
+                continue
+        direct_id = metadata["pdf_text_id"] if "pdf_text_id" in page_meta_columns else None
+        binding["metadata_has_mapping"] = bool(direct_id is not None or template_mapping)
+        binding["reason"] = None
+        eligible[page_ref.page_id] = page_ref
+        if direct_id is not None:
+            direct_id_to_pages.setdefault(direct_id, []).append(page_ref)
+
+    candidate_lengths: dict[str, dict[int, int]] = {page_id: {} for page_id in eligible}
+    direct_ids = list(direct_id_to_pages)
+    for direct_id_batch in batches(direct_ids):
+        placeholders = ", ".join("?" for _ in direct_id_batch)
+        rows = fts.execute(
+            f"""
+            SELECT text_id, document_id, attachment_id, pdf_page_no,
+                   length(COALESCE(text, '')) AS text_length
+            FROM pdf_text_content
+            WHERE text_id IN ({placeholders})
+            """,
+            direct_id_batch,
+        )
+        rows_by_id = {row["text_id"]: row for row in rows}
+        for direct_id in direct_id_batch:
+            row = rows_by_id.get(direct_id)
+            for page_ref in direct_id_to_pages[direct_id]:
+                if row is not None and matches_pdf_identity(dict(row), page_ref):
+                    text_length = int(row["text_length"] or 0)
+                    if text_length:
+                        candidate_lengths[page_ref.page_id][int(direct_id)] = text_length
+                else:
+                    bindings[page_ref.page_id]["mismatched_direct_pointer"] = True
+
+    eligible_refs = [
+        page_ref for page_ref in eligible.values() if not candidate_lengths[page_ref.page_id]
+    ]
+    ref_batch_size = max(1, _SQL_BIND_LIMIT // 4)
+    page_meta_filter = page_meta_live_filter(page_meta_columns, alias="p")
+    for start in range(0, len(eligible_refs), ref_batch_size):
+        ref_batch = eligible_refs[start : start + ref_batch_size]
+        scoped_values = ", ".join("(?, ?, ?, ?)" for _ in ref_batch)
+        scoped_params = tuple(
+            value
+            for page_ref in ref_batch
+            for value in (
+                page_ref.page_id,
+                page_ref.document_id,
+                page_ref.attachment_id,
+                page_ref.pdf_page_no,
+            )
+        )
+        rows = fts.execute(
+            f"""
+            WITH expected(page_id, document_id, attachment_id, pdf_page_no) AS
+                (VALUES {scoped_values})
+            SELECT e.page_id, c.text_id, c.document_id, c.attachment_id, c.pdf_page_no,
+                   length(COALESCE(c.text, '')) AS text_length
+            FROM expected AS e
+            JOIN page_meta AS p
+              ON p.page_id = e.page_id AND p.document_id = e.document_id
+            JOIN pdf_text_content AS c
+              ON c.document_id = e.document_id
+             AND c.attachment_id = e.attachment_id
+             AND c.pdf_page_no = e.pdf_page_no
+            WHERE COALESCE(c.text, '') <> '' {page_meta_filter}
+            """,
+            scoped_params,
+        )
+        ref_by_page = {ref.page_id: ref for ref in ref_batch}
+        for row in rows:
+            candidate_page_ref = ref_by_page.get(row["page_id"])
+            if candidate_page_ref is not None and matches_pdf_identity(
+                dict(row), candidate_page_ref
+            ):
+                candidate_lengths[candidate_page_ref.page_id][int(row["text_id"])] = int(
+                    row["text_length"] or 0
+                )
+
+    for page_id, lengths in candidate_lengths.items():
+        binding = bindings[page_id]
+        text_ids = sorted(lengths)
+        binding["text_ids"] = text_ids
+        binding["text_rows"] = len(text_ids)
+        binding["text_chars"] = sum(lengths.values())
+        binding["state"] = "stored-text" if text_ids else "no-stored-text"
+    return {"available": True, "pages": bindings}
+
+
 def coverage(
     fts: sqlite3.Connection | None,
-    page_refs: list[tuple[str, str]],
+    page_refs: list[PageRef],
     requested_sources: list[str] | None = None,
 ) -> dict[str, Any]:
     """Return scoped mapping diagnostics and aggregates for requested text sources."""
@@ -161,7 +358,7 @@ def coverage(
             "mismatched page metadata."
         )
 
-    page_ids = [page_id for _, page_id in page_refs]
+    page_ids = [page_ref.page_id for page_ref in page_refs]
     source_names = list(_TEXT_TABLES) if requested_sources is None else requested_sources
     for source in source_names:
         table = _TEXT_TABLES[source]
@@ -173,7 +370,7 @@ def coverage(
                 f"{details['metadata_without_nonempty_text_pages']} PDF page mappings in this "
                 "scope have no non-empty indexed PDF text."
             )
-    return {"page_meta": page_meta, "sources": sources, "warnings": _unique(warnings)}
+    return {"page_meta": page_meta, "sources": sources, "warnings": list(dict.fromkeys(warnings))}
 
 
 def _source_coverage(
@@ -181,7 +378,7 @@ def _source_coverage(
     source: str,
     table: str,
     page_ids: list[str],
-    page_refs: list[tuple[str, str]],
+    page_refs: list[PageRef],
 ) -> tuple[dict[str, Any], list[str]]:
     label = _TEXT_LABELS[source]
     details: dict[str, Any] = {
@@ -204,7 +401,7 @@ def _source_coverage(
     details["availability"] = "available"
     if source in {"handwriting", "textbox"}:
         counts: dict[str, tuple[int, int]] = {}
-        for batch in _chunks(page_ids):
+        for batch in id_batches(page_ids):
             placeholders = ", ".join("?" for _ in batch)
             rows = fts.execute(
                 f"""
@@ -236,127 +433,57 @@ def _source_coverage(
 
 
 def _pdf_coverage(
-    fts: sqlite3.Connection, page_refs: list[tuple[str, str]]
+    fts: sqlite3.Connection | None, page_refs: list[PageRef]
 ) -> tuple[dict[str, Any], list[str]]:
     empty_stats = {
         "pages_with_stored_nonempty_text": None,
         "text_rows": None,
         "text_chars": None,
         "metadata_without_nonempty_text_pages": None,
+        "unverifiable_pages": len(page_refs),
+        "mismatched_direct_pointers": None,
     }
-    if not page_meta_supports_pdf_mapping(fts):
+    binding_result = pdf_page_bindings(fts, page_refs)
+    if not binding_result["available"]:
         return empty_stats, [
-            "PDF page metadata cannot be mapped because usable `page_meta` mapping is unavailable."
+            "PDF text identity cannot be verified because required page or content metadata "
+            "is unavailable."
         ]
-    pdf_columns = table_columns(fts, "pdf_text_content")
-    if not {"text_id", "text"} <= pdf_columns:
-        return empty_stats, [
-            "PDF text is unavailable because `pdf_text_content` lacks required columns."
-        ]
-    meta_columns = table_columns(fts, "page_meta")
-    template_columns = table_columns(fts, "template_meta")
-    has_template_mapping = (
-        table_exists(fts, "template_meta")
-        and {"attachment_id", "pdf_page_no"} <= template_columns
-        and {"attachment_id", "pdf_page_no", "document_id"} <= pdf_columns
-    )
-    mapping_filter = page_meta_live_filter(meta_columns, alias="p")
-    counts: dict[str, tuple[int, int, bool]] = {}
-    pair_batch_size = max(1, _SQL_ID_BATCH // 2)
-    for start in range(0, len(page_refs), pair_batch_size):
-        batch = page_refs[start : start + pair_batch_size]
-        scoped_values = ", ".join("(?, ?)" for _ in batch)
-        scoped_params = tuple(
-            value for document_id, page_id in batch for value in (page_id, document_id)
+    bindings = binding_result["pages"]
+    values = list(bindings.values())
+    mapped = [binding for binding in values if binding["state"] == "stored-text"]
+    no_text_with_mapping = [
+        binding
+        for binding in values
+        if binding["state"] == "no-stored-text" and binding["metadata_has_mapping"]
+    ]
+    unverifiable = [binding for binding in values if binding["state"] == "unknown"]
+    mismatched = [binding for binding in values if binding["mismatched_direct_pointer"]]
+    warnings: list[str] = []
+    if unverifiable:
+        warnings.append(
+            f"PDF identity could not be verified for {len(unverifiable)} active pages in this "
+            "scope."
         )
-        direct_rows = fts.execute(
-            f"""
-            WITH scoped_pages(page_id, document_id) AS (VALUES {scoped_values})
-            SELECT p.page_id, COUNT(c.text_id) AS text_rows,
-                   SUM(length(COALESCE(c.text, ''))) AS text_chars,
-                   MAX(CASE WHEN p.pdf_text_id IS NOT NULL
-                                 OR (p.template_attachment_id_and_page_no IS NOT NULL
-                                     AND p.template_attachment_id_and_page_no <> '')
-                            THEN 1 ELSE 0 END) AS has_mapping
-            FROM page_meta AS p
-            JOIN scoped_pages AS scope
-              ON scope.page_id = p.page_id AND scope.document_id = p.document_id
-            LEFT JOIN pdf_text_content AS c
-              ON c.text_id = p.pdf_text_id AND COALESCE(c.text, '') <> ''
-            WHERE 1 = 1 {mapping_filter}
-            GROUP BY p.page_id
-            """,
-            scoped_params,
+    if mismatched:
+        warnings.append(
+            f"{len(mismatched)} PDF direct pointers did not match the current projection "
+            "identity; only independently verified text is counted."
         )
-        for row in direct_rows:
-            counts[row["page_id"]] = (
-                int(row["text_rows"]),
-                int(row["text_chars"] or 0),
-                bool(row["has_mapping"]),
-            )
-        if has_template_mapping:
-            template_rows = fts.execute(
-                f"""
-                WITH scoped_pages(page_id, document_id) AS (VALUES {scoped_values})
-                SELECT page_id, COUNT(text_id) AS text_rows,
-                       SUM(text_length) AS text_chars, MAX(has_mapping) AS has_mapping
-                FROM (
-                    SELECT DISTINCT p.page_id, c.text_id,
-                               p.document_id,
-                           length(COALESCE(c.text, '')) AS text_length,
-                           CASE WHEN p.template_attachment_id_and_page_no IS NOT NULL
-                                      AND p.template_attachment_id_and_page_no <> ''
-                                THEN 1 ELSE 0 END AS has_mapping
-                    FROM page_meta AS p
-                        JOIN scoped_pages AS scope
-                          ON scope.page_id = p.page_id AND scope.document_id = p.document_id
-                    LEFT JOIN template_meta AS t
-                      ON p.template_attachment_id_and_page_no =
-                         t.attachment_id || '_' || t.pdf_page_no
-                    LEFT JOIN pdf_text_content AS c
-                      ON c.attachment_id = t.attachment_id
-                     AND c.pdf_page_no = t.pdf_page_no
-                     AND c.document_id = p.document_id
-                     AND COALESCE(c.text, '') <> ''
-                        WHERE p.pdf_text_id IS NULL {mapping_filter}
-                )
-                    GROUP BY page_id
-                """,
-                scoped_params,
-            )
-            for row in template_rows:
-                page_id = row["page_id"]
-                prior = counts.get(page_id, (0, 0, False))
-                counts[page_id] = (
-                    prior[0] + int(row["text_rows"]),
-                    prior[1] + int(row["text_chars"] or 0),
-                    prior[2] or bool(row["has_mapping"]),
-                )
-    pages_with_text = sum(1 for rows, _, _ in counts.values() if rows)
-    text_rows = sum(rows for rows, _, _ in counts.values())
-    text_chars = sum(chars for _, chars, _ in counts.values())
-    metadata_without_text = sum(
-        1 for rows, _, has_mapping in counts.values() if has_mapping and not rows
-    )
-    if not has_template_mapping and "template_attachment_id_and_page_no" in meta_columns:
-        warnings = [
-            "Template-based PDF text cannot be counted because `template_meta` mapping is "
-            "unavailable."
-        ]
-    else:
-        warnings = []
     return {
-        "pages_with_stored_nonempty_text": pages_with_text,
-        "text_rows": text_rows,
-        "text_chars": text_chars,
-        "metadata_without_nonempty_text_pages": metadata_without_text,
+        "pages_with_stored_nonempty_text": len(mapped),
+        "text_rows": sum(int(binding["text_rows"] or 0) for binding in mapped),
+        "text_chars": sum(int(binding["text_chars"] or 0) for binding in mapped),
+        "metadata_without_nonempty_text_pages": len(no_text_with_mapping),
+        "unverifiable_pages": len(unverifiable),
+        "mismatched_direct_pointers": len(mismatched),
     }, warnings
 
 
 def _page_meta_diagnostics(
-    fts: sqlite3.Connection | None, page_refs: list[tuple[str, str]]
+    fts: sqlite3.Connection | None, page_refs: list[PageRef]
 ) -> dict[str, Any]:
-    active_page_ids = {page_id for _, page_id in page_refs}
+    active_page_ids = {page_ref.page_id for page_ref in page_refs}
     empty = {
         "available": False,
         "active_pages": len(active_page_ids),
@@ -370,14 +497,14 @@ def _page_meta_diagnostics(
     if "page_id" not in columns:
         return empty
     valid_mapping = {"page_id", "document_id"} <= columns
-    doc_by_page = {page_id: document_id for document_id, page_id in page_refs}
+    doc_by_page = {page_ref.page_id: page_ref.document_id for page_ref in page_refs}
     found: set[str] = set()
     stale: set[str] = set()
     selected = ["page_id"]
     for optional in ("document_id", "is_doc_deleted", "is_page_deleted"):
         if optional in columns:
             selected.append(optional)
-    for batch in _chunks(list(active_page_ids)):
+    for batch in id_batches(list(active_page_ids)):
         placeholders = ", ".join("?" for _ in batch)
         rows = fts.execute(
             f"SELECT {', '.join(selected)} FROM page_meta WHERE page_id IN ({placeholders})",
@@ -410,10 +537,57 @@ def page_meta_live_filter(columns: set[str], *, alias: str) -> str:
     return "AND " + " AND ".join(filters) if filters else ""
 
 
-def _chunks(values: list[str]) -> Iterator[list[str]]:
-    for start in range(0, len(values), _SQL_ID_BATCH):
-        yield values[start : start + _SQL_ID_BATCH]
+def search_pdf_rows(
+    fts: sqlite3.Connection,
+    binding_result: dict[str, Any],
+    query: str,
+    document_ids: list[str] | None = None,
+) -> Iterator[sqlite3.Row]:
+    """Search only rows already bound to projection-derived page identities."""
+    if not binding_result["available"]:
+        return
+    selected_documents = set(document_ids) if document_ids is not None else None
+    bound_rows = [
+        (
+            page_id,
+            binding["document_id"],
+            binding["attachment_id"],
+            binding["pdf_page_no"],
+            text_id,
+        )
+        for page_id, binding in binding_result["pages"].items()
+        if binding["state"] == "stored-text"
+        and (selected_documents is None or binding["document_id"] in selected_documents)
+        for text_id in binding["text_ids"]
+    ]
+    batch_size = max(1, _SQL_BIND_LIMIT // 6)
+    for batch in batches(bound_rows, batch_size):
+        values_sql = ", ".join("(?, ?, ?, ?, ?)" for _ in batch)
+        parameters = tuple(value for row in batch for value in row) + (query,)
+        yield from fts.execute(
+            f"""
+            WITH bound_rows(page_id, document_id, attachment_id, pdf_page_no, text_id)
+                AS (VALUES {values_sql})
+            SELECT bound.document_id, bound.page_id, content.text,
+                   content.text_id AS sort_id
+            FROM bound_rows AS bound
+            JOIN pdf_text_content AS content
+              ON content.text_id = bound.text_id
+             AND content.document_id = bound.document_id
+             AND content.attachment_id = bound.attachment_id
+             AND content.pdf_page_no = bound.pdf_page_no
+            WHERE COALESCE(content.text, '') <> ''
+              AND instr(casefold(content.text), casefold(?)) > 0
+            ORDER BY content.text_id
+            """,
+            parameters,
+        )
 
 
-def _unique(values: list[str]) -> list[str]:
-    return list(dict.fromkeys(values))
+def id_batches(values: list[str]) -> Iterator[list[str]]:
+    yield from batches(values)
+
+
+def batches(values: list[_Value], size: int = _SQL_BIND_LIMIT) -> Iterator[list[_Value]]:
+    for start in range(0, len(values), size):
+        yield values[start : start + size]

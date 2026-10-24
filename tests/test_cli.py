@@ -97,6 +97,138 @@ def test_top_level_field_selection_accepts_and_retains_snapshot(
     assert data == {"id": "doc-hostile", "snapshot": library_copy.name}
 
 
+def _assert_invalid_fields_are_rejected_before_write_command(
+    writer: str, library_copy: Path, tmp_path: Path
+) -> None:
+    annotated_pdf = tmp_path / "annotated.pdf"
+    document = pymupdf.open()
+    for _ in range(3):
+        document.new_page()
+    document.save(annotated_pdf)
+    document.close()
+
+    output = tmp_path / "output.pdf"
+    bundle_parent = tmp_path / "new-parent"
+    if writer == "sync":
+        arguments = ["sync", "--library", str(library_copy / "Library")]
+    elif writer == "snapshot":
+        output = tmp_path / "new-snapshot"
+        arguments = ["snapshot", str(library_copy / "Library"), str(output)]
+    elif writer == "attach-pdf":
+        arguments = ["attach-pdf", "doc-hostile", str(annotated_pdf)]
+    elif writer == "export":
+        arguments = ["export", "doc-hostile", "--output", str(output)]
+    elif writer == "render":
+        output = tmp_path / "output.png"
+        arguments = ["render", "doc-hostile", "--output", str(output)]
+    else:
+        output = bundle_parent / "bundle"
+        arguments = ["bundle", "doc-hostile", "--output", str(output)]
+
+    result = invoke(
+        ["--fields", "definitely-not-a-field", *arguments],
+        tmp_path,
+        sandbox=library_copy if writer != "sync" and writer != "snapshot" else None,
+    )
+
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert json.loads(result.stderr)["error"]["code"] == "operation_failed"
+    assert not output.exists()
+    assert not (tmp_path / "state").exists()
+    assert not (library_copy.parent / ".goodnotes-cli").exists()
+    assert not bundle_parent.exists()
+
+
+@pytest.mark.parametrize("writer", ["sync", "snapshot", "attach-pdf", "export", "render", "bundle"])
+def test_invalid_fields_preflight_all_writers(
+    writer: str, library_copy: Path, tmp_path: Path
+) -> None:
+    _assert_invalid_fields_are_rejected_before_write_command(writer, library_copy, tmp_path)
+
+
+def test_sync_projection_can_select_an_absent_optional_warning_key(
+    library_copy: Path, tmp_path: Path
+) -> None:
+    data = successful(
+        invoke(
+            [
+                "--fields",
+                "status,warnings",
+                "sync",
+                "--library",
+                str(library_copy / "Library"),
+            ],
+            tmp_path,
+        )
+    )
+
+    assert data["status"] == "ready"
+    assert "warnings" not in data
+    assert (tmp_path / "state" / "active.json").is_file()
+
+
+def test_unavailable_search_index_returns_scoped_coverage_and_pdf_fallback(
+    library_copy: Path, tmp_path: Path
+) -> None:
+    (library_copy / "Library/Databases/fts.sqlite").unlink()
+
+    result = invoke(
+        ["search", "missing phrase", "--notebook", "doc-hostile"],
+        tmp_path,
+        sandbox=library_copy,
+    )
+
+    assert result.returncode == 1
+    assert result.stdout == ""
+    error = json.loads(result.stderr)["error"]
+    assert error["code"] == "operation_failed"
+    assert error["details"]["coverage"] == "stored-index"
+    details = error["details"]["coverage_detail"]
+    assert details["scope"]["notebook_id"] == "doc-hostile"
+    assert any("scan-pdfs" in step for step in details["next_steps"])
+    assert error["details"]["warnings"]
+
+
+@pytest.mark.parametrize(
+    ("query", "notebook", "message"),
+    [
+        ("", "doc-hostile", "Search query must not be empty"),
+        ("phrase", "missing-notebook", "No active, reachable item matches"),
+    ],
+)
+def test_unavailable_index_does_not_mask_search_input_errors(
+    library_copy: Path, tmp_path: Path, query: str, notebook: str, message: str
+) -> None:
+    (library_copy / "Library/Databases/fts.sqlite").unlink()
+
+    result = invoke(
+        ["search", query, "--notebook", notebook],
+        tmp_path,
+        sandbox=library_copy,
+    )
+
+    assert result.returncode == 1
+    error = json.loads(result.stderr)["error"]
+    assert message in error["message"]
+    assert "details" not in error
+
+
+def test_invalid_bundle_page_selection_does_not_create_parent(
+    library_copy: Path, tmp_path: Path
+) -> None:
+    parent = tmp_path / "not-created"
+    result = invoke(
+        ["bundle", "doc-hostile", "--pages", "0", "--output", str(parent / "bundle")],
+        tmp_path,
+        sandbox=library_copy,
+    )
+
+    assert result.returncode == 1
+    assert json.loads(result.stderr)["error"]["code"] == "operation_failed"
+    assert not parent.exists()
+
+
 @pytest.mark.parametrize("command", ["search", "scan-pdfs"])
 def test_search_scope_options_are_exclusive_before_loading_a_library(
     command: str, tmp_path: Path

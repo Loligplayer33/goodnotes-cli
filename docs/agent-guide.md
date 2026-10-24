@@ -8,7 +8,7 @@ Use `info`, `ls`, or `tree` to find a notebook. Use `pages` for its current one-
 
 `pages --with-recognition` adds per-page metadata without returning candidate text. `recognition.availability` distinguishes `stored-text`, `no-stored-text`, and `unavailable`; `recognition.index_state` distinguishes `pending`, `not-pending`, and `unknown`. Counts describe stored recognition rows and characters, not ink strokes or transcription accuracy. The page `annotation_count` comes from `projection.notes_items`; it is not an ink-stroke or recognition count.
 
-Read candidate text with `read --source handwriting`. Preserve the source label, raw delimiters, and warnings. Label any cleaned reconstruction as an interpretation rather than a verbatim quote or visual transcription. A pending-index warning can appear even when no stored candidate text is returned. `not-pending` does not verify recognition accuracy or freshness. `pdf` text may come from the index or a mapped PDF background in the copy. `textbox` is typed text stored on the page.
+Read candidate text with `read --source handwriting`. Preserve the source label, raw delimiters, and warnings. Quote only exact raw substrings; label edited wording as an interpretation rather than a verbatim quote or visual transcription. A pending-index warning can appear even when no stored candidate text is returned. `not-pending` does not verify recognition accuracy or freshness. `pdf` text may come from the index or a mapped PDF background in the copy. `textbox` is typed text stored on the page.
 
 ## Search and check coverage
 
