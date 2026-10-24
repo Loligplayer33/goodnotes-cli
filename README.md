@@ -2,7 +2,7 @@
 
 Goodnotes CLI lets you browse, search, read, and export a local Goodnotes library from the command line. It reads a managed copy of the library and does not edit Goodnotes or its source files.
 
-Live library discovery is for macOS. On other systems, point `sync --library` at an available copy of a Goodnotes `Library` folder that contains `Databases/` and `Attachments/`.
+Live library discovery is for macOS. On Linux, point `sync --library` at an available copy of a Goodnotes `Library` folder that contains `Databases/` and `Attachments/`.
 
 ## What it can do
 
@@ -45,7 +45,7 @@ The complete option reference is in [Command reference](docs/commands.md). Each 
 
 ## Quickstart
 
-You need Python 3.11 or newer and [`uv`](https://docs.astral.sh/uv/). From a terminal:
+You need macOS or Linux, Python 3.11 or newer, and [`uv`](https://docs.astral.sh/uv/). From a terminal:
 
 1. Clone the repository if you do not already have a checkout, then enter it:
 
@@ -66,7 +66,7 @@ You need Python 3.11 or newer and [`uv`](https://docs.astral.sh/uv/). From a ter
    uv run goodnotes sync
    ```
 
-   On another system, give `sync` the path to an available library copy:
+   On Linux, give `sync` the path to an available library copy:
 
    ```sh
    uv run goodnotes sync --library /path/to/Library

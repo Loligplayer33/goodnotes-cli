@@ -10,7 +10,7 @@ On macOS, sync discovers the Goodnotes library and prepares the local read view:
 uv run goodnotes sync
 ```
 
-On another system, give `sync` a path to an available copy of the `Library` folder:
+On Linux, give `sync` a path to an available copy of the `Library` folder:
 
 ```sh
 uv run goodnotes sync --library /path/to/Library
