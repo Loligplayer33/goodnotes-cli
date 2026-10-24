@@ -7,7 +7,7 @@ uv run goodnotes --text ls --limit 50
 uv run goodnotes --expect-snapshot SNAPSHOT_ID pages "Course Notes"
 ```
 
-Use `uv run goodnotes --help` for the command index, `uv run goodnotes COMMAND --help` for readable examples and options, and `uv run goodnotes schema COMMAND` for structured arguments, options, defaults, and bounds. Plain `schema` returns the compact overview.
+Use `uv run goodnotes --help` for the command index, `uv run goodnotes COMMAND --help` for readable examples and options, and `uv run goodnotes schema COMMAND` for structured arguments, options, defaults, bounds, and output-field hints. Plain `schema` returns the compact overview.
 
 ## Command index
 
@@ -39,20 +39,20 @@ These options are accepted before a command. They apply only where the command u
 | `--data-dir PATH` | `GOODNOTES_DATA_DIR`; otherwise `$XDG_CACHE_HOME/goodnotes-cli`, or `~/.cache/goodnotes-cli` | Select the managed cache location. |
 | `--text` | Off | Indent JSON for inspection. |
 | `--json` | On | Emit compact JSON. If both `--text` and `--json` are given, compact JSON wins. |
-| `--fields FIELDS` | All fields | Comma-separated keys to keep. It selects keys in object rows under `items`, `pages`, or `hits` when present; otherwise it selects top-level response keys. Use keys that exist at that level. |
+| `--fields FIELDS` | All fields | Comma-separated keys to keep. It selects keys in object rows under `items`, `pages`, or `hits` when present; otherwise it selects top-level response keys. An unknown key returns the valid keys for that level. |
 | `--expect-snapshot ID` | Unset | Fail with `stale_snapshot` if a cache-backed command opens a different read-view generation. |
 | `--version` | N/A | Print the CLI version and exit. |
 | `--help` | N/A | Show the CLI or command's help and exit. |
 
 `GOODNOTES_DATA_DIR` takes precedence over the default cache path; `--data-dir` overrides the environment. The same precedence applies to `GOODNOTES_SANDBOX` and `--sandbox`.
 
-Field selection filters object rows while keeping surrounding metadata, including warnings and pagination. Empty row arrays stay empty. Responses without object-row arrays, such as `bundle`, use top-level selection. Cache-backed commands always retain `snapshot`.
+Field selection filters object rows while keeping surrounding metadata, including warnings and pagination. Empty row arrays stay empty and still validate requested field names. Responses without object-row arrays, such as `bundle`, use top-level selection. Valid optional response keys are omitted when absent. Cache-backed commands always retain `snapshot`. Declared fields are checked before commands write outputs or cache state. Use `schema COMMAND` for field names; selecting `recognition` requires `pages --with-recognition`.
 
 ## Names, folders, and pages
 
-`NOTEBOOK` accepts an exact UUID, exact full library path, or unique exact name. `FOLDER` accepts the same selector forms but must resolve to a folder. An ambiguous name fails instead of choosing an item. Use the full path or UUID when names repeat. If you omit `--folder`, the command uses `/`.
+`NOTEBOOK` accepts an exact UUID, exact full library path, or unique exact name. `FOLDER` accepts the same selector forms but must resolve to a folder. An ambiguous name fails instead of choosing an item. Use the full path or UUID when names repeat. `ls` and `tree` use `/` when `--folder` is omitted. `search` and `scan-pdfs` use `/` when neither scope option is supplied.
 
-Public page numbers start at 1. Page expressions such as `1-3,7` preserve the listed order and reject duplicates, empty entries, reversed ranges, and pages outside the notebook.
+Public page numbers start at 1. Page expressions such as `1-3,7` preserve the listed order and reject duplicates, empty entries, reversed ranges, and pages outside the notebook. Page-count limits depend on the command: `read` accepts at most 20, `bundle` at most 10, and `export` has no 20-page cap.
 
 ## Commands
 
@@ -117,15 +117,16 @@ Resolves an active folder or notebook by UUID, full path, or unique name. Return
 ### pages
 
 ```text
-goodnotes pages NOTEBOOK [--limit N] [--offset N]
+goodnotes pages NOTEBOOK [--limit N] [--offset N] [--with-recognition | --no-with-recognition]
 ```
 
 | Option | Default | Bounds |
 | --- | --- | --- |
 | `--limit N` | `100` | `1` to `1000` pages |
 | `--offset N` | `0` | `0` or greater |
+| `--with-recognition` / `--no-with-recognition` | `--no-with-recognition` | Add or omit stored recognition status metadata. |
 
-Lists the notebook's active pages in current order, numbered from 1. The result has a `pages` array, `next_offset`, and the active read-view `snapshot` ID. Page rows include page and notebook IDs, page number, position, available background attachment and PDF-page mapping, dimensions, and annotation count.
+Lists the notebook's active pages in current order, numbered from 1. The result has a `pages` array, `next_offset`, and the active read-view `snapshot` ID. Page rows include page and notebook IDs, page number, position, available background attachment and PDF-page mapping, dimensions, and annotation count. `--with-recognition` adds per-page availability and index state without returning candidate text. The top-level `annotation_count_source` is `projection.notes_items`; it does not count ink or OCR results.
 
 ### read
 
@@ -140,50 +141,53 @@ goodnotes read NOTEBOOK [--page N | --pages EXPR] [--source SOURCE] [--max-chars
 | `--source SOURCE` | `all` | `all`, `pdf`, `handwriting`, or `textbox` |
 | `--max-chars N` | `12000` | `1` to `1000000` characters across the selected pages |
 
-Use either `--page` or `--pages`, not both. Returns a `pages` array of page IDs and source-labelled `parts`, plus `truncated` and the active read-view `snapshot` ID. PDF text may come from the stored index or from a mapped PDF background in the copy. Handwriting text is stored recognition output, not a visual reading of ink. Native Goodnotes annotations are not decoded. See [PDF and handwriting](pdf-and-handwriting.md) for source limits.
+Use either `--page` or `--pages`, not both. Returns a `pages` array of page IDs and source-labelled `parts`, plus `truncated` and the active read-view `snapshot` ID. PDF text may come from the stored index or from a mapped PDF background in the copy. Handwriting text is stored recognition output, not a visual reading of ink. It preserves raw candidate delimiters. Label any cleaned reconstruction as an interpretation, not an exact quotation. A pending-index warning may appear even when no candidate text is returned. See [PDF and handwriting](pdf-and-handwriting.md) for source limits.
 
 ### search
 
 ```text
-goodnotes search QUERY [--folder FOLDER] [--source SOURCE] [--limit N] [--offset N]
+goodnotes search QUERY [--folder FOLDER | --notebook NOTEBOOK] [--source SOURCE] [--limit N] [--offset N]
 ```
 
 | Option | Default | Bounds or values |
 | --- | --- | --- |
-| `--folder FOLDER` | `/` | Folder selector; see [Names, folders, and pages](#names-folders-and-pages). |
+| `--folder FOLDER` | Unset | Folder selector; mutually exclusive with `--notebook`. |
+| `--notebook NOTEBOOK` | Unset | One notebook by UUID, path, or unique exact name; mutually exclusive with `--folder`. |
 | `--source SOURCE` | `all` | `all`, `pdf`, `handwriting`, or `textbox` |
 | `--limit N` | `20` | `1` to `100` hits |
 | `--offset N` | `0` | `0` or greater |
 
-Finds literal, case-insensitive substrings in stored search-index rows. Returns `hits` with page identifiers, source labels, and snippets up to 320 characters, plus `next_offset`, `coverage: "stored-index"`, `warnings`, and the active read-view `snapshot` ID. It does not search every copied PDF directly; use [scan-pdfs](#scan-pdfs) when stored-index coverage is insufficient.
+Finds literal, case-insensitive substrings in stored search-index rows. The result includes `hits`, `next_offset`, `coverage: "stored-index"`, `coverage_detail`, `warnings`, and the active read-view `snapshot` ID. `coverage_detail` reports the resolved scope, source-specific stored-text counts, metadata diagnostics, warnings, and next steps. Its completeness remains `unknown`; metadata rows do not prove index coverage. Search does not start a PDF scan automatically. Run [scan-pdfs](#scan-pdfs) separately when copied PDF text may be missing from the index.
 
 ### scan-pdfs
 
 ```text
-goodnotes scan-pdfs QUERY [--folder FOLDER] [--limit N] [--page-limit N] [--page-offset N]
+goodnotes scan-pdfs QUERY [--folder FOLDER | --notebook NOTEBOOK] [--limit N] [--page-limit N] [--page-offset N]
 ```
 
 | Option | Default | Bounds |
 | --- | --- | --- |
-| `--folder FOLDER` | `/` | Folder selector; see [Names, folders, and pages](#names-folders-and-pages). |
+| `--folder FOLDER` | Unset | Folder selector; mutually exclusive with `--notebook`. |
+| `--notebook NOTEBOOK` | Unset | One notebook by UUID, path, or unique exact name; mutually exclusive with `--folder`. |
 | `--limit N` | `20` | `1` to `100` hits |
 | `--page-limit N` | `200` | `1` to `250` notebook pages scanned per call |
 | `--page-offset N` | `0` | `0` or greater |
 
-Searches extracted text from copied PDF backgrounds only. It does not search the stored index, handwriting, or a PDF registered with `attach-pdf`. The result includes `hits`, `pages_scanned`, `next_page_offset`, `warnings`, and the active read-view `snapshot` ID. Continue with `--page-offset` set to `next_page_offset`; the cursor counts scanned pages, not matching hits. Warnings may report missing, unmapped, unreadable, or truncated background pages.
+Searches extracted text from copied PDF backgrounds only. It does not search the stored index, handwriting, or a PDF registered with `attach-pdf`. The result includes `hits`, resolved `scope`, `total_pages` for that scope, `pages_scanned`, `next_page_offset`, `scan_complete`, `coverage_complete`, `stop_reason`, `warnings`, and the active read-view `snapshot` ID. `stop_reason` is `complete`, `hit-limit`, or `page-limit`. `scan_complete` means no pages remain in the scoped sequence. `coverage_complete` is true only for a scan starting at offset `0` that reaches the end without extraction gaps; it does not describe handwriting or registered PDFs. Continue with `--page-offset` set to `next_page_offset` and keep the query, scope, and snapshot fixed. The cursor counts scanned pages, not matching hits. Warnings may report missing, unmapped, unreadable, or truncated background pages.
 
 ### export
 
 ```text
-goodnotes export NOTEBOOK --output FILE [--layer LAYER]
+goodnotes export NOTEBOOK --output FILE [--pages EXPR] [--layer LAYER]
 ```
 
 | Option | Default | Values |
 | --- | --- | --- |
 | `--output FILE` | Required | New `.pdf` path |
+| `--pages EXPR` | All pages | Distinct one-based page numbers; preserves listed order, with no 20-page cap |
 | `--layer LAYER` | `background` | `background` or `annotated` |
 
-Exports all active notebook pages in current order. The background layer contains PDF page backgrounds and does not overlay native Goodnotes ink. The annotated layer requires a PDF registered with [attach-pdf](#attach-pdf); registration cannot verify whether annotations were included or whether page order matches. The result includes the output path, page count, source, `includes_handwriting`, `annotation_status`, and warnings. Existing output paths are never overwritten; outputs must be outside the snapshot and production Goodnotes locations.
+Exports all active notebook pages in current order when `--pages` is omitted. For example, `--pages 1-3,7` exports those pages in that listed order. The result includes the output path, `pages` count, `selected_pages`, source, `includes_handwriting`, `annotation_status`, and warnings. The background layer contains PDF page backgrounds and does not overlay native Goodnotes ink. The annotated layer requires a PDF registered with [attach-pdf](#attach-pdf); registration cannot verify whether annotations were included or whether page order matches. Existing output paths are never overwritten; outputs must be outside the snapshot and production Goodnotes locations.
 
 ### render
 
@@ -238,10 +242,10 @@ Reports active and deleted item counts, tree consistency issues, search-index av
 goodnotes schema [COMMAND]
 ```
 
-Prints the command contract without loading notebook data. With no command, it reports the compact CLI overview. With a command name, it returns that command's contract and option metadata. Use `goodnotes COMMAND --help` for human-readable help. Treat schema output as a discovery contract that may grow, not as a frozen copy of this full reference.
+Prints the command contract without loading notebook data. With no command, it reports the compact CLI overview. With a command name, it returns that command's contract, option metadata, and output-field hints where available. Row-based commands identify the projection level, valid row keys, and a `--fields` example. These keys are derived from the output models; `pages` marks `recognition` optional because it requires `--with-recognition`. Use `goodnotes COMMAND --help` for human-readable help. Treat schema output as a discovery contract that may grow, not as a frozen copy of this full reference.
 
 ## Output, errors, and pagination
 
-Successful commands that return data write one JSON value to stdout. Compact JSON is the default; `--text` indents it. Help and version output are plain text. Expected runtime errors write `{"error":{"code":"...","message":"..."}}` to stderr and exit `1`. Invalid command syntax or parser-checked option bounds exit `2` with `invalid_arguments`; application-checked values such as an invalid page expression are runtime errors and exit `1`. Keyboard interruption or a broken pipe exits `130`.
+Successful commands that return data write one JSON value to stdout. Compact JSON is the default; `--text` indents it. Help and version output are plain text. Expected runtime errors write `{"error":{"code":"...","message":"..."}}` to stderr and exit `1`. Errors may include `details` with recovery context; unavailable-index search errors include scoped coverage and PDF fallback guidance. Invalid command syntax or parser-checked option bounds exit `2` with `invalid_arguments`; application-checked values such as an invalid page expression are runtime errors and exit `1`. Keyboard interruption or a broken pipe exits `130`.
 
 Cache-backed commands include the read-view generation ID as `snapshot`. For `ls`, `tree`, `pages`, and `search`, pass `next_offset` as the next `--offset`. For `scan-pdfs`, pass `next_page_offset` as the next `--page-offset`. Include the same generation ID with global `--expect-snapshot ID` on every request in a multi-call sequence. If the command returns `stale_snapshot`, restart the sequence against the new view; do not combine results from different generations. The `snapshot` field from `sync` is a filesystem path; use its `snapshot_id` field for the generation ID. The standalone `snapshot` command's `snapshot` field is also a destination path.

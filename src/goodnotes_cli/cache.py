@@ -578,10 +578,13 @@ def _recognized_managed_state(state: Path) -> bool:
 
 def _managed_state_for_explicit(path: Path) -> Path | None:
     requested = Path(path).expanduser()
-    if requested.parent.name != "snapshots":
+    # Normalize dot segments and parent aliases before deciding whether this is a
+    # managed generation. Otherwise an explicit path such as
+    # snapshots/<generation>/../<generation> can bypass the shared view lock.
+    resolved = requested.resolve(strict=False)
+    if resolved.parent.name != "snapshots":
         return None
-    state = requested.parent.parent
-    resolved_state = state.resolve(strict=False)
+    resolved_state = resolved.parent.parent.resolve(strict=False)
     _require_not_production(resolved_state, purpose="CLI cache storage")
     if _recognized_managed_state(resolved_state):
         return resolved_state

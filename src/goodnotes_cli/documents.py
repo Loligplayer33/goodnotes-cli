@@ -58,13 +58,15 @@ def export_pdf(
     destination: Path,
     *,
     layer: str = "background",
+    page_numbers: list[int] | None = None,
 ) -> dict[str, object]:
-    """Export notebook pages in their current order to a new PDF.
+    """Export notebook pages to a new PDF.
 
     Background exports use the per-page source attachment. Annotated exports require a PDF
-    registered for the same document. Neither path overwrites an existing output file.
+    registered for the same document. When ``page_numbers`` is provided, selected pages are
+    exported in that sequence. Neither path overwrites an existing output file.
     """
-    ordered = _ordered_pages(pages)
+    ordered = _selected_pages(pages, page_numbers)
     _check_layer(layer)
     output_path = sandbox.ensure_output(Path(destination))
     if output_path.suffix.casefold() != ".pdf":
@@ -119,6 +121,7 @@ def export_pdf(
         "path": str(output_path),
         "document_id": ordered[0].document_id,
         "pages": len(ordered),
+        "selected_pages": [page.number for page in ordered],
         "layer": layer,
         "source": source,
         "includes_handwriting": includes_handwriting,
@@ -289,13 +292,39 @@ def _ordered_pages(pages: list[Page]) -> list[Page]:
     document_id = pages[0].document_id
     if any(page.document_id != document_id for page in pages):
         raise GoodnotesError("A PDF export can include pages from only one notebook.")
-    if any(isinstance(page.number, bool) or page.number < 1 for page in pages):
+    if any(isinstance(page.number, bool) or not isinstance(page.number, int) for page in pages):
+        raise GoodnotesError("Every page must have an integer one-based page number.")
+    if any(page.number < 1 for page in pages):
         raise GoodnotesError("Every page must have a positive one-based page number.")
     if len({page.number for page in pages}) != len(pages):
         raise GoodnotesError("The selected pages contain duplicate page numbers.")
     if len({page.id for page in pages}) != len(pages):
         raise GoodnotesError("The selected pages contain duplicate page IDs.")
     return sorted(pages, key=lambda page: page.number)
+
+
+def _selected_pages(pages: list[Page], page_numbers: list[int] | None) -> list[Page]:
+    ordered = _ordered_pages(pages)
+    if page_numbers is None:
+        return ordered
+    if not isinstance(page_numbers, list):
+        raise GoodnotesError("Selected page numbers must be provided as a list.")
+    if not page_numbers:
+        raise GoodnotesError("Select at least one notebook page to export.")
+    if any(isinstance(number, bool) or not isinstance(number, int) for number in page_numbers):
+        raise GoodnotesError("Selected page numbers must be integers.")
+    if any(number < 1 for number in page_numbers):
+        raise GoodnotesError("Selected page numbers must be positive one-based numbers.")
+    if len(set(page_numbers)) != len(page_numbers):
+        raise GoodnotesError("Selected page numbers must not contain duplicates.")
+
+    pages_by_number = {page.number: page for page in ordered}
+    unknown = [number for number in page_numbers if number not in pages_by_number]
+    if unknown:
+        raise GoodnotesError(
+            f"Selected page number {unknown[0]} is not present in the notebook's current pages."
+        )
+    return [pages_by_number[number] for number in page_numbers]
 
 
 def _check_layer(layer: str) -> None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import heapq
+import shlex
 import sqlite3
 from collections.abc import Iterator
 from contextlib import ExitStack
@@ -13,8 +14,9 @@ from typing import TYPE_CHECKING, Any
 
 import pymupdf
 
-from .errors import GoodnotesError
-from .models import Item, Page, PageText, SearchHit, TextPart
+from . import text_index
+from .errors import GoodnotesError, TextIndexUnavailableError
+from .models import Item, Page, PageRef, PageText, RecognitionStatus, SearchHit, TextPart
 from .safety import open_database
 
 if TYPE_CHECKING:
@@ -244,8 +246,15 @@ class Library:
             truncated = truncated or omitted
             if found:
                 warnings.append(
-                    "Handwriting text is machine-recognized and may be inaccurate; any `|` "
-                    "alternatives are preserved verbatim."
+                    "Stored handwriting text is machine-recognized and unverified. Candidate "
+                    "alternatives and delimiters are preserved as stored. Label any cleaned "
+                    "reading as an interpretation, not a verbatim quote or visual transcription."
+                )
+            recognition = self._recognition_status_for_page_ids([selected.id]).get(selected.id)
+            if recognition is not None and recognition.index_state == "pending":
+                warnings.append(
+                    "Handwriting indexing is pending for this page; stored recognition text "
+                    "may be missing or outdated."
                 )
 
         if not truncated and "textbox" in selected_sources:
@@ -254,11 +263,17 @@ class Library:
             truncated = truncated or omitted
 
         if not truncated and "pdf" in selected_sources:
-            pdf_parts, remaining, omitted, indexed = self._read_pdf_text_for_page(
-                selected.id, item.id, remaining
+            page_refs = self._page_refs_for_notebooks({item.id}, page_ids={selected.id})
+            page_ref = (
+                page_refs[0] if page_refs else PageRef(document_id=item.id, page_id=selected.id)
+            )
+            pdf_parts, remaining, omitted, indexed, mapping_warning = self._read_pdf_text_for_page(
+                page_ref, remaining
             )
             parts.extend(pdf_parts)
             truncated = truncated or omitted
+            if mapping_warning:
+                warnings.append(mapping_warning)
             if indexed:
                 warnings.append(
                     "PDF text comes from the indexed PDF layer and may omit annotations."
@@ -298,22 +313,37 @@ class Library:
     def _read_warnings(self, source: str) -> list[str]:
         """Return only source-coverage warnings relevant to this read request."""
         if source == "all":
-            return self.text_warnings()
-        label = _TEXT_TABLES[source][1]
-        table = _TEXT_TABLES[source][0]
+            selected_sources = list(_TEXT_TABLES)
+        else:
+            selected_sources = [source]
         if self._fts is None:
+            labels = ", ".join(_TEXT_TABLES[item][1].lower() for item in selected_sources)
             return [
-                f"The sandbox has no search index; indexed {label.lower()} text is unavailable."
+                "The sandbox has no search index; indexed "
+                f"{labels} text is unavailable for this page."
             ]
         warnings: list[str] = []
-        if not self._table_exists(self._fts, table):
+        for selected in selected_sources:
+            label = _TEXT_TABLES[selected][1]
+            table = _TEXT_TABLES[selected][0]
+            if not self._table_exists(self._fts, table):
+                warnings.append(
+                    f"{label} text is unavailable because `{table}` is missing from the "
+                    "search index."
+                )
+        if "pdf" in selected_sources and not text_index.page_meta_supports_pdf_mapping(self._fts):
             warnings.append(
-                f"{label} text is unavailable because `{table}` is missing from the search index."
+                "Indexed PDF text cannot be mapped because usable `page_meta` mapping is "
+                "unavailable in the search index."
             )
-        if source == "pdf" and not self._table_exists(self._fts, "page_meta"):
+        if (
+            "pdf" in selected_sources
+            and self._table_exists(self._fts, "pdf_text_content")
+            and not text_index.pdf_identity_schema_available(self._fts)
+        ):
             warnings.append(
-                "Indexed PDF text cannot be mapped because `page_meta` is missing from the "
-                "search index."
+                "Indexed PDF text cannot be verified because full PDF page identity columns are "
+                "unavailable in the search index."
             )
         return warnings
 
@@ -381,15 +411,37 @@ class Library:
                 return parts, budget, True, found
         return parts, budget, False, found
 
+    def recognition_status(self, notebook: str | Item) -> dict[str, RecognitionStatus]:
+        """Return stored handwriting-recognition status for every active notebook page."""
+        self._require_open()
+        self._ensure_consistent_graph()
+        item = self._resolve_notebook_selector(notebook, option="--notebook")
+        assert self._projection is not None
+        page_ids = [
+            row[0]
+            for row in self._projection.execute(
+                "SELECT id FROM pages WHERE document_id = ? AND COALESCE(deleted, 0) = 0 "
+                "ORDER BY position, id",
+                (item.id,),
+            )
+        ]
+        return self._recognition_status_for_page_ids(page_ids)
+
+    def _recognition_status_for_page_ids(self, page_ids: list[str]) -> dict[str, RecognitionStatus]:
+        """Read recognition row counts and optional pending flags without loading text."""
+        assert self._projection is not None
+        raw_statuses = text_index.recognition_status(self._projection, self._fts, page_ids)
+        return {page_id: RecognitionStatus(**status) for page_id, status in raw_statuses.items()}
+
     def text_warnings(self) -> list[str]:
-        """Report unavailable text sources and index-to-page mapping limitations."""
+        """Report library-wide text-source and page-mapping limitations for diagnostics."""
         self._require_open()
         if self._text_warnings_cache is not None:
             return list(self._text_warnings_cache)
         if self._fts is None:
             self._text_warnings_cache = [
-                "The sandbox has no search index; indexed handwriting, textbox, and PDF text "
-                "sources are unavailable."
+                "Library-wide: the sandbox has no search index; indexed handwriting, textbox, "
+                "and PDF text sources are unavailable."
             ]
             return list(self._text_warnings_cache)
 
@@ -398,10 +450,10 @@ class Library:
             for table, label in _TEXT_TABLES.values()
             if not self._table_exists(self._fts, table)
         ]
-        if not self._table_exists(self._fts, "page_meta"):
+        if not text_index.page_meta_supports_search(self._fts):
             warnings.append(
-                "Stored-index search cannot map text rows to notebook pages because `page_meta` "
-                "is missing."
+                "Stored-index search cannot map text rows to notebook pages because usable "
+                "`page_meta` columns are missing."
             )
         else:
             index_page_ids = {
@@ -413,8 +465,236 @@ class Library:
                     "Stored-index search cannot cover every active page; "
                     f"{missing_page_count} pages have no `page_meta` row."
                 )
-        self._text_warnings_cache = warnings
+        self._text_warnings_cache = [f"Library-wide: {warning}" for warning in warnings]
         return list(self._text_warnings_cache)
+
+    def search_coverage(
+        self,
+        folder: str | Item = "/",
+        source: str = "all",
+        *,
+        notebook: str | Item | None = None,
+    ) -> dict[str, Any]:
+        """Summarize stored text and mapping metadata for one resolved library scope."""
+        self._require_open()
+        self._ensure_consistent_graph()
+        source = source.casefold() if isinstance(source, str) else ""
+        if source not in {"all", *_TEXT_TABLES}:
+            raise GoodnotesError("Coverage source must be all, handwriting, pdf, or textbox.")
+        scope, _, notebook_ids = self._resolve_text_scope(folder, notebook)
+        page_refs = self._page_refs_for_notebooks(notebook_ids)
+        requested_sources = list(_TEXT_TABLES) if source == "all" else [source]
+        details = text_index.coverage(self._fts, page_refs, requested_sources)
+        mapping = details["page_meta"]
+        source_details = details["sources"]
+        warnings = list(details["warnings"])
+        next_steps: list[str] = []
+
+        if source in {"all", "pdf"}:
+            if scope["type"] == "notebook":
+                scope_option = "--notebook"
+                scope_value = scope["path"]
+            elif scope["folder_id"] is None:
+                scope_option = "--folder"
+                scope_value = "/"
+            else:
+                scope_option = "--folder"
+                scope_value = scope["path"]
+            scan_command = (
+                f"goodnotes scan-pdfs 'QUERY' {scope_option} {shlex.quote(scope_value)} "
+                "--page-limit 200"
+            )
+            next_steps.append(
+                "To check copied PDF backgrounds in this scope, run `"
+                f"{scan_command}`; replace `QUERY` with a phrase and continue with "
+                "`--page-offset` if returned."
+            )
+        if not mapping["available"] or mapping["active_pages_without_metadata"]:
+            next_steps.append("Refresh the read-only snapshot with `goodnotes sync`.")
+        if mapping.get("stale_or_mismatched_pages", 0):
+            next_steps.append("Refresh the read-only snapshot with `goodnotes sync`.")
+        for source_details_row in source_details.values():
+            if source_details_row["availability"] == "unavailable":
+                next_steps.append("Refresh the read-only snapshot with `goodnotes sync`.")
+
+        if source in {"all", "handwriting"}:
+            recognition = self._recognition_status_for_page_ids(
+                [page_ref.page_id for page_ref in page_refs]
+            )
+            pending_pages = sum(
+                1 for status in recognition.values() if status.index_state == "pending"
+            )
+            if pending_pages:
+                warnings.append(
+                    f"Handwriting indexing is pending for {pending_pages} active pages in this "
+                    "scope; handwriting text counts may be incomplete or outdated."
+                )
+                next_steps.append(
+                    "After Goodnotes finishes indexing, refresh the read-only snapshot with "
+                    "`goodnotes sync`."
+                )
+
+        warnings.append(
+            "Stored-text counts describe this snapshot; source-index completeness cannot be "
+            "confirmed from the available metadata."
+        )
+        if not next_steps:
+            next_steps.append(
+                "Use `goodnotes read` on selected pages to inspect stored text and its source."
+            )
+        return {
+            "scope": scope,
+            "selected_source": source,
+            "active_pages": len(page_refs),
+            "page_meta": mapping,
+            "sources": source_details,
+            "completeness": "unknown",
+            "warnings": list(dict.fromkeys(warnings)),
+            "next_steps": list(dict.fromkeys(next_steps))[:5],
+        }
+
+    def _page_refs_for_notebooks(
+        self, notebook_ids: set[str], *, page_ids: set[str] | None = None
+    ) -> list[PageRef]:
+        """Read active page identities and current PDF mappings from the projection."""
+        if not notebook_ids:
+            return []
+        assert self._projection is not None
+        page_columns = text_index.table_columns(self._projection, "pages")
+        template_columns = (
+            text_index.table_columns(self._projection, "templates")
+            if self._table_exists(self._projection, "templates")
+            else set()
+        )
+        has_projection_mapping = {"template_id", "id", "document_id"} <= page_columns and {
+            "id",
+            "document_id",
+            "attachment_id",
+            "page_number",
+        } <= template_columns
+        if has_projection_mapping:
+            identity = "t.attachment_id AS attachment_id, t.page_number AS page_number"
+            template_join = (
+                "LEFT JOIN templates AS t ON t.id = p.template_id AND t.document_id = p.document_id"
+            )
+        else:
+            identity = "NULL AS attachment_id, NULL AS page_number"
+            template_join = ""
+        order = (
+            "p.document_id, p.position, p.id"
+            if "position" in page_columns
+            else "p.document_id, p.id"
+        )
+        requested_pages = sorted(page_ids) if page_ids is not None else []
+        page_batches = (
+            list(text_index.batches(requested_pages, 300)) if page_ids is not None else [None]
+        )
+        result: list[PageRef] = []
+        for notebook_batch in text_index.id_batches(sorted(notebook_ids)):
+            document_placeholders = ", ".join("?" for _ in notebook_batch)
+            for page_batch in page_batches:
+                page_filter = ""
+                parameters: tuple[Any, ...] = tuple(notebook_batch)
+                if page_batch is not None:
+                    page_placeholders = ", ".join("?" for _ in page_batch)
+                    page_filter = f"AND p.id IN ({page_placeholders})"
+                    parameters += tuple(page_batch)
+                rows = self._projection.execute(
+                    f"""
+                    SELECT p.id AS page_id, p.document_id, {identity}
+                    FROM pages AS p
+                    {template_join}
+                    WHERE p.document_id IN ({document_placeholders})
+                      AND COALESCE(p.deleted, 0) = 0 {page_filter}
+                    ORDER BY {order}
+                    """,
+                    parameters,
+                )
+                for row in rows:
+                    attachment_id = row["attachment_id"]
+                    attachment_id = str(attachment_id) if attachment_id else None
+                    pdf_page_no: int | None
+                    try:
+                        pdf_page_no = int(row["page_number"])
+                        if pdf_page_no < 1:
+                            pdf_page_no = None
+                    except (TypeError, ValueError):
+                        pdf_page_no = None
+                    result.append(
+                        PageRef(
+                            document_id=row["document_id"],
+                            page_id=row["page_id"],
+                            attachment_id=attachment_id,
+                            pdf_page_no=pdf_page_no,
+                        )
+                    )
+        return result
+
+    def _resolve_text_scope(
+        self, folder: str | Item, notebook: str | Item | None
+    ) -> tuple[dict[str, Any], list[Item], set[str]]:
+        if notebook is not None:
+            try:
+                parent_key = self._folder_key(folder, root_allowed=True)
+            except GoodnotesError as exc:
+                if "different kind" in str(exc):
+                    raise GoodnotesError(
+                        "Use --notebook for a notebook selector and --folder for a folder "
+                        "selector; do not pass both scopes."
+                    ) from None
+                raise
+            if parent_key is not None:
+                raise GoodnotesError("Use either --notebook or a non-root --folder, not both.")
+            item = self._resolve_notebook_selector(notebook, option="--notebook")
+            return (
+                {
+                    "type": "notebook",
+                    "notebook_id": item.id,
+                    "path": item.path,
+                },
+                [item],
+                {item.id},
+            )
+
+        try:
+            parent_key = self._folder_key(folder, root_allowed=True)
+        except GoodnotesError as exc:
+            is_notebook = False
+            try:
+                self.resolve(folder, kind="notebook")
+                is_notebook = True
+            except GoodnotesError:
+                pass
+            if is_notebook or "different kind" in str(exc):
+                raise GoodnotesError(
+                    "The selector identifies a notebook; use --notebook for a notebook or "
+                    "--folder for a folder."
+                ) from None
+            raise
+        notebooks = [item for item in self.tree(folder) if item.kind == "notebook"]
+        if parent_key is None:
+            scope = {"type": "folder", "folder_id": None, "path": "/"}
+        else:
+            item = self._item_for_key(parent_key)
+            scope = {"type": "folder", "folder_id": item.id, "path": item.path}
+        return scope, notebooks, {item.id for item in notebooks}
+
+    def _resolve_notebook_selector(self, selector: str | Item, *, option: str) -> Item:
+        try:
+            return self.resolve(selector, kind="notebook")
+        except GoodnotesError as exc:
+            is_folder = False
+            try:
+                self.resolve(selector, kind="folder")
+                is_folder = True
+            except GoodnotesError:
+                pass
+            if is_folder or "different kind" in str(exc):
+                raise GoodnotesError(
+                    f"{option} identifies a folder; use --folder for a folder scope and "
+                    "--notebook for a notebook."
+                ) from None
+            raise
 
     def search(
         self,
@@ -422,6 +702,8 @@ class Library:
         folder: str | Item = "/",
         source: str = "all",
         limit: int = 20,
+        *,
+        notebook: str | Item | None = None,
     ) -> list[SearchHit]:
         """Find literal, case-folded substrings in ordinary SQLite content tables."""
         self._require_open()
@@ -434,27 +716,27 @@ class Library:
         valid_sources = {"all", "handwriting", "pdf", "textbox"}
         if source not in valid_sources:
             raise GoodnotesError("Search source must be all, handwriting, pdf, or textbox.")
+        _, _, notebook_ids = self._resolve_text_scope(folder, notebook)
         if self._fts is None:
-            raise GoodnotesError("The sandbox has no search index.")
+            raise TextIndexUnavailableError("The sandbox has no search index.")
 
         selected_sources = list(_TEXT_TABLES) if source == "all" else [source]
         missing_sources = [
             item_source
             for item_source in selected_sources
-            if not self._table_exists(self._fts, _TEXT_TABLES[item_source][0])
+            if not text_index.search_source_available(self._fts, item_source)
         ]
         if source != "all" and missing_sources:
             label = _TEXT_TABLES[source][1]
-            raise GoodnotesError(f"{label} text is unavailable in this search index.")
+            raise TextIndexUnavailableError(f"{label} text is unavailable in this search index.")
         if source == "all" and len(missing_sources) == len(selected_sources):
-            raise GoodnotesError("The search index has no available text content tables.")
-        if not self._table_exists(self._fts, "page_meta") and source != "all":
-            raise GoodnotesError(
-                "Search results cannot be mapped because page metadata is missing."
+            raise TextIndexUnavailableError(
+                "The search index has no available text content tables."
             )
-
-        parent_key = self._folder_key(folder, root_allowed=True)
-        notebook_ids = self._notebook_ids_under(parent_key)
+        if not text_index.page_meta_supports_search(self._fts):
+            raise TextIndexUnavailableError(
+                "Search results cannot be mapped because usable page metadata is missing."
+            )
         if not notebook_ids:
             return []
 
@@ -462,20 +744,61 @@ class Library:
             item_source for item_source in selected_sources if item_source not in missing_sources
         ]
         if not available:
-            raise GoodnotesError("The requested search index content table is unavailable.")
+            raise TextIndexUnavailableError(
+                "The requested search index content table is unavailable."
+            )
+        pdf_bindings: text_index._PDFPageBindings | None = None
+        if "pdf" in available:
+            pdf_bindings = text_index.pdf_page_bindings(
+                self._fts, self._page_refs_for_notebooks(notebook_ids)
+            )
+            if not pdf_bindings["available"]:
+                if source == "pdf":
+                    raise TextIndexUnavailableError(
+                        "PDF text cannot be searched because full page identity mapping is "
+                        "unavailable in this search index."
+                    )
+                available.remove("pdf")
+            elif (
+                source == "pdf"
+                and pdf_bindings["pages"]
+                and not any(
+                    binding["state"] != "unknown" for binding in pdf_bindings["pages"].values()
+                )
+            ):
+                raise TextIndexUnavailableError(
+                    "PDF text cannot be searched because active pages have no verifiable "
+                    "identity mapping in this search index."
+                )
+        if not available:
+            raise TextIndexUnavailableError("The requested text index mappings are unavailable.")
 
         source_order = {"handwriting": 0, "pdf": 1, "textbox": 2}
         candidates: list[_SearchCandidate] = []
         retained_keys: set[tuple[str, str, int, bytes]] = set()
         sequence = 0
+        notebook_batches = list(text_index.id_batches(sorted(notebook_ids)))
         # Each source cursor orders by text_id, and a page/source fixes the other
         # sort fields. Thus a later exact duplicate can never outrank its first row;
         # keys for candidates outside the retained top-K set need not be kept.
         for item_source in available:
-            for row in self._search_rows(item_source, query):
+            if item_source == "pdf":
+                assert pdf_bindings is not None
+                rows = (
+                    row
+                    for notebook_batch in notebook_batches
+                    for row in text_index.search_pdf_rows(
+                        self._fts, pdf_bindings, query, notebook_batch
+                    )
+                )
+            else:
+                rows = (
+                    row
+                    for notebook_batch in notebook_batches
+                    for row in self._search_rows(item_source, query, notebook_batch)
+                )
+            for row in rows:
                 document_id = row["document_id"]
-                if document_id not in notebook_ids:
-                    continue
                 page_id = row["page_id"]
                 page_number = self._page_number_for_id(document_id, page_id)
                 if page_number is None:
@@ -534,6 +857,7 @@ class Library:
         limit: int = 20,
         page_limit: int = 200,
         page_offset: int = 0,
+        notebook: str | Item | None = None,
     ) -> dict[str, Any]:
         """Search copied PDF backgrounds in a bounded window of notebook pages."""
         self._require_open()
@@ -552,18 +876,9 @@ class Library:
         if isinstance(page_offset, bool) or not isinstance(page_offset, int) or page_offset < 0:
             raise GoodnotesError("PDF scan page_offset must be a non-negative integer.")
 
-        page_iterator = self._iter_notebook_pages(folder)
-        for _ in range(page_offset):
-            if next(page_iterator, None) is None:
-                return {
-                    "hits": [],
-                    "pages_scanned": 0,
-                    "next_page_offset": None,
-                    "warnings": [
-                        "PDF scan searches copied background PDF text only; it does not scan "
-                        "handwriting or the stored search index."
-                    ],
-                }
+        scope, notebooks, _ = self._resolve_text_scope(folder, notebook)
+        total_pages = sum(item.page_count for item in notebooks)
+        window_pages = min(page_limit, max(0, total_pages - page_offset))
 
         hits: list[SearchHit] = []
         warnings: list[str] = [
@@ -575,41 +890,62 @@ class Library:
         unmapped_backgrounds = 0
         unreadable_backgrounds = 0
         truncated_pages = 0
-        has_more = False
+        extraction_issues: list[dict[str, Any]] = []
         folded_query = query.casefold()
 
-        while pages_scanned < page_limit:
-            candidate = next(page_iterator, None)
-            if candidate is None:
-                break
-            notebook, page = candidate
+        stopped_for_hits = False
+        for notebook_item, page in self._iter_page_window(
+            notebooks, offset=page_offset, count=window_pages
+        ):
             pages_scanned += 1
-            text, extraction_warning, _ = self._extract_pdf_fallback(page)
+            text, extraction_warning, extraction_truncated = self._extract_pdf_fallback(page)
+            issue: str | None = None
             if not page.attachment_path:
                 missing_backgrounds += 1
+                issue = "missing-background"
             elif page.pdf_page is None:
                 unmapped_backgrounds += 1
+                issue = "unmapped-background"
             elif text is None:
                 unreadable_backgrounds += 1
-            if extraction_warning and "truncated at" in extraction_warning:
+                issue = "unreadable-background"
+            if extraction_truncated or (
+                extraction_warning is not None and "truncated at" in extraction_warning
+            ):
                 truncated_pages += 1
+                issue = "truncated-text"
+            if issue is not None:
+                extraction_issues.append(
+                    {
+                        "page_id": page.id,
+                        "document_id": notebook_item.id,
+                        "page": page.number,
+                        "issue": issue,
+                        "detail": extraction_warning,
+                    }
+                )
             if text is not None and folded_query in text.casefold():
                 hits.append(
                     SearchHit(
-                        document_id=notebook.id,
-                        path=notebook.path,
+                        document_id=notebook_item.id,
+                        path=notebook_item.path,
                         page=page.number,
                         page_id=page.id,
                         source="pdf",
                         text=text,
                     )
                 )
-                if len(hits) >= limit:
-                    has_more = next(page_iterator, None) is not None
+                if len(hits) >= limit and page_offset + pages_scanned < total_pages:
+                    stopped_for_hits = True
                     break
 
-        if pages_scanned == page_limit and len(hits) < limit:
-            has_more = next(page_iterator, None) is not None
+        scan_complete = page_offset + pages_scanned >= total_pages
+        if scan_complete:
+            stop_reason = "complete"
+        elif stopped_for_hits:
+            stop_reason = "hit-limit"
+        else:
+            stop_reason = "page-limit"
         if missing_backgrounds:
             warnings.append(
                 f"{missing_backgrounds} scanned pages have no confined copied background."
@@ -626,19 +962,56 @@ class Library:
             warnings.append(
                 f"{truncated_pages} PDF page extractions were truncated at the safe text limit."
             )
+        if extraction_issues:
+            warnings.append(
+                "PDF text coverage is incomplete for one or more scanned pages; see "
+                "`extraction_issues`."
+            )
 
         return {
             "hits": hits,
             "pages_scanned": pages_scanned,
-            "next_page_offset": page_offset + pages_scanned if has_more else None,
+            "next_page_offset": None if scan_complete else page_offset + pages_scanned,
+            "scope": scope,
+            "total_pages": total_pages,
+            "scan_complete": scan_complete,
+            "coverage_complete": page_offset == 0 and scan_complete and not extraction_issues,
+            "stop_reason": stop_reason,
+            "extraction_issues": extraction_issues,
             "warnings": warnings,
         }
 
-    def _iter_notebook_pages(self, folder: str | Item) -> Iterator[tuple[Item, Page]]:
-        for item in self.tree(folder):
-            if item.kind == "notebook":
-                for page in self.pages(item):
-                    yield item, page
+    def _iter_page_window(
+        self, notebooks: list[Item], *, offset: int, count: int
+    ) -> Iterator[tuple[Item, Page]]:
+        """Hydrate only pages in a bounded scan window, skipping by catalog counts."""
+        if count <= 0:
+            return
+        assert self._projection is not None
+        skipped = offset
+        remaining = count
+        for notebook in notebooks:
+            if remaining <= 0:
+                break
+            if skipped >= notebook.page_count:
+                skipped -= notebook.page_count
+                continue
+            local_offset = skipped
+            skipped = 0
+            fetch_count = min(remaining, notebook.page_count - local_offset)
+            rows = self._projection.execute(
+                """
+                SELECT id, document_id, template_id, position, group_id
+                FROM pages
+                WHERE document_id = ? AND COALESCE(deleted, 0) = 0
+                ORDER BY position, id
+                LIMIT ? OFFSET ?
+                """,
+                (notebook.id, fetch_count, local_offset),
+            ).fetchall()
+            for index, row in enumerate(rows, start=local_offset + 1):
+                yield notebook, self._page_from_row(row, index)
+            remaining -= len(rows)
 
     def stats(self) -> dict[str, Any]:
         """Return counts and capability warnings suitable for a doctor/info command."""
@@ -693,18 +1066,28 @@ class Library:
             warnings.append(
                 f"{self._links_to_deleted_count} active links to deleted items were ignored."
             )
+        page_meta_available = text_index.page_meta_supports_search(self._fts)
         page_meta_ids: set[str] = set()
-        if self._fts is not None and self._table_exists(self._fts, "page_meta"):
+        if self._fts is not None and page_meta_available:
             page_meta_ids = {
                 row[0] for row in self._fts.execute("SELECT page_id FROM page_meta").fetchall()
             }
-        active_page_ids = set(self._page_numbers_by_id())
-        pages_without_metadata = len(active_page_ids - page_meta_ids)
-        metadata_without_pages = len(page_meta_ids - active_page_ids)
-        if pages_without_metadata:
-            warnings.append(f"{pages_without_metadata} active pages have no index metadata row.")
-        if metadata_without_pages:
-            warnings.append(f"{metadata_without_pages} index metadata rows have no active page.")
+        if page_meta_available:
+            active_page_ids = set(self._page_numbers_by_id())
+            pages_without_metadata: int | None = len(active_page_ids - page_meta_ids)
+            metadata_without_pages: int | None = len(page_meta_ids - active_page_ids)
+            if pages_without_metadata:
+                warnings.append(
+                    f"{pages_without_metadata} active pages have no index metadata row."
+                )
+            if metadata_without_pages:
+                warnings.append(
+                    f"{metadata_without_pages} index metadata rows have no active page."
+                )
+        else:
+            pages_without_metadata = None
+            metadata_without_pages = None
+            warnings.append("Page-to-index metadata coverage is unavailable for this snapshot.")
         return {
             "active_folders": active_folders,
             "active_notebooks": active_notebooks,
@@ -722,7 +1105,7 @@ class Library:
             "pages_without_index_metadata": pages_without_metadata,
             "index_metadata_without_active_pages": metadata_without_pages,
             "search_index_available": bool(
-                self._fts is not None and fts_tables and self._table_exists(self._fts, "page_meta")
+                self._fts is not None and fts_tables and page_meta_available
             ),
             "search_content_tables": fts_tables,
             "warnings": warnings,
@@ -1037,10 +1420,6 @@ class Library:
                     pdf_page = candidate_page
             except (TypeError, ValueError):
                 pdf_page = None
-        if pdf_page is None:
-            mapping = self._page_template_mapping(row["id"])
-            if mapping is not None:
-                pdf_page = mapping[1]
 
         return Page(
             id=row["id"],
@@ -1146,7 +1525,12 @@ class Library:
         return text, warning, truncated
 
     def _page_template_mapping(self, page_id: str) -> tuple[str, int] | None:
-        if self._fts is None or not self._table_exists(self._fts, "page_meta"):
+        if (
+            self._fts is None
+            or not self._table_exists(self._fts, "page_meta")
+            or "template_attachment_id_and_page_no"
+            not in text_index.table_columns(self._fts, "page_meta")
+        ):
             return None
         row = self._fts.execute(
             "SELECT template_attachment_id_and_page_no FROM page_meta WHERE page_id = ?",
@@ -1166,69 +1550,87 @@ class Library:
         return attachment_id, page_number
 
     def _read_pdf_text_for_page(
-        self, page_id: str, document_id: str, budget: int | None
-    ) -> tuple[list[TextPart], int | None, bool, bool]:
-        """Read PDF index rows, loading no more than the remaining page text budget."""
-        if (
-            self._fts is None
-            or not self._table_exists(self._fts, "pdf_text_content")
-            or not self._table_exists(self._fts, "page_meta")
-        ):
-            return [], budget, False, False
-
-        mapping = self._fts.execute(
-            "SELECT pdf_text_id, template_attachment_id_and_page_no "
-            "FROM page_meta WHERE page_id = ?",
-            (page_id,),
-        ).fetchone()
-        if mapping is None:
-            return [], budget, False, False
-        if mapping["pdf_text_id"] is not None:
-            rows = self._fts.execute(
-                """
-                SELECT text_id, length(text) AS text_length
-                FROM pdf_text_content
-                WHERE text_id = ? AND COALESCE(text, '') <> ''
-                ORDER BY text_id
-                """,
-                (mapping["pdf_text_id"],),
+        self, page_ref: PageRef, budget: int | None
+    ) -> tuple[list[TextPart], int | None, bool, bool, str | None]:
+        """Read PDF index rows that match the projection-derived page identity."""
+        if self._fts is None or not self._table_exists(self._fts, "pdf_text_content"):
+            return [], budget, False, False, None
+        binding_result = text_index.pdf_page_bindings(self._fts, [page_ref])
+        if not binding_result["available"]:
+            return (
+                [],
+                budget,
+                False,
+                False,
+                "Indexed PDF text identity could not be verified; only confined copied "
+                "background text can be used.",
             )
-        elif mapping["template_attachment_id_and_page_no"] and self._table_exists(
-            self._fts, "template_meta"
-        ):
-            rows = self._fts.execute(
-                """
-                SELECT DISTINCT content.text_id, length(content.text) AS text_length
-                FROM template_meta AS template
-                JOIN pdf_text_content AS content
-                  ON content.attachment_id = template.attachment_id
-                 AND content.pdf_page_no = template.pdf_page_no
-                 AND content.document_id = ?
-                WHERE template.attachment_id || '_' || template.pdf_page_no = ?
-                  AND COALESCE(content.text, '') <> ''
-                ORDER BY content.text_id
-                """,
-                (document_id, mapping["template_attachment_id_and_page_no"]),
+        binding = binding_result["pages"][page_ref.page_id]
+        if binding["state"] == "unknown":
+            return (
+                [],
+                budget,
+                False,
+                False,
+                "Indexed PDF text mapping could not be verified for this page; only confined "
+                "copied background text can be used.",
             )
-        else:
-            return [], budget, False, False
+        mapping_warning = None
+        if binding["mismatched_direct_pointer"]:
+            mapping_warning = (
+                "A stored PDF text pointer did not match the current page identity and was ignored."
+            )
+        text_ids = binding["text_ids"]
+        if not text_ids:
+            return [], budget, False, False, mapping_warning
 
+        assert self._fts is not None
+        indexed_rows: list[sqlite3.Row] = []
+        for batch in text_index.batches(text_ids):
+            placeholders = ", ".join("?" for _ in batch)
+            indexed_rows.extend(
+                self._fts.execute(
+                    f"""
+                    SELECT text_id, length(text) AS text_length
+                    FROM pdf_text_content
+                    WHERE text_id IN ({placeholders})
+                      AND document_id = ? AND attachment_id = ? AND pdf_page_no = ?
+                      AND COALESCE(text, '') <> ''
+                    ORDER BY text_id
+                    """,
+                    (*batch, page_ref.document_id, page_ref.attachment_id, page_ref.pdf_page_no),
+                ).fetchall()
+            )
         parts: list[TextPart] = []
         found = False
-        for row in rows:
+        for row in indexed_rows:
             found = True
             if budget is not None and budget == 0:
-                return parts, budget, True, found
+                return parts, budget, True, found, mapping_warning
             if budget is None:
                 content = self._fts.execute(
-                    "SELECT text FROM pdf_text_content WHERE text_id = ?", (row["text_id"],)
+                    "SELECT text FROM pdf_text_content WHERE text_id = ? AND document_id = ? "
+                    "AND attachment_id = ? AND pdf_page_no = ?",
+                    (
+                        row["text_id"],
+                        page_ref.document_id,
+                        page_ref.attachment_id,
+                        page_ref.pdf_page_no,
+                    ),
                 ).fetchone()
                 text = content[0] if content is not None else ""
                 part_truncated = False
             else:
                 content = self._fts.execute(
-                    "SELECT substr(text, 1, ?) FROM pdf_text_content WHERE text_id = ?",
-                    (budget + 1, row["text_id"]),
+                    "SELECT substr(text, 1, ?) FROM pdf_text_content WHERE text_id = ? "
+                    "AND document_id = ? AND attachment_id = ? AND pdf_page_no = ?",
+                    (
+                        budget + 1,
+                        row["text_id"],
+                        page_ref.document_id,
+                        page_ref.attachment_id,
+                        page_ref.pdf_page_no,
+                    ),
                 ).fetchone()
                 text = content[0] if content is not None else ""
                 part_truncated = int(row["text_length"] or 0) > budget or len(text) > budget
@@ -1239,8 +1641,8 @@ class Library:
             if budget is not None:
                 budget = max(0, budget - len(text))
             if part_truncated:
-                return parts, budget, True, found
-        return parts, budget, False, found
+                return parts, budget, True, found, mapping_warning
+        return parts, budget, False, found, mapping_warning
 
     def _notebook_ids_under(self, parent_key: tuple[str, str] | None) -> set[str]:
         ids: set[str] = set()
@@ -1256,69 +1658,44 @@ class Library:
         visit(parent_key)
         return ids
 
-    def _search_rows(self, source: str, query: str) -> Iterator[sqlite3.Row]:
+    def _search_rows(
+        self, source: str, query: str, document_ids: list[str] | None = None
+    ) -> Iterator[sqlite3.Row]:
+        """Search handwriting or textbox rows for a bounded notebook-id set."""
         assert self._fts is not None
-        if not self._table_exists(self._fts, "page_meta"):
+        if document_ids is None:
+            document_ids = sorted(self._notebook_ids_under(None))
+        if len(document_ids) > text_index.SQL_BIND_LIMIT:
+            for batch in text_index.id_batches(document_ids):
+                yield from self._search_rows(source, query, batch)
             return
-        if source == "handwriting":
-            if not self._table_exists(self._fts, "annotation_text_content"):
-                return
-            yield from self._fts.execute(
-                """
-                SELECT p.document_id, a.page_id, a.text, a.text_id AS sort_id
-                FROM annotation_text_content AS a
-                JOIN page_meta AS p ON p.page_id = a.page_id
-                WHERE instr(casefold(a.text), casefold(?)) > 0
-                ORDER BY a.text_id
-                """,
-                (query,),
-            )
+        if not document_ids or not text_index.page_meta_supports_search(self._fts):
             return
-        if source == "textbox":
-            if not self._table_exists(self._fts, "textbox_text_content"):
-                return
-            yield from self._fts.execute(
-                """
-                SELECT p.document_id, t.page_id, t.text, t.text_id AS sort_id
-                FROM textbox_text_content AS t
-                JOIN page_meta AS p ON p.page_id = t.page_id
-                WHERE instr(casefold(t.text), casefold(?)) > 0
-                ORDER BY t.text_id
-                """,
-                (query,),
-            )
+        if source not in {"handwriting", "textbox"}:
             return
-        if not self._table_exists(self._fts, "pdf_text_content"):
+        table = _TEXT_TABLES[source][0]
+        if not self._table_exists(self._fts, table) or not {
+            "page_id",
+            "text_id",
+            "text",
+        } <= text_index.table_columns(self._fts, table):
             return
+        alias = "a" if source == "handwriting" else "t"
+        scope = ", ".join("?" for _ in document_ids)
+        page_meta_columns = text_index.table_columns(self._fts, "page_meta")
+        mapping_filter = text_index.page_meta_live_filter(page_meta_columns, alias="p")
         yield from self._fts.execute(
-            """
-            SELECT p.document_id, p.page_id, content.text, content.text_id AS sort_id
-            FROM page_meta AS p
-            JOIN pdf_text_content AS content ON content.text_id = p.pdf_text_id
-            WHERE instr(casefold(content.text), casefold(?)) > 0
-            ORDER BY content.text_id
+            f"""
+            SELECT p.document_id, {alias}.page_id, {alias}.text,
+                   {alias}.text_id AS sort_id
+            FROM {table} AS {alias}
+            JOIN page_meta AS p ON p.page_id = {alias}.page_id
+            WHERE p.document_id IN ({scope}) {mapping_filter}
+              AND instr(casefold({alias}.text), casefold(?)) > 0
+            ORDER BY {alias}.text_id
             """,
-            (query,),
+            (*document_ids, query),
         )
-        if self._table_exists(self._fts, "template_meta"):
-            yield from self._fts.execute(
-                """
-                SELECT DISTINCT p.document_id, p.page_id, content.text,
-                                content.text_id AS sort_id
-                FROM page_meta AS p
-                JOIN template_meta AS template
-                  ON p.template_attachment_id_and_page_no =
-                     template.attachment_id || '_' || template.pdf_page_no
-                JOIN pdf_text_content AS content
-                  ON content.attachment_id = template.attachment_id
-                 AND content.pdf_page_no = template.pdf_page_no
-                 AND content.document_id = p.document_id
-                WHERE p.pdf_text_id IS NULL
-                  AND instr(casefold(content.text), casefold(?)) > 0
-                ORDER BY content.text_id
-                """,
-                (query,),
-            )
 
     def _page_number_for_id(self, document_id: str, page_id: str) -> int | None:
         return self._page_numbers.get((document_id, page_id))

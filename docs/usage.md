@@ -43,6 +43,14 @@ uv run goodnotes --text pages "Notebook name"
 
 If a name matches more than one notebook, use its full path or ID. Page numbers start at 1 and follow the notebook's current order.
 
+To find pages that have stored handwriting text or indexing still pending, request recognition metadata:
+
+```sh
+uv run goodnotes --fields number,recognition pages "Notebook name" --with-recognition
+```
+
+This keeps the same `pages` array and adds per-page status. It reports stored text counts and indexing state; it does not return the candidate text or inspect ink. `--no-with-recognition` disables the metadata and is the default.
+
 ## 3. Read page text
 
 Read the first page or choose a page range:
@@ -54,34 +62,39 @@ uv run goodnotes --text read "Notebook name" --pages 1-3,7
 
 `read` labels text sources separately. Use `--source pdf`, `--source handwriting`, or `--source textbox` to select one source. Handwriting results are recognition candidates stored by Goodnotes. They do not show how the ink looks on the page. The default text budget is 12,000 characters across the selected pages; use `--max-chars` to change it. The result reports when text was truncated.
 
+Handwriting output preserves stored candidate delimiters. Treat it as a cleaned recognition reading, not an exact quotation or visual transcription. A pending-index warning may appear even when the page has no stored candidate text.
+
 ## 4. Search for a phrase
 
 Search uses the stored text index:
 
 ```sh
-uv run goodnotes --text search "lecture topic"
+uv run goodnotes --text search "lecture topic" --notebook "Notebook name"
 uv run goodnotes --text search "lecture topic" --folder "Course"
 ```
 
-If the index misses text that appears in a copied PDF background, scan those PDF pages separately:
+Use either `--notebook` or `--folder`; omitting both searches from `/`. Search checks the stored index and does not start a PDF scan automatically. Its `coverage_detail` describes the resolved scope, stored source text, metadata warnings, and suggested next steps. Index completeness remains `unknown`, even when metadata rows appear complete. Metadata counts are not proof that every page has indexed text.
+
+If the stored-index search misses text that may appear in a copied PDF background, run a separate scoped scan:
 
 ```sh
-uv run goodnotes --text scan-pdfs "lecture topic" --page-limit 200
+uv run goodnotes --text scan-pdfs "lecture topic" --notebook "Notebook name" --page-limit 200
 ```
 
-`scan-pdfs` searches PDF backgrounds only. It does not search handwriting or the stored index. If more pages remain, use the returned `next_page_offset` as `--page-offset` on the next call.
+`scan-pdfs` searches copied PDF backgrounds only. It does not search handwriting, the stored index, or PDFs registered with `attach-pdf`. Use the returned `next_page_offset` as `--page-offset` with the same query, scope, and snapshot. `scan_complete` says whether the scoped page sequence is exhausted. `coverage_complete` is true only when a scan starts at offset 0, reaches the end, and has no extraction gaps. Check `stop_reason` and warnings as well; neither a partial scan nor missing or unreadable backgrounds proves text is absent.
 
 ## 5. Export a page or notebook
 
 Export a notebook to PDF, render one page to PNG, or create a small set of page images and text data:
 
 ```sh
+uv run goodnotes export "Notebook name" --pages 1-3,7 --output /tmp/selected-pages.pdf
 uv run goodnotes export "Notebook name" --output /tmp/notebook.pdf
 uv run goodnotes render "Notebook name" --page 3 --output /tmp/page-3.png
 uv run goodnotes bundle "Notebook name" --pages 1-3 --output /tmp/notebook-pages
 ```
 
-These commands use the `background` layer by default. It contains each page's source attachment and does not add native Goodnotes ink. `bundle` writes one PNG per selected page and a `text.json` manifest. It accepts up to 10 pages and applies one character budget across their text. For annotated PDF output, follow [PDFs and handwriting](pdf-and-handwriting.md).
+`export --pages` selects distinct one-based page numbers in the listed order, with no 20-page cap; omitting it exports all pages. These commands use the `background` layer by default. It contains each page's source attachment and does not add native Goodnotes ink. `bundle` accepts up to 10 pages and applies one character budget across their text. For annotated PDF output, follow [PDFs and handwriting](pdf-and-handwriting.md).
 
 Output paths must be new. The CLI does not replace an existing file or directory.
 

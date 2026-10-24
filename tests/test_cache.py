@@ -370,6 +370,22 @@ def _read_view_paused_with_missing_pointer(
         Path(output).write_text(json.dumps({"error": repr(exc)}), encoding="utf-8")
 
 
+def _read_explicit_view_paused(
+    sandbox_path: str,
+    yielded: multiprocessing.synchronize.Event,
+    release_reader: multiprocessing.synchronize.Event,
+    output: str,
+) -> None:
+    try:
+        with cache_module.read_view(Settings(sandbox=Path(sandbox_path))) as sandbox:
+            yielded.set()
+            if not release_reader.wait(15):
+                raise RuntimeError("explicit read-view release barrier timed out")
+            Path(output).write_text(str(sandbox.root), encoding="utf-8")
+    except BaseException as exc:
+        Path(output).write_text(json.dumps({"error": repr(exc)}), encoding="utf-8")
+
+
 def test_existing_cache_without_pointer_locks_before_resolving_reader(
     tmp_path: Path,
 ) -> None:
@@ -587,6 +603,102 @@ def test_explicit_managed_sandbox_takes_shared_view_lock(
 
     assert acquired == [(data_dir / cache_module._VIEW_LOCK, False)]
     assert settings.snapshot_id == sandbox_path.name
+
+
+def test_explicit_managed_sandbox_dotdot_alias_holds_snapshot_during_prune(
+    tmp_path: Path,
+) -> None:
+    context = multiprocessing.get_context("spawn")
+    source = make_library(tmp_path / "source")
+    data_dir = tmp_path / "cache"
+    first = cache_module.refresh_cache(source, data_dir)
+    old_root = Path(str(first["snapshot"]))
+    # Resolves to the same managed generation, but its lexical parent is "..".
+    sandbox_alias = old_root.parent / old_root.name / ".." / old_root.name
+    assert sandbox_alias.resolve() == old_root
+    (source / "Attachments" / "page.pdf").write_bytes(b"changed for explicit alias prune")
+
+    yielded = context.Event()
+    release_reader = context.Event()
+    reader_output = tmp_path / "explicit-reader-output.txt"
+    reader = context.Process(
+        target=_read_explicit_view_paused,
+        args=(str(sandbox_alias), yielded, release_reader, str(reader_output)),
+    )
+    reader.start()
+    sync_process: Any = None
+    try:
+        assert yielded.wait(15), "explicit reader did not enter read_view"
+
+        captured = context.Event()
+        publish_attempt = context.Event()
+        complete = context.Event()
+        sync_output = tmp_path / "explicit-alias-sync-output.json"
+        sync_process = context.Process(
+            target=_refresh_waiting_to_publish,
+            args=(
+                str(source),
+                str(data_dir),
+                captured,
+                publish_attempt,
+                complete,
+                str(sync_output),
+            ),
+        )
+        sync_process.start()
+        assert captured.wait(15), "refresh did not finish capture while explicit reader held view"
+        assert publish_attempt.wait(15), "refresh did not reach publication"
+        assert not complete.is_set(), "refresh must wait for the explicit reader's view lock"
+        assert active_pointer(data_dir)["snapshot"] == str(old_root)
+        assert old_root.is_dir()
+    finally:
+        release_reader.set()
+        reader.join(15)
+        if sync_process is not None:
+            sync_process.join(15)
+        for process in (reader, sync_process):
+            if process is not None and process.is_alive():
+                process.terminate()
+                process.join()
+
+    assert reader.exitcode == 0
+    assert sync_process is not None and sync_process.exitcode == 0
+    assert reader_output.read_text(encoding="utf-8") == str(old_root)
+    sync_result = json.loads((tmp_path / "explicit-alias-sync-output.json").read_text())
+    assert "error" not in sync_result
+    assert active_pointer(data_dir)["snapshot"] == sync_result["snapshot"]
+    assert not old_root.exists()
+
+
+def test_explicit_custom_named_sandbox_still_loads_without_managed_cache(
+    tmp_path: Path,
+) -> None:
+    sandbox_path = tmp_path / "custom" / "snapshot"
+    sandbox_path.mkdir(parents=True)
+    database_dir = sandbox_path / "Library" / "Databases"
+    database_dir.mkdir(parents=True)
+    (sandbox_path / "Library" / "Attachments").mkdir()
+    with sqlite3.connect(database_dir / "projection.sqlite"):
+        pass
+    (sandbox_path / "goodnotes-snapshot.json").write_text(
+        json.dumps({"format_version": 1}), encoding="utf-8"
+    )
+
+    with cache_module.read_view(Settings(sandbox=sandbox_path)) as sandbox:
+        assert sandbox.root == sandbox_path
+        assert sandbox.root.name == "snapshot"
+
+
+def test_explicit_managed_sandbox_symlink_is_still_rejected(tmp_path: Path) -> None:
+    source = make_library(tmp_path / "source")
+    result = cache_module.refresh_cache(source, tmp_path / "cache")
+    sandbox_path = Path(str(result["snapshot"]))
+    alias = tmp_path / "snapshot-link"
+    alias.symlink_to(sandbox_path, target_is_directory=True)
+
+    with pytest.raises(GoodnotesError, match="snapshot root must not be a symlink"):
+        with cache_module.read_view(Settings(sandbox=alias)):
+            pass
 
 
 def test_expected_snapshot_mismatch_raises_stale_snapshot_error(tmp_path: Path) -> None:

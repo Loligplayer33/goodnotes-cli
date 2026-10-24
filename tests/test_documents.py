@@ -165,9 +165,98 @@ def test_export_orders_pages_and_uses_each_pages_attachment(tmp_path: Path) -> N
         assert exported.page_count == 2
         assert "first background" in exported[0].get_text()
         assert "second background" in exported[1].get_text()
+    assert result["pages"] == 2
+    assert result["selected_pages"] == [1, 2]
     assert result["includes_handwriting"] is False
     assert result["layer"] == "background"
     assert result["warnings"]
+
+
+def test_export_selects_reversed_noncontiguous_pages_from_mixed_attachments(
+    tmp_path: Path,
+) -> None:
+    sandbox = FakeSandbox(tmp_path / "sandbox")
+    sandbox.add_notebook("notebook-1", 5)
+    _make_pdf(sandbox.attachments_dir / "second-page.pdf", ["notebook page two"])
+    _make_pdf(sandbox.attachments_dir / "fifth-page.pdf", ["notebook page five"])
+    pages = [
+        _page(f"page-{number}", number, attachment)
+        for number, attachment in (
+            (1, None),
+            (2, "second-page.pdf"),
+            (3, None),
+            (4, None),
+            (5, "fifth-page.pdf"),
+        )
+    ]
+
+    result = export_pdf(
+        sandbox,
+        pages,
+        Path("selected.pdf"),
+        page_numbers=[5, 2],
+    )
+
+    with fitz.open(result["path"]) as exported:
+        assert exported.page_count == 2
+        assert "notebook page five" in exported[0].get_text()
+        assert "notebook page two" in exported[1].get_text()
+    assert result["pages"] == 2
+    assert result["selected_pages"] == [5, 2]
+
+
+def test_export_selection_has_no_twenty_page_cap(tmp_path: Path) -> None:
+    sandbox = FakeSandbox(tmp_path / "sandbox")
+    sandbox.add_notebook("notebook-1", 21)
+    _make_pdf(sandbox.attachments_dir / "background.pdf", ["shared background"])
+    pages = [_page(f"page-{number}", number, "background.pdf") for number in range(1, 22)]
+
+    result = export_pdf(
+        sandbox,
+        pages,
+        Path("over-twenty.pdf"),
+        page_numbers=list(range(1, 22)),
+    )
+
+    with fitz.open(result["path"]) as exported:
+        assert exported.page_count == 21
+    assert result["pages"] == 21
+    assert result["selected_pages"] == list(range(1, 22))
+
+
+@pytest.mark.parametrize(
+    ("page_numbers", "message"),
+    [
+        ([], "at least one notebook page"),
+        ([1, 1], "must not contain duplicates"),
+        ([True], "must be integers"),
+        ([1.5], "must be integers"),
+        (["1"], "must be integers"),
+        ([0], "must be positive"),
+        ([-1], "must be positive"),
+        ([3], "not present in the notebook"),
+    ],
+    ids=["empty", "duplicate", "bool", "float", "string", "zero", "negative", "unknown"],
+)
+def test_export_rejects_invalid_selection_without_creating_output(
+    tmp_path: Path,
+    page_numbers: list[Any],
+    message: str,
+) -> None:
+    sandbox = FakeSandbox(tmp_path / "sandbox")
+    sandbox.add_notebook("notebook-1", 2)
+    output = sandbox.outputs_dir / "invalid.pdf"
+
+    with pytest.raises(GoodnotesError, match=message):
+        export_pdf(
+            sandbox,
+            [_page("page-1", 1, None), _page("page-2", 2, None)],
+            output,
+            page_numbers=page_numbers,
+        )
+
+    assert not output.exists()
+    assert list(sandbox.outputs_dir.iterdir()) == []
 
 
 def test_export_deduplicates_repeated_image_streams_without_changing_pages(
@@ -240,6 +329,33 @@ def test_annotated_layer_never_falls_back_to_background(tmp_path: Path) -> None:
             layer="annotated",
         )
     assert not (sandbox.outputs_dir / "annotated.pdf").exists()
+
+
+def test_annotated_export_selects_current_page_numbers_in_requested_order(
+    tmp_path: Path,
+) -> None:
+    sandbox = FakeSandbox(tmp_path / "sandbox")
+    sandbox.add_notebook("notebook-1", 4)
+    source = tmp_path / "annotated.pdf"
+    _make_pdf(source, ["annotated one", "annotated two", "annotated three", "annotated four"])
+    register_annotated_pdf(sandbox, "notebook-1", source, expected_pages=4)
+    pages = [_page(f"page-{number}", number, None) for number in range(4, 0, -1)]
+
+    result = export_pdf(
+        sandbox,
+        pages,
+        Path("annotated-selected.pdf"),
+        layer="annotated",
+        page_numbers=[4, 2],
+    )
+
+    with fitz.open(result["path"]) as exported:
+        assert exported.page_count == 2
+        assert "annotated four" in exported[0].get_text()
+        assert "annotated two" in exported[1].get_text()
+    assert result["pages"] == 2
+    assert result["selected_pages"] == [4, 2]
+    assert result["annotation_status"] == "user-provided-unverified"
 
 
 def test_missing_background_attachment_does_not_create_blank_page(tmp_path: Path) -> None:

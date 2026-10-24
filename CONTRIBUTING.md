@@ -2,6 +2,8 @@
 
 Contributions should preserve the CLI's read-only access to Goodnotes source files. `sync` reads source files to create or refresh a local copy. Other commands read the validated copy; commands that create PDFs, images, bundles, snapshots, or annotated-PDF registrations write to new CLI-owned paths. Do not include real notebook names, IDs, library paths, email addresses, or extracted note text in code, tests, logs, issues, or documentation.
 
+Agents should follow [AGENTS.md](AGENTS.md) for project-specific safety and review instructions.
+
 ## Set up
 
 Install `uv`, then run these commands from the repository root. They create and use the project `.venv`:
@@ -23,6 +25,7 @@ Keep the implementation within its package boundary:
 | Area | Responsibility |
 | --- | --- |
 | `library` | Read SQLite rows and map folders, notebooks, pages, text, and search results. |
+| `text_index` | Query raw stored-text rows, verified PDF bindings, and index diagnostics using connections owned by `library`. |
 | `documents` | Resolve copied PDF pages, render pages, and export PDFs. |
 | `cache` and `safety` | Validate snapshots, cache transitions, locks, and safe paths. |
 | `snapshot` | Copy, verify, and mark a Library snapshot. |

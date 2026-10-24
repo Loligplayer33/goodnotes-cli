@@ -11,7 +11,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from functools import wraps
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, cast
 
 import typer
 from typer.core import TyperGroup
@@ -20,15 +20,18 @@ from . import __version__
 from .cache import read_view, refresh_cache
 from .config import Settings, default_data_dir, default_library
 from .documents import export_pdf, register_annotated_pdf, render_page
-from .errors import GoodnotesError
+from .errors import GoodnotesError, TextIndexUnavailableError
 from .library import Library
 from .output import (
+    Projection,
     bound_page_text,
     emit,
     emit_error,
+    output_contract,
     select_pages,
     serializable,
     snippet_hits,
+    validate_projection,
     window,
 )
 from .snapshot import create_snapshot
@@ -38,6 +41,12 @@ ItemSelector = Annotated[
 ]
 FolderOption = Annotated[
     str, typer.Option(help="Folder UUID, path, or unique exact name; / is the root.")
+]
+SearchFolderOption = Annotated[
+    str | None, typer.Option(help="Folder selector; defaults to /. Use with --notebook omitted.")
+]
+SearchNotebookOption = Annotated[
+    str | None, typer.Option(help="Exact notebook UUID, path, or unique name; excludes --folder.")
 ]
 
 
@@ -67,8 +76,23 @@ app = typer.Typer(
 
 def command(*args: Any, **kwargs: Any) -> Any:
     def decorate(function: Any) -> Any:
+        command_name = (
+            args[0]
+            if args and isinstance(args[0], str)
+            else kwargs.get("name") or function.__name__.replace("_", "-")
+        )
+
         @wraps(function)
         def checked(*fargs: Any, **fkwargs: Any) -> Any:
+            ctx = cast(typer.Context | None, fkwargs.get("ctx") or (fargs[0] if fargs else None))
+            if ctx is not None and hasattr(ctx, "params") and isinstance(ctx.obj, Settings):
+                cfg = settings(ctx)
+                projection = Projection(
+                    command_name,
+                    frozenset(name for name, value in ctx.params.items() if value is True),
+                )
+                cfg.projection = projection
+                validate_projection(cfg.fields, projection)
             try:
                 return function(*fargs, **fkwargs)
             except (OSError, sqlite3.Error, ValueError) as exc:
@@ -97,7 +121,10 @@ def configure(
     text: Annotated[bool, typer.Option("--text", help="Indent JSON for inspection.")] = False,
     json_output: Annotated[bool, typer.Option("--json", help="Compact JSON, the default.")] = False,
     fields: Annotated[
-        str | None, typer.Option(help="Comma-separated row fields or top-level response keys.")
+        str | None,
+        typer.Option(
+            help="Comma-separated row fields or response keys; see schema COMMAND output."
+        ),
     ] = None,
     expect_snapshot: Annotated[
         str | None, typer.Option(help="Reject a changed pagination generation.")
@@ -221,17 +248,29 @@ def pages(
     notebook: ItemSelector,
     limit: Annotated[int, typer.Option(min=1, max=1000)] = 100,
     offset: Annotated[int, typer.Option(min=0)] = 0,
+    with_recognition: Annotated[
+        bool,
+        typer.Option(help="Include stored handwriting recognition availability and index state."),
+    ] = False,
 ) -> None:
     """List pages in current notebook order, numbered from 1.
 
-    Returns pages and next_offset. Continue with --offset and use global
-    --expect-snapshot to keep results on the same generation.
+    Returns pages and next_offset. --with-recognition adds metadata without reading
+    candidate text. annotation_count counts projected note items, not ink or recognition.
+    Continue with --offset and pin --expect-snapshot for a consistent generation.
 
     Example: goodnotes pages "Course Notes" --limit 20
     """
     with repository(ctx) as lib:
         result = window(lib.pages(notebook), limit, offset)
         result["pages"] = result.pop("items")
+        if with_recognition:
+            recognition = lib.recognition_status(notebook)
+            result["pages"] = [
+                {**serializable(page), "recognition": serializable(recognition[page.id])}
+                for page in result["pages"]
+            ]
+        result["annotation_count_source"] = "projection.notes_items"
         emit(result, settings(ctx))
 
 
@@ -272,28 +311,54 @@ def read_text(
 def search(
     ctx: typer.Context,
     query: Annotated[str, typer.Argument(help="Literal, case-insensitive text to find.")],
-    folder: FolderOption = "/",
+    folder: SearchFolderOption = None,
+    notebook: SearchNotebookOption = None,
     source: Annotated[str, typer.Option(help="all, pdf, handwriting, or textbox.")] = "all",
     limit: Annotated[int, typer.Option(min=1, max=100)] = 20,
     offset: Annotated[int, typer.Option(min=0)] = 0,
 ) -> None:
     """Search stored text for a literal, case-insensitive phrase.
 
-    --source accepts all, pdf, handwriting, or textbox. Returns hits, next_offset,
-    coverage, and warnings. No hits do not prove absence; scan-pdfs searches PDF
-    backgrounds separately. Snippets are capped at 320 characters.
+    Choose --notebook for one notebook or --folder for a subtree. coverage_detail
+    reports scoped source availability, not proof that every page was indexed.
+    No hits do not prove absence; scan-pdfs searches PDF backgrounds separately.
+    Snippets are capped at 320 characters.
 
     Example: goodnotes search "regression" --folder "Course" --limit 10
     """
+    selected_folder = _search_folder(folder, notebook)
     with repository(ctx) as lib:
-        hits = lib.search(query, folder=folder, source=source, limit=offset + limit + 1)
+        try:
+            hits = lib.search(
+                query,
+                folder=selected_folder,
+                notebook=notebook,
+                source=source,
+                limit=offset + limit + 1,
+            )
+        except TextIndexUnavailableError as exc:
+            coverage = lib.search_coverage(folder=selected_folder, notebook=notebook, source=source)
+            warnings = coverage.pop("warnings", [])
+            emit_error(
+                "operation_failed",
+                str(exc),
+                details={
+                    "coverage": "stored-index",
+                    "coverage_detail": coverage,
+                    "warnings": warnings,
+                },
+            )
+            raise SystemExit(1) from None
         selected = snippet_hits(hits[offset : offset + limit], query)
+        coverage = lib.search_coverage(folder=selected_folder, notebook=notebook, source=source)
+        warnings = coverage.pop("warnings")
         emit(
             {
                 "hits": selected,
                 "next_offset": offset + limit if len(hits) > offset + limit else None,
                 "coverage": "stored-index",
-                "warnings": lib.text_warnings(),
+                "coverage_detail": coverage,
+                "warnings": warnings,
             },
             settings(ctx),
         )
@@ -303,24 +368,38 @@ def search(
 def scan_pdfs(
     ctx: typer.Context,
     query: Annotated[str, typer.Argument(help="Literal, case-insensitive PDF text to find.")],
-    folder: FolderOption = "/",
+    folder: SearchFolderOption = None,
+    notebook: SearchNotebookOption = None,
     limit: Annotated[int, typer.Option(min=1, max=100)] = 20,
     page_limit: Annotated[int, typer.Option(min=1, max=250)] = 200,
     page_offset: Annotated[int, typer.Option(min=0)] = 0,
 ) -> None:
     """Search PDF background text when the stored index misses it.
 
-    Scans a bounded number of pages. Continue using next_page_offset as --page-offset.
-    Check warnings for incomplete coverage. Does not search handwriting or attached PDFs.
+    Choose --notebook or --folder. Continue next_page_offset with --page-offset,
+    the same scope, query, and snapshot. coverage_complete requires a complete
+    scan from offset 0 without extraction gaps. Does not search handwriting or attached PDFs.
 
     Example: goodnotes scan-pdfs "regression" --folder "Course" --page-limit 50
     """
+    selected_folder = _search_folder(folder, notebook)
     with repository(ctx) as lib:
         result = lib.scan_pdfs(
-            query, folder=folder, limit=limit, page_limit=page_limit, page_offset=page_offset
+            query,
+            folder=selected_folder,
+            notebook=notebook,
+            limit=limit,
+            page_limit=page_limit,
+            page_offset=page_offset,
         )
         result["hits"] = snippet_hits(result["hits"], query)
         emit(result, settings(ctx))
+
+
+def _search_folder(folder: str | None, notebook: str | None) -> str:
+    if folder is not None and notebook is not None:
+        raise GoodnotesError("Use --folder or --notebook, not both.")
+    return folder if folder is not None else "/"
 
 
 @command("export")
@@ -329,8 +408,12 @@ def export_notebook(
     notebook: ItemSelector,
     output: Annotated[Path, typer.Option(help="New PDF file to write.")],
     layer: Annotated[str, typer.Option(help="background or annotated.")] = "background",
+    pages: Annotated[
+        str | None,
+        typer.Option(help="Selected pages in listed order, e.g. 1-3,7. Defaults to all."),
+    ] = None,
 ) -> None:
-    """Export all notebook pages in their current order to a new PDF.
+    """Export all pages, or selected pages in listed order, to a new PDF.
 
     The default background layer omits native ink. The annotated layer requires
     attach-pdf and uses an unverified user export. Existing outputs are never replaced.
@@ -339,8 +422,14 @@ def export_notebook(
     """
 
     with repository(ctx) as lib:
+        all_pages = lib.pages(notebook)
+        selected = (
+            select_pages(pages, len(all_pages), maximum=len(all_pages))
+            if pages is not None
+            else None
+        )
         emit(
-            export_pdf(lib.sandbox, lib.pages(notebook), output, layer=layer),
+            export_pdf(lib.sandbox, all_pages, output, layer=layer, page_numbers=selected),
             settings(ctx),
         )
 
@@ -418,12 +507,14 @@ def bundle(
     cfg = settings(ctx)
     with repository(ctx) as lib:
         sandbox = lib.sandbox
+        all_pages = lib.pages(notebook)
+        selected = select_pages(pages, len(all_pages), maximum=10)
         destination = sandbox.ensure_output(output)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        temporary = Path(tempfile.mkdtemp(prefix=".goodnotes-bundle-", dir=destination.parent))
+        parent_existed = destination.parent.exists()
+        temporary: Path | None = None
         try:
-            all_pages = lib.pages(notebook)
-            selected = select_pages(pages, len(all_pages), maximum=10)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            temporary = Path(tempfile.mkdtemp(prefix=".goodnotes-bundle-", dir=destination.parent))
             manifest = []
             remaining = max_chars
             for number in selected:
@@ -447,7 +538,13 @@ def bundle(
             )
             publish_bundle(temporary, destination)
         except BaseException:
-            shutil.rmtree(temporary, ignore_errors=True)
+            if temporary is not None:
+                shutil.rmtree(temporary, ignore_errors=True)
+            if not parent_existed:
+                try:
+                    destination.parent.rmdir()
+                except OSError:
+                    pass
             raise
         emit(
             {
@@ -519,20 +616,24 @@ def schema(
             raise typer.BadParameter(f"Unknown command: {command_name}", param_hint="COMMAND")
         with typer.Context(target, parent=root, info_name=command_name) as target_ctx:
             parameters = target.get_params(target_ctx)
+            result: dict[str, Any] = {
+                "version": __version__,
+                "command": command_name,
+                "usage": target.get_usage(target_ctx).removeprefix("Usage: "),
+                "help": target.help,
+                "arguments": [
+                    parameter_contract(p) for p in parameters if p.param_type_name == "argument"
+                ],
+                "options": [
+                    parameter_contract(p) for p in parameters if p.param_type_name == "option"
+                ],
+                "global_options": [parameter_contract(p) for p in group.get_params(root)],
+            }
+            contract = output_contract(command_name)
+            if contract is not None:
+                result["output"] = contract
             emit(
-                {
-                    "version": __version__,
-                    "command": command_name,
-                    "usage": target.get_usage(target_ctx).removeprefix("Usage: "),
-                    "help": target.help,
-                    "arguments": [
-                        parameter_contract(p) for p in parameters if p.param_type_name == "argument"
-                    ],
-                    "options": [
-                        parameter_contract(p) for p in parameters if p.param_type_name == "option"
-                    ],
-                    "global_options": [parameter_contract(p) for p in group.get_params(root)],
-                },
+                result,
                 settings(ctx),
             )
         return
@@ -547,14 +648,20 @@ def schema(
                 "ls": "[--folder FOLDER --limit N --offset N]",
                 "tree": "[--folder FOLDER --depth N --limit N --offset N]",
                 "info": "NOTEBOOK",
-                "pages": "NOTEBOOK [--limit N --offset N]",
+                "pages": "NOTEBOOK [--with-recognition --limit N --offset N]",
                 "read": (
                     "NOTEBOOK [--page N | --pages 1-3,7] "
                     "[--source all|pdf|handwriting|textbox] [--max-chars N]"
                 ),
-                "search": "QUERY [--folder FOLDER --source SOURCE --limit N --offset N]",
-                "scan-pdfs": "QUERY [--folder FOLDER --page-limit N --page-offset N --limit N]",
-                "export": "NOTEBOOK --output FILE [--layer background|annotated]",
+                "search": (
+                    "QUERY [--folder FOLDER | --notebook NOTEBOOK] "
+                    "[--source SOURCE --limit N --offset N]"
+                ),
+                "scan-pdfs": (
+                    "QUERY [--folder FOLDER | --notebook NOTEBOOK] "
+                    "[--page-limit N --page-offset N --limit N]"
+                ),
+                "export": "NOTEBOOK --output FILE [--pages 1-3,7 --layer background|annotated]",
                 "render": "NOTEBOOK --output PNG [--page N --layer LAYER --dpi N]",
                 "bundle": "NOTEBOOK --output DIR [--pages 1-3 --layer LAYER --dpi N --max-chars N]",
                 "attach-pdf": "NOTEBOOK PDF",
@@ -585,6 +692,7 @@ def schema(
             ],
             "usage_notes": [
                 "Global options go before the command. schema COMMAND gives targeted details.",
+                "schema COMMAND includes output field hints for row-based responses.",
                 "Notebook selectors accept an exact UUID, full path, or unique exact name.",
                 "Follow next_offset or next_page_offset; pin snapshot with --expect-snapshot.",
                 "Check source labels, coverage, warnings, and truncated when interpreting results.",
