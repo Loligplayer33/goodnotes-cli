@@ -35,7 +35,7 @@ The initial private copy includes Databases and Attachments. The projection data
 
 The first integrated test pass completed with 73 tests. Later independent reviews added cache lifecycle, resource limits, and concurrency regressions. Tests include WAL-only commits, writes during capture, active-pointer failure, output conflicts, bounded text, PDF signatures, and isolated command subprocesses. The final cache review passed its targeted regressions. Freshness metadata documents only what the inventory checks observed; it does not promise latest-at-return state.
 
-Final local validation: 102 tests passed. Ruff formatting and lint checks passed. Mypy passed. The source distribution and wheel contain only code, synthetic tests, and documentation.
+Final local validation: 102 tests passed. Ruff formatting and lint checks passed. Mypy passed. The source distribution contains source code, synthetic tests, and documentation. The wheel contains the CLI package and standard package metadata. Both archives were checked for private data.
 
 GitHub CI passed on Linux with Python 3.11, 3.12, and 3.13, and on macOS with Python 3.12. Linux passed 101 tests and skipped the APFS-specific test; macOS passed all 102 tests. Both distributions were installed in separate temporary environments and ran outside the checkout. The [v0.1.0 release run](https://github.com/Loligplayer33/goodnotes-cli/actions/runs/40082820695) passed the version, changelog, test, and packaging gates and published the [release files](https://github.com/Loligplayer33/goodnotes-cli/releases/tag/v0.1.0).
 
