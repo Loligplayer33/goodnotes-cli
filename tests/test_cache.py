@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import fcntl
 import hashlib
 import json
@@ -100,6 +101,89 @@ def test_refresh_skips_capture_when_source_inventory_is_unchanged(
     assert second["snapshot"] == first["snapshot"]
     assert second["snapshot_id"] == first["snapshot_id"]
     assert second["captured_at"] == first["captured_at"]
+    stats = second["capture_stats"]
+    assert isinstance(stats, dict)
+    assert stats["source_captured_files"] == stats["source_captured_bytes"] == 0
+    assert stats["cache_reused_files"] == stats["cache_reused_bytes"] == 0
+    assert stats["source_bytes_hashed"] == stats["byte_copied_bytes"] == 0
+
+
+def test_native_change_refreshes_only_changed_files_and_prunes_previous_generation(
+    tmp_path: Path,
+) -> None:
+    source = make_library(tmp_path / "source")
+    native = source / "Databases" / "notes_main.db"
+    native.mkdir()
+    (native / "CURRENT").write_bytes(b"MANIFEST-000001\n")
+    (native / "MANIFEST-000001").write_bytes(b"generated manifest")
+    wal = native / "000002.log"
+    wal.write_bytes(b"initial generated wal")
+    (native / "000003.sst").write_bytes(b"generated large table" * 100_000)
+    cache = tmp_path / "cache"
+    first = cache_module.refresh_cache(source, cache)
+    old = Path(str(first["snapshot"]))
+    wal.write_bytes(b"new generated wal")
+    result = cache_module.refresh_cache(source, cache)
+    stats = result["capture_stats"]
+    assert result["status"] == "ready"
+    assert isinstance(stats, dict)
+    assert stats["source_captured_files"] == 1
+    assert stats["source_captured_bytes"] == wal.stat().st_size
+    assert stats["cache_reused_files"] == 6
+    assert stats["cache_reused_bytes"] > 2_000_000
+    assert stats["native_store_present"] is True
+    assert len(generated_snapshots(cache)) == 1
+    assert not old.exists()
+    copied = Path(str(result["snapshot"])) / "Library" / "Databases" / "notes_main.db"
+    assert (copied / wal.name).read_bytes() == wal.read_bytes()
+    unchanged = cache_module.refresh_cache(source, cache)
+    assert unchanged["status"] == "unchanged"
+    assert unchanged["capture_stats"]["source_bytes_hashed"] == 0  # type: ignore[index]
+
+
+def test_force_rehashes_native_store_and_does_not_reuse_cached_files(tmp_path: Path) -> None:
+    source = make_library(tmp_path / "source")
+    native = source / "Databases" / "notes_main.db"
+    native.mkdir()
+    (native / "CURRENT").write_bytes(b"MANIFEST-000001\n")
+    (native / "MANIFEST-000001").write_bytes(b"generated manifest")
+    (native / "000002.log").write_bytes(b"generated wal")
+    data_dir = tmp_path / "cache"
+    cache_module.refresh_cache(source, data_dir)
+    forced = cache_module.refresh_cache(source, data_dir, force=True)
+    stats = forced["capture_stats"]
+    assert isinstance(stats, dict)
+    assert stats["cache_reused_files"] == stats["cache_reused_bytes"] == 0
+    assert stats["source_captured_files"] == stats["total_files"] == 6
+    assert stats["source_bytes_hashed"] >= stats["source_captured_bytes"]
+    assert len(generated_snapshots(data_dir)) == 1
+
+
+def test_native_inventory_permission_denial_is_actionable_and_keeps_active_pointer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = make_library(tmp_path / "source")
+    native = source / "Databases" / "notes_main.db"
+    native.mkdir()
+    (native / "000001.log").write_bytes(b"generated wal")
+    data_dir = tmp_path / "cache"
+    cache_module.refresh_cache(source, data_dir)
+    pointer_before = (data_dir / "active.json").read_bytes()
+    original_scandir = cache_module.os.scandir
+
+    def deny_native(path: Any) -> Any:
+        if Path(path) == native:
+            raise PermissionError(errno.EACCES, "generated denial", str(native))
+        return original_scandir(path)
+
+    monkeypatch.setattr(cache_module.os, "scandir", deny_native)
+    with pytest.raises(GoodnotesError) as error:
+        cache_module.refresh_cache(source, data_dir)
+    assert getattr(error.value, "code", None) == "source_permission_denied"
+    details = getattr(error.value, "details", {})
+    assert details["path"] == str(native)
+    assert "remedy" in details
+    assert (data_dir / "active.json").read_bytes() == pointer_before
 
 
 @pytest.mark.parametrize(
@@ -238,8 +322,14 @@ def test_source_change_during_refresh_is_reported_with_snapshot_time(
         destination: str | Path,
         *,
         max_attempts: int = 3,
+        previous_snapshot: Path | None = None,
     ) -> Path:
-        snapshot = original_create(source_library, destination, max_attempts=max_attempts)
+        snapshot = original_create(
+            source_library,
+            destination,
+            max_attempts=max_attempts,
+            previous_snapshot=previous_snapshot,
+        )
         attachment.write_bytes(b"source advanced after capture")
         return snapshot
 
@@ -406,8 +496,14 @@ def _refresh_waiting_to_publish(
         destination: str | Path,
         *,
         max_attempts: int = 3,
+        previous_snapshot: Path | None = None,
     ) -> Path:
-        result = original_create(source_library, destination, max_attempts=max_attempts)
+        result = original_create(
+            source_library,
+            destination,
+            max_attempts=max_attempts,
+            previous_snapshot=previous_snapshot,
+        )
         captured.set()
         return result
 

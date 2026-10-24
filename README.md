@@ -8,10 +8,11 @@ Live library discovery is for macOS. On Linux, point `sync --library` at an avai
 
 | Task | Support | Limit |
 | --- | --- | --- |
-| Browse notebooks and pages | Yes | Reads the last synced copy. Run `sync` again after Goodnotes changes the library. |
-| Search and read text | Yes | `search` checks the stored text index. `read` returns PDF text, stored handwriting recognition candidates, and typed text. Use `scan-pdfs` explicitly for copied PDF backgrounds. The CLI does not OCR images or reconstruct ink. |
+| Browse notebooks and pages | Yes | Reads the last synced copy. Run `watch` to refresh it automatically as files change on the Mac. |
+| Search and read text | Yes | `search` checks the stored text index. `read` returns PDF text, stored handwriting recognition candidates, and typed text. Use `scan-pdfs` explicitly for copied PDF backgrounds. The CLI does not OCR images. |
 | View and export page backgrounds | Yes | Uses each page's PDF or image background. Native Goodnotes ink is not included. |
-| View and export annotations | With a supplied PDF | You must export and register a PDF from Goodnotes. The CLI cannot verify that it includes annotations or that its page order matches. |
+| View and export native ink | Experimental | `--layer native` reconstructs supported pen and highlight objects from the copied native store. Check its coverage and warnings; complete Goodnotes rendering is not established. Requires a compatible RocksDB runtime. |
+| Use a Goodnotes-exported PDF | Yes | Register it with `attach-pdf` for `--layer annotated`. The CLI cannot verify annotation inclusion or page order. |
 | Edit Goodnotes notebooks | No | The CLI does not write to the Goodnotes library. |
 
 ## Commands
@@ -21,6 +22,7 @@ The complete option reference is in [Command reference](docs/commands.md). Each 
 | Group | Command | Purpose |
 | --- | --- | --- |
 | Setup | [`sync`](docs/commands.md#sync) | Create or refresh the managed copy. |
+| Setup | [`watch`](docs/commands.md#watch) | Keep the managed copy refreshed while the process runs. |
 | Setup | [`snapshot`](docs/commands.md#snapshot) | Save a separate copy of a Library folder. |
 | Setup | [`doctor`](docs/commands.md#doctor) | Check the current copy and available text sources. |
 | Setup | [`schema`](docs/commands.md#schema) | Print the machine-readable command contract without loading notes. |
@@ -73,6 +75,14 @@ You need macOS or Linux, Python 3.11 or newer, and [`uv`](https://docs.astral.sh
    ```
 
 After sync, browse and read commands need only read access to the cache. An agent can use that copy without access to the live Goodnotes library. `doctor` reports its location and capture time. See [restricted agent setup](docs/usage.md#read-access-for-an-agent) for permissions and custom cache locations.
+
+For recent notes, have the agent sync once at the start of each request, then pin the returned `snapshot_id` across its reads. Once [native rendering is set up](docs/pdf-and-handwriting.md#native-ink-without-manual-pdf-exports), it can inspect the actual pen annotations with:
+
+```sh
+uv run goodnotes --expect-snapshot SNAPSHOT_ID bundle "Notebook name" --pages 3 --layer native --output /tmp/study-page-3
+```
+
+`uv run goodnotes watch` is optional for continuous refresh or for an agent with cache-only access. Both routes observe files already present on this Mac and cannot tell whether an iPad edit has arrived. Refreshes reuse verified unchanged files, and the managed cache retains one published generation after readers finish. Native rendering also needs writable temporary scratch and an output destination.
 
 ## Working with results
 

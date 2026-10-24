@@ -1,6 +1,39 @@
 # PDFs and handwriting
 
-The CLI can export the page backgrounds stored in the Goodnotes library. It cannot rebuild native Goodnotes ink or run OCR on images. To see annotations, provide a PDF exported from Goodnotes and register it for the current local copy.
+The CLI offers three image layers. `background` uses the page's stored PDF or image. Experimental `native` reconstructs supported pen and highlight records from the copied Goodnotes store. `annotated` uses a PDF that you exported from Goodnotes and registered with the CLI. None of these layers runs OCR on images.
+
+## Native ink without manual PDF exports
+
+Install a compatible RocksDB shared library once. On macOS with Homebrew:
+
+```sh
+brew install rocksdb
+uv run goodnotes doctor --access-only
+```
+
+The CLI discovers the standard Apple Silicon and Intel Homebrew locations, then the system library search path. For a custom installation, set `GOODNOTES_ROCKSDB_LIBRARY` to its absolute shared-library path. The runtime must support the format of the copied store; an incompatible or missing library produces `native_runtime_unavailable` rather than a background-only image. The CLI does not install system libraries automatically.
+
+Create a new copy with `sync`, or start `watch` and keep it running while you study:
+
+```sh
+uv run goodnotes watch
+```
+
+In another terminal, render or bundle the page you want an agent to inspect:
+
+```sh
+uv run goodnotes render "Notebook name" --page 3 --layer native --output /tmp/page-3-native.png
+uv run goodnotes bundle "Notebook name" --pages 3 --layer native --output /tmp/page-3-study
+uv run goodnotes export "Notebook name" --pages 3 --layer native --output /tmp/page-3-native.pdf
+```
+
+These commands do not require a manually exported PDF. Sync includes the native `notes_main.db` store when available. A copy made before native capture was added needs a new sync. Watch sees edits after Goodnotes has written them on this Mac; it cannot establish whether the latest iPad edit has arrived. Check the returned `snapshot`, `captured_at`, and warnings before judging a new note.
+
+Native results report `annotation_status: "native-reconstructed-approximate"` and a `native_annotations` object. Its `coverage` is `supported-pen-records` or `partial`, with rendered, erased, deleted, and unsupported object counts and reasons. `includes_handwriting: true` means supported strokes were rendered. It does not establish complete page reconstruction. `full_fidelity_verified` remains `false`.
+
+Supported reconstruction covers the observed legacy TPL pen and highlighter format, RGBA colours, and supported lasso translations. Shapes, images, text boxes, pencil behaviour, complex erasure, ambiguous object versions, and drawing order across multiple actors are not fully supported. Unknown active objects produce partial-coverage warnings. No supported objects, missing native records, and unsupported page geometry fail explicitly; an absent native root is unknown annotation availability, not evidence of a blank page. The projection-to-native page mapping is experimental. Rotations, nonmatching coordinate scales, and unsupported PDF crop geometry are rejected.
+
+The native engine opens only a disposable private scratch copy of the validated snapshot. It never opens the source store or the completed snapshot store. Scratch defaults to the operating system temporary directory; set `GOODNOTES_SCRATCH_DIR` to an existing private writable directory outside the snapshot when necessary. APFS clones avoid another full byte copy. Without clone support, the reader allows independent copying only for stores up to 64 MiB and rejects larger stores. Native rendering therefore needs cache read access, scratch write access, and output write access. Use `doctor --access-only --scratch-dir PATH --output-dir PATH` to inspect those access boundaries without changing them.
 
 ## Export page backgrounds
 
@@ -28,9 +61,9 @@ The metadata reports counts for stored handwriting text and whether indexing is 
 
 `read --source handwriting` returns stored recognition candidates and preserves their raw delimiters and alternatives. Label any cleaned reconstruction as an interpretation rather than an exact quote or visual transcription. `not-pending` does not verify freshness or accuracy. The CLI does not perform handwriting recognition or reconstruct ink from these candidates.
 
-## Export with annotations
+## Use a PDF exported by Goodnotes
 
-Use a Goodnotes PDF export when you need to see the notebook's ink:
+Use a Goodnotes PDF export when you need the app's own rendering, including elements unsupported by native reconstruction:
 
 1. In Goodnotes, export the notebook as a PDF with both **Include Annotation** and **Include Page Background** enabled. See [Goodnotes' PDF export instructions](https://support.goodnotes.com/hc/en-us/articles/360000629576-Include-Annotations-and-Page-Backgrounds-in-PDF-Exports).
 2. Check that the exported PDF pages match the notebook's current page order. The CLI cannot make this check for you.

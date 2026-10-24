@@ -12,15 +12,18 @@ import sqlite3
 import stat
 import sys
 import tempfile
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
-from .errors import GoodnotesError
+from .errors import FilesystemAccessError, GoodnotesError, _permission_denied
 from .safety import SNAPSHOT_MARKER, _is_production_goodnotes_path, open_database
 
 _DATABASE_NAMES = ("projection.sqlite", "fts.sqlite")
+_NATIVE_STORE_NAMES = ("notes_main.db",)
 _DATABASE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
 _PROJECTION_COLUMNS = {
     "folders": {"id", "name", "updated_at", "deleted", "position"},
@@ -70,6 +73,8 @@ class _Entry:
     stat_key: tuple[int, int, int, int, int, int]
     size: int = 0
     sha256: str | None = None
+    copy_from: Path | None = None
+    reused: bool = False
 
 
 def _stat_key(info: os.stat_result) -> tuple[int, int, int, int, int, int]:
@@ -88,18 +93,28 @@ def _lstat(path: Path) -> os.stat_result:
         info = path.lstat()
     except FileNotFoundError as exc:
         raise _SourceChanged(f"Source path disappeared during snapshot: {path}") from exc
+    except OSError as exc:
+        if _permission_denied(exc):
+            raise FilesystemAccessError.from_exception(
+                exc, operation="inspect_snapshot_input", path=path, kind="source"
+            ) from exc
+        raise
     if stat.S_ISLNK(info.st_mode):
         raise GoodnotesError(f"Symlinks are not allowed in snapshot inputs: {path}")
     return info
 
 
 def _hash_file(path: Path) -> tuple[tuple[int, int, int, int, int, int], int, str]:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
     except OSError as exc:
         if exc.errno in {errno.ELOOP, errno.ENOENT}:
             raise _SourceChanged(f"Source file changed while opening: {path}") from exc
+        if _permission_denied(exc):
+            raise FilesystemAccessError.from_exception(
+                exc, operation="read_snapshot_input", path=path, kind="source"
+            ) from exc
         raise GoodnotesError(f"Could not read snapshot input: {path}") from exc
 
     digest = hashlib.sha256()
@@ -127,10 +142,12 @@ def _directory_entry(path: Path, relative: Path) -> _Entry:
     return _Entry(relative=relative, is_directory=True, stat_key=_stat_key(info))
 
 
-def _file_entry(path: Path, relative: Path) -> _Entry:
+def _file_entry(path: Path, relative: Path, *, hash_contents: bool = True) -> _Entry:
     info = _lstat(path)
     if not stat.S_ISREG(info.st_mode):
         raise GoodnotesError(f"Snapshot input is not a regular file: {path}")
+    if not hash_contents:
+        return _Entry(relative, False, _stat_key(info), info.st_size)
     stat_key, size, digest = _hash_file(path)
     if stat_key != _stat_key(info):
         raise _SourceChanged(f"Source file changed while hashing: {path}")
@@ -169,7 +186,7 @@ def _clone_file_from_fd(source_fd: int, destination: Path) -> bool:
         os.close(destination_dir_fd)
 
 
-def _collect_manifest(source_library: Path) -> list[_Entry]:
+def _collect_manifest(source_library: Path, *, hash_contents: bool = True) -> list[_Entry]:
     database_dir = source_library / "Databases"
     attachments_dir = source_library / "Attachments"
     entries: list[_Entry] = [
@@ -192,7 +209,11 @@ def _collect_manifest(source_library: Path) -> list[_Entry]:
                 )
             if not stat.S_ISREG(database_info.st_mode):
                 raise GoodnotesError(f"Snapshot input is not a regular file: {database_path}")
-            entries.append(_file_entry(database_path, Path("Databases") / database_name))
+            entries.append(
+                _file_entry(
+                    database_path, Path("Databases") / database_name, hash_contents=hash_contents
+                )
+            )
 
         sidecars = sorted(database_dir.glob(database_name + "-*"))
         if sidecars and database_info is None:
@@ -202,7 +223,9 @@ def _collect_manifest(source_library: Path) -> list[_Entry]:
                 sidecar.name == database_name + suffix for suffix in _DATABASE_SIDECAR_SUFFIXES
             ):
                 raise GoodnotesError(f"Unsupported SQLite sidecar: {sidecar}")
-            entries.append(_file_entry(sidecar, Path("Databases") / sidecar.name))
+            entries.append(
+                _file_entry(sidecar, Path("Databases") / sidecar.name, hash_contents=hash_contents)
+            )
 
     if not any(
         entry.relative == Path("Databases/projection.sqlite") and not entry.is_directory
@@ -217,6 +240,10 @@ def _collect_manifest(source_library: Path) -> list[_Entry]:
         try:
             children = sorted(os.scandir(directory), key=lambda child: child.name)
         except OSError as exc:
+            if _permission_denied(exc):
+                raise FilesystemAccessError.from_exception(
+                    exc, operation="inventory_snapshot_input", path=directory, kind="source"
+                ) from exc
             raise GoodnotesError(
                 f"Could not inspect snapshot input directory: {directory}"
             ) from exc
@@ -229,7 +256,7 @@ def _collect_manifest(source_library: Path) -> list[_Entry]:
                 entries.append(entry)
                 scan_directory(child_path, child_relative)
             elif stat.S_ISREG(child_info.st_mode):
-                entries.append(_file_entry(child_path, child_relative))
+                entries.append(_file_entry(child_path, child_relative, hash_contents=hash_contents))
             else:
                 raise GoodnotesError(f"Unsupported snapshot input type: {child_path}")
         after = _directory_entry(directory, relative)
@@ -237,17 +264,29 @@ def _collect_manifest(source_library: Path) -> list[_Entry]:
             raise _SourceChanged(f"Source directory changed while scanning: {directory}")
 
     scan_directory(attachments_dir, Path("Attachments"))
+    for name in _NATIVE_STORE_NAMES:
+        native_path = database_dir / name
+        try:
+            native_path.lstat()
+        except FileNotFoundError:
+            continue
+        entries.append(_directory_entry(native_path, Path("Databases") / name))
+        scan_directory(native_path, Path("Databases") / name)
     entries.sort(key=lambda entry: (entry.relative.as_posix(), not entry.is_directory))
     return entries
 
 
-def _copy_regular_file(source: Path, destination: Path, expected: _Entry) -> None:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+def _copy_regular_file(source: Path, destination: Path, expected: _Entry) -> bool:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
         source_fd = os.open(source, flags)
     except OSError as exc:
         if exc.errno in {errno.ELOOP, errno.ENOENT}:
             raise _SourceChanged(f"Source file changed while copying: {source}") from exc
+        if _permission_denied(exc):
+            raise FilesystemAccessError.from_exception(
+                exc, operation="copy_snapshot_input", path=source, kind="source"
+            ) from exc
         raise GoodnotesError(f"Could not copy snapshot input: {source}") from exc
 
     try:
@@ -292,6 +331,15 @@ def _copy_regular_file(source: Path, destination: Path, expected: _Entry) -> Non
         after_path = _stat_key(_lstat(source))
         if after_fd != expected.stat_key or after_path != expected.stat_key:
             raise _SourceChanged(f"Source file changed while copying: {source}")
+        copied = _lstat(destination)
+        if not stat.S_ISREG(copied.st_mode) or (copied.st_dev, copied.st_ino) == (
+            source_info.st_dev,
+            source_info.st_ino,
+        ):
+            raise GoodnotesError(
+                f"Snapshot copy must have an independent regular inode: {destination}"
+            )
+        return cloned
     finally:
         if source_fd >= 0:
             os.close(source_fd)
@@ -299,7 +347,7 @@ def _copy_regular_file(source: Path, destination: Path, expected: _Entry) -> Non
 
 def _copy_snapshot_tree(
     source_library: Path, destination_library: Path, entries: Iterable[_Entry]
-) -> None:
+) -> dict[str, int]:
     destination_library.mkdir(mode=0o700)
     all_entries = list(entries)
     directories = sorted(
@@ -312,10 +360,28 @@ def _copy_snapshot_tree(
         target = destination_library / entry.relative
         if target != destination_library:
             target.mkdir(mode=0o700)
+    metrics = {
+        "cloned_files": 0,
+        "cloned_logical_bytes": 0,
+        "byte_copied_files": 0,
+        "byte_copied_bytes": 0,
+        "source_copy_bytes_hashed": 0,
+    }
     for entry in files:
         target = destination_library / entry.relative
         target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        _copy_regular_file(source_library / entry.relative, target, entry)
+        cloned = _copy_regular_file(
+            entry.copy_from or source_library / entry.relative, target, entry
+        )
+        if cloned:
+            metrics["cloned_files"] += 1
+            metrics["cloned_logical_bytes"] += entry.size
+        else:
+            metrics["byte_copied_files"] += 1
+            metrics["byte_copied_bytes"] += entry.size
+            if not entry.reused:
+                metrics["source_copy_bytes_hashed"] += entry.size
+    return metrics
 
 
 def _verify_copy(destination_library: Path, entries: Iterable[_Entry]) -> None:
@@ -325,6 +391,15 @@ def _verify_copy(destination_library: Path, entries: Iterable[_Entry]) -> None:
             info = _lstat(target)
             if not stat.S_ISDIR(info.st_mode):
                 raise GoodnotesError(f"Snapshot directory verification failed: {target}")
+            continue
+        if entry.reused:
+            # The previous digest was verified during its original capture. Its
+            # saved stat key was checked before reuse; clonefile produces an
+            # independent inode with the same bytes. The fallback byte copier
+            # verifies its streaming digest. Neither path rehashes a COW clone.
+            info = _lstat(target)
+            if not stat.S_ISREG(info.st_mode) or info.st_size != entry.size:
+                raise GoodnotesError(f"Reused snapshot file verification failed: {target}")
             continue
         _, size, digest = _hash_file(target)
         if size != entry.size or digest != entry.sha256:
@@ -412,8 +487,229 @@ def _validate_projection_database(database_path: Path) -> None:
         ) from exc
 
 
-def _write_marker(destination: Path, entries: Iterable[_Entry]) -> None:
-    marker_data = {
+def _valid_relative(value: object) -> Path | None:
+    if not isinstance(value, str):
+        return None
+    path = Path(value)
+    if path.is_absolute() or not path.parts or any(part in {".", ".."} for part in path.parts):
+        return None
+    if path.as_posix() != value:
+        return None
+    return path
+
+
+def _saved_stat(value: object) -> tuple[int, int, int, int, int, int] | None:
+    if (
+        not isinstance(value, list)
+        or len(value) != 6
+        or any(type(item) is not int for item in value)
+    ):
+        return None
+    return (value[0], value[1], value[2], value[3], value[4], value[5])
+
+
+def _saved_digest(value: object) -> str | None:
+    if not isinstance(value, str) or len(value) != 64:
+        return None
+    return value if all(char in "0123456789abcdef" for char in value) else None
+
+
+def _previous_inventory(
+    previous: Path | None, source: Path
+) -> tuple[dict[Path, _Entry], dict[Path, _Entry]]:
+    """Load verified digests, accepting only unchanged regular copied files.
+
+    A marker from an older CLI still works as a snapshot but is not eligible for
+    incremental reuse. Damage to one cached file invalidates reuse for that file.
+    """
+
+    if previous is None:
+        return {}, {}
+    from .safety import Sandbox
+
+    try:
+        sandbox = Sandbox.load(previous)
+        marker = json.loads((sandbox.root / SNAPSHOT_MARKER).read_text(encoding="utf-8"))
+        if marker.get("source_path") != str(source):
+            return {}, {}
+        source_records, file_records = marker.get("source_inventory"), marker.get("files")
+        if not isinstance(source_records, list) or not isinstance(file_records, list):
+            return {}, {}
+        source_entries: dict[Path, _Entry] = {}
+        for record in source_records:
+            if not isinstance(record, dict):
+                return {}, {}
+            relative = _valid_relative(record.get("path"))
+            saved_stat = _saved_stat(record.get("stat_key"))
+            digest = _saved_digest(record.get("sha256"))
+            if relative is None or saved_stat is None or digest is None:
+                return {}, {}
+            if relative in source_entries or not stat.S_ISREG(saved_stat[2]):
+                return {}, {}
+            source_entries[relative] = _Entry(relative, False, saved_stat, saved_stat[3], digest)
+        copied_entries: dict[Path, _Entry] = {}
+        for record in file_records:
+            if not isinstance(record, dict):
+                return {}, {}
+            saved_path = _valid_relative(record.get("path"))
+            saved_stat = _saved_stat(record.get("cache_stat_key"))
+            digest = _saved_digest(record.get("sha256"))
+            if saved_path is None or saved_path.parts[0] != "Library":
+                return {}, {}
+            relative = Path(*saved_path.parts[1:])
+            if not relative.parts or relative in copied_entries:
+                return {}, {}
+            if saved_stat is None or digest is None or record.get("size") != saved_stat[3]:
+                continue
+            copied_file = sandbox.library_dir / relative
+            try:
+                for parent in reversed(copied_file.parents):
+                    if parent == sandbox.library_dir or sandbox.library_dir in parent.parents:
+                        info = _lstat(parent)
+                        if not stat.S_ISDIR(info.st_mode):
+                            raise GoodnotesError("Previous copied parent is not a directory")
+                current = _lstat(copied_file)
+            except (GoodnotesError, OSError):
+                continue
+            if not stat.S_ISREG(current.st_mode) or _stat_key(current) != saved_stat:
+                continue
+            copied_entries[relative] = _Entry(
+                relative, False, saved_stat, current.st_size, digest, copied_file, True
+            )
+        return source_entries, copied_entries
+    except (GoodnotesError, OSError, ValueError, TypeError):
+        return {}, {}
+
+
+def _sqlite_family(relative: Path, name: str) -> bool:
+    return relative == Path("Databases") / name or relative in {
+        Path("Databases") / (name + suffix) for suffix in _DATABASE_SIDECAR_SUFFIXES
+    }
+
+
+def _plan_capture(
+    source: Path, entries: list[_Entry], previous: Path | None
+) -> tuple[list[_Entry], list[_Entry]]:
+    """Choose previous independent files or hash current source bytes.
+
+    A completed SQLite copy may have consolidated WAL data. Reuse it only when
+    its entire original source family is unchanged; otherwise recapture that
+    family as bytes. Native stores and attachments can reuse individual files.
+    """
+
+    previous_source, previous_copy = _previous_inventory(previous, source)
+    files = {entry.relative: entry for entry in entries if not entry.is_directory}
+    reused_families: dict[str, _Entry] = {}
+    for name in _DATABASE_NAMES:
+        current_family = {
+            path: entry.stat_key for path, entry in files.items() if _sqlite_family(path, name)
+        }
+        old_family = {
+            path: entry.stat_key
+            for path, entry in previous_source.items()
+            if _sqlite_family(path, name)
+        }
+        copied = previous_copy.get(Path("Databases") / name)
+        if current_family and current_family == old_family and copied is not None:
+            reused_families[name] = copied
+
+    copy_entries: list[_Entry] = []
+    source_entries: list[_Entry] = []
+    for entry in entries:
+        if entry.is_directory:
+            copy_entries.append(entry)
+            continue
+        family = next(
+            (name for name in _DATABASE_NAMES if _sqlite_family(entry.relative, name)), None
+        )
+        if family is not None and family in reused_families:
+            source_entries.append(previous_source[entry.relative])
+            if entry.relative == Path("Databases") / family:
+                copy_entries.append(reused_families[family])
+            continue
+        old_source = previous_source.get(entry.relative)
+        copied = previous_copy.get(entry.relative)
+        if (
+            family is None
+            and old_source is not None
+            and old_source.stat_key == entry.stat_key
+            and copied is not None
+            and copied.sha256 == old_source.sha256
+        ):
+            source_entries.append(old_source)
+            copy_entries.append(copied)
+        else:
+            hashed = _file_entry(source / entry.relative, entry.relative)
+            if hashed.stat_key != entry.stat_key:
+                raise _SourceChanged(
+                    f"Source file changed before capture: {source / entry.relative}"
+                )
+            source_entries.append(hashed)
+            copy_entries.append(hashed)
+    return copy_entries, source_entries
+
+
+def _capture_stats(entries: Iterable[_Entry], metrics: dict[str, int]) -> dict[str, Any]:
+    entries = list(entries)
+    files = [entry for entry in entries if not entry.is_directory]
+    return {
+        "scope": "successful-attempt",
+        "source_captured_files": sum(not entry.reused for entry in files),
+        "source_captured_bytes": sum(entry.size for entry in files if not entry.reused),
+        "cache_reused_files": sum(entry.reused for entry in files),
+        "cache_reused_bytes": sum(entry.size for entry in files if entry.reused),
+        "source_bytes_hashed": sum(entry.size for entry in files if not entry.reused)
+        + metrics["source_copy_bytes_hashed"],
+        **{name: value for name, value in metrics.items() if name != "source_copy_bytes_hashed"},
+        "total_files": len(files),
+        "total_bytes": sum(entry.size for entry in files),
+        "bytes_are_logical": True,
+        "native_store_present": any(
+            entry.relative.parts[:2] == ("Databases", "notes_main.db") for entry in entries
+        ),
+    }
+
+
+def _final_manifest(library: Path, planned: list[_Entry]) -> list[_Entry]:
+    """Retain known file digests; hash only SQLite bytes changed by consolidation."""
+
+    known = {entry.relative: entry for entry in planned if not entry.is_directory}
+    consolidated = {
+        name
+        for name in _DATABASE_NAMES
+        if any(
+            _sqlite_family(entry.relative, name) and entry.relative.name != name
+            for entry in planned
+        )
+    }
+    final = []
+    for entry in _collect_manifest(library, hash_contents=False):
+        if entry.is_directory:
+            final.append(entry)
+            continue
+        if entry.relative in {Path("Databases") / name for name in consolidated}:
+            final.append(_file_entry(library / entry.relative, entry.relative))
+        else:
+            original = known[entry.relative]
+            final.append(_Entry(entry.relative, False, entry.stat_key, entry.size, original.sha256))
+    return final
+
+
+def _write_marker(
+    destination: Path,
+    entries: Iterable[_Entry],
+    *,
+    source: Path | None = None,
+    source_entries: Iterable[_Entry] = (),
+    capture_stats: dict[str, Any] | None = None,
+) -> None:
+    entries = list(entries)
+    # Freeze files before recording their metadata, so subsequent refreshes can
+    # distinguish cache damage from files whose digest was already verified.
+    for entry in entries:
+        if not entry.is_directory:
+            (destination / "Library" / entry.relative).chmod(0o444)
+    marker_data: dict[str, Any] = {
         "format_version": 1,
         "created_at_utc": datetime.now(UTC).isoformat(),
         "files": [
@@ -421,11 +717,21 @@ def _write_marker(destination: Path, entries: Iterable[_Entry]) -> None:
                 "path": (Path("Library") / entry.relative).as_posix(),
                 "size": entry.size,
                 "sha256": entry.sha256,
+                "cache_stat_key": _stat_key((destination / "Library" / entry.relative).lstat()),
             }
             for entry in entries
             if not entry.is_directory
         ],
     }
+    if source is not None:
+        marker_data["source_path"] = str(source)
+        marker_data["source_inventory"] = [
+            {"path": entry.relative.as_posix(), "stat_key": entry.stat_key, "sha256": entry.sha256}
+            for entry in source_entries
+            if not entry.is_directory
+        ]
+    if capture_stats is not None:
+        marker_data["capture_stats"] = capture_stats
     marker = destination / SNAPSHOT_MARKER
     fd, temporary_name = tempfile.mkstemp(prefix=".snapshot-marker-", dir=destination)
     temporary = Path(temporary_name)
@@ -444,7 +750,8 @@ def _make_read_only(destination: Path, entries: Iterable[_Entry]) -> None:
     for entry in entries:
         target = destination / "Library" / entry.relative
         if not entry.is_directory:
-            target.chmod(0o444)
+            if stat.S_IMODE(target.lstat().st_mode) != 0o444:
+                target.chmod(0o444)
     for entry in sorted(
         (entry for entry in entries if entry.is_directory),
         key=lambda item: len(item.relative.parts),
@@ -487,6 +794,7 @@ def create_snapshot(
     destination: str | Path,
     *,
     max_attempts: int = 3,
+    previous_snapshot: Path | None = None,
 ) -> Path:
     """Copy the Goodnotes Library tree into a new, validated read-only snapshot.
 
@@ -498,15 +806,20 @@ def create_snapshot(
     if max_attempts < 1:
         raise ValueError("max_attempts must be at least one")
     requested_source = Path(source_library).expanduser()
-    if requested_source.is_symlink():
-        raise GoodnotesError("The source Library directory must not be a symlink.")
     try:
+        if requested_source.is_symlink():
+            raise GoodnotesError("The source Library directory must not be a symlink.")
         source = requested_source.resolve(strict=True)
+        source_info = source.lstat()
     except OSError as exc:
+        if _permission_denied(exc):
+            raise FilesystemAccessError.from_exception(
+                exc, operation="resolve_source_library", path=requested_source, kind="source"
+            ) from exc
         raise GoodnotesError(
             f"Source Library directory does not exist: {requested_source}"
         ) from exc
-    if not source.is_dir():
+    if not stat.S_ISDIR(source_info.st_mode):
         raise GoodnotesError(f"Source Library path is not a directory: {source}")
 
     requested_destination = Path(destination).expanduser()
@@ -532,22 +845,33 @@ def create_snapshot(
     except OSError as exc:
         raise GoodnotesError(f"Could not create snapshot destination: {target}") from exc
 
+    started = time.monotonic()
     try:
         for attempt in range(max_attempts):
             try:
-                manifest_before = _collect_manifest(source)
+                manifest_before = _collect_manifest(source, hash_contents=False)
+                planned, source_files = _plan_capture(source, manifest_before, previous_snapshot)
                 library_destination = target / "Library"
-                _copy_snapshot_tree(source, library_destination, manifest_before)
-                manifest_after = _collect_manifest(source)
+                copy_metrics = _copy_snapshot_tree(source, library_destination, planned)
+                manifest_after = _collect_manifest(source, hash_contents=False)
                 if manifest_before != manifest_after:
                     raise _SourceChanged("Source files changed during snapshot copy.")
-                _verify_copy(library_destination, manifest_before)
+                _verify_copy(library_destination, planned)
                 _consolidate_copied_databases(library_destination)
                 _validate_projection_database(
                     library_destination / "Databases" / "projection.sqlite"
                 )
-                final_manifest = _collect_manifest(library_destination)
-                _write_marker(target, final_manifest)
+                final_manifest = _final_manifest(library_destination, planned)
+                capture_stats = _capture_stats(planned, copy_metrics)
+                capture_stats["attempts"] = attempt + 1
+                capture_stats["capture_seconds"] = round(time.monotonic() - started, 6)
+                _write_marker(
+                    target,
+                    final_manifest,
+                    source=source,
+                    source_entries=source_files,
+                    capture_stats=capture_stats,
+                )
                 _make_read_only(target, final_manifest)
                 return target
             except _SourceChanged as exc:

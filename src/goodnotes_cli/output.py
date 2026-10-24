@@ -75,7 +75,22 @@ _PROJECTIONS: dict[str, _ProjectionSpec] = {
     ),
     "sync": _ProjectionSpec(
         ("status", "snapshot", "snapshot_id", "checked_at", "source_changed_during_refresh"),
-        optional_fields=("captured_at", "warnings"),
+        optional_fields=("captured_at", "warnings", "capture_stats"),
+    ),
+    "watch": _ProjectionSpec(
+        ("event", "iteration"),
+        optional_fields=(
+            "status",
+            "snapshot",
+            "snapshot_id",
+            "checked_at",
+            "captured_at",
+            "source_changed_during_refresh",
+            "warnings",
+            "capture_stats",
+            "error",
+            "retry_in_seconds",
+        ),
     ),
     "snapshot": _ProjectionSpec(("snapshot", "status")),
     "export": _ProjectionSpec(
@@ -90,7 +105,8 @@ _PROJECTIONS: dict[str, _ProjectionSpec] = {
             "annotation_status",
             "warnings",
             "snapshot",
-        )
+        ),
+        optional_fields=("native_annotations", "captured_at"),
     ),
     "render": _ProjectionSpec(
         (
@@ -105,12 +121,16 @@ _PROJECTIONS: dict[str, _ProjectionSpec] = {
             "annotation_status",
             "warnings",
             "snapshot",
-        )
+        ),
+        optional_fields=("native_annotations", "captured_at"),
     ),
     "attach-pdf": _ProjectionSpec(
         ("document_id", "path", "pages", "registered", "warnings", "snapshot")
     ),
-    "bundle": _ProjectionSpec(("directory", "manifest", "pages", "layer", "truncated", "snapshot")),
+    "bundle": _ProjectionSpec(
+        ("directory", "manifest", "pages", "layer", "truncated", "snapshot"),
+        optional_fields=("captured_at",),
+    ),
 }
 
 

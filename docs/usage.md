@@ -16,7 +16,26 @@ On Linux, give `sync` a path to an available copy of the `Library` folder:
 uv run goodnotes sync --library /path/to/Library
 ```
 
-The folder must contain `Databases/` and `Attachments/`. Run `sync` again after Goodnotes changes the library. To rebuild the copy even when its saved file inventory appears unchanged, add `--force`.
+The folder must contain `Databases/` and `Attachments/`. `sync` captures changed files and reuses unchanged verified files. To rebuild even when the saved inventory appears unchanged, add `--force`.
+
+For agent conversations, sync once at the start of each request, then use its `snapshot_id` with `--expect-snapshot` across the request's reads and renders. This requires no persistent watcher. Do not refresh between commands in the same answer unless restarting against a newer generation.
+
+For optional continuous updates, leave this foreground command running in a separate terminal:
+
+```sh
+uv run goodnotes watch --interval 2 --debounce 1
+```
+
+Use `watch --library /path/to/Library` for an explicit source. Watch emits an initial result, then JSON events for updates, errors, and recovery. It stays quiet when unchanged and stops with Ctrl-C. This observes changes that reached the Mac; it cannot verify whether an iPad is fully synced. If watch is not running, refresh with `sync` after edits.
+
+For actual pen annotations, install the optional native runtime described in [PDFs and handwriting](pdf-and-handwriting.md), then render a page or prepare an agent bundle:
+
+```sh
+uv run goodnotes render "Notebook name" --page 3 --layer native --output /tmp/notes-page.png
+uv run goodnotes bundle "Notebook name" --pages 3 --layer native --output /tmp/notes-context
+```
+
+Inspect `native_annotations`, warnings, snapshot ID, and capture time before evaluating the image. Native reconstruction is approximate and reports unsupported objects; text recognition remains separate.
 
 To make a separate copy at a path you manage, use `snapshot`, then pass that copy with the global `--sandbox` option:
 

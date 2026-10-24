@@ -15,7 +15,7 @@ from typing import Protocol
 
 import pymupdf as fitz
 
-from .errors import GoodnotesError
+from .errors import FilesystemAccessError, GoodnotesError
 from .models import Page
 from .safety import _require_not_production, open_database
 
@@ -73,6 +73,7 @@ def export_pdf(
         raise GoodnotesError("PDF exports must use a .pdf destination.")
 
     result_doc = fitz.open()
+    native_annotations: list[dict[str, object]] = []
     try:
         if layer == "background":
             for page in ordered:
@@ -82,6 +83,19 @@ def export_pdf(
             annotation_status = "not-included"
             warnings = [_BACKGROUND_WARNING]
             source = "per-page-background-attachments"
+        elif layer == "native":
+            for page in ordered:
+                native_annotations.append(_append_native_page(result_doc, sandbox, page))
+            includes_handwriting = any(
+                bool(entry.get("rendered_strokes")) for entry in native_annotations
+            )
+            annotation_status = "native-reconstructed-approximate"
+            warnings = list(
+                dict.fromkeys(
+                    warning for entry in native_annotations for warning in _native_warnings(entry)
+                )
+            )
+            source = "copied-native-records-and-backgrounds"
         else:
             source_doc, entry = _open_registered_pdf(sandbox, ordered[0].document_id)
             try:
@@ -117,7 +131,7 @@ def export_pdf(
     finally:
         result_doc.close()
 
-    return {
+    result: dict[str, object] = {
         "path": str(output_path),
         "document_id": ordered[0].document_id,
         "pages": len(ordered),
@@ -127,7 +141,11 @@ def export_pdf(
         "includes_handwriting": includes_handwriting,
         "annotation_status": annotation_status,
         "warnings": warnings,
+        "captured_at": getattr(sandbox, "captured_at", None),
     }
+    if layer == "native":
+        result["native_annotations"] = native_annotations
+    return result
 
 
 def render_page(
@@ -145,11 +163,15 @@ def render_page(
     if output_path.suffix.casefold() != ".png":
         raise GoodnotesError("Page renders must use a .png destination.")
 
-    if layer == "background":
-        source_path = _resolve_attachment_path(sandbox, page)
+    native_annotations: dict[str, object] | None = None
+    if layer in {"background", "native"}:
         render_doc = fitz.open()
         try:
-            _append_background_page(render_doc, page, source_path)
+            if layer == "native":
+                native_annotations = _append_native_page(render_doc, sandbox, page)
+            else:
+                source_path = _resolve_attachment_path(sandbox, page)
+                _append_background_page(render_doc, page, source_path)
             source_page = render_doc.load_page(0)
             _check_render_size(source_page.rect, dpi)
             _publish_new_file(
@@ -162,10 +184,16 @@ def render_page(
             raise GoodnotesError(f"Could not render page {page.number}: {exc}") from exc
         finally:
             render_doc.close()
-        includes_handwriting = False
-        annotation_status = "not-included"
-        source = "per-page-background-attachment"
-        warnings = [_BACKGROUND_WARNING]
+        if native_annotations is not None:
+            includes_handwriting = bool(native_annotations.get("rendered_strokes"))
+            annotation_status = "native-reconstructed-approximate"
+            source = "copied-native-records-and-background"
+            warnings = _native_warnings(native_annotations)
+        else:
+            includes_handwriting = False
+            annotation_status = "not-included"
+            source = "per-page-background-attachment"
+            warnings = [_BACKGROUND_WARNING]
         source_page_number = page.pdf_page or 1
     else:
         source_doc, entry = _open_registered_pdf(sandbox, page.document_id)
@@ -190,7 +218,7 @@ def render_page(
         warnings = [_ANNOTATED_WARNING]
         source_page_number = page.number
 
-    return {
+    result: dict[str, object] = {
         "path": str(output_path),
         "document_id": page.document_id,
         "page": page.number,
@@ -201,7 +229,11 @@ def render_page(
         "includes_handwriting": includes_handwriting,
         "annotation_status": annotation_status,
         "warnings": warnings,
+        "captured_at": getattr(sandbox, "captured_at", None),
     }
+    if native_annotations is not None:
+        result["native_annotations"] = native_annotations
+    return result
 
 
 def register_annotated_pdf(
@@ -271,7 +303,7 @@ def register_annotated_pdf(
         "sha256": digest,
     }
 
-    registry_path = _registry_path(sandbox, document_id)
+    registry_path = _registry_path(sandbox, document_id, create=True)
     _write_registry(registry_path, entry)
 
     return {
@@ -328,8 +360,39 @@ def _selected_pages(pages: list[Page], page_numbers: list[int] | None) -> list[P
 
 
 def _check_layer(layer: str) -> None:
-    if layer not in {"background", "annotated"}:
-        raise GoodnotesError("The PDF layer must be 'background' or 'annotated'.")
+    if layer not in {"background", "annotated", "native"}:
+        raise GoodnotesError("The PDF layer must be 'background', 'native', or 'annotated'.")
+
+
+def _native_warnings(metadata: dict[str, object]) -> list[str]:
+    warnings = metadata.get("warnings")
+    return [str(value) for value in warnings] if isinstance(warnings, list) else []
+
+
+def _append_native_page(
+    document: fitz.Document, sandbox: SandboxProtocol, page: Page
+) -> dict[str, object]:
+    """Compose a copied native overlay with its verified background mapping."""
+    from .annotations import render_native_overlay
+
+    source_path = _resolve_attachment_path(sandbox, page)
+    index = _append_background_page(document, page, source_path)
+    target = document[index]
+    if target.rotation or target.cropbox != target.mediabox:
+        raise GoodnotesError(
+            "Native annotation rendering does not yet support rotated or cropped backgrounds."
+        )
+    overlay = render_native_overlay(
+        sandbox,
+        page,
+        width_points=target.rect.width,
+        height_points=target.rect.height,
+    )
+    if overlay.svg and overlay.metadata.get("rendered_strokes"):
+        with fitz.open(stream=overlay.svg, filetype="svg") as vector:
+            with fitz.open(stream=vector.convert_to_pdf(), filetype="pdf") as ink:
+                target.show_pdf_page(target.rect, ink, 0, overlay=True)
+    return {"page": page.number, "page_id": page.id, **overlay.metadata}
 
 
 def _check_dpi(dpi: int) -> None:
@@ -494,24 +557,39 @@ def _current_page_count(sandbox: SandboxProtocol, document_id: str) -> int:
     return int(row[0])
 
 
-def _sidecar_dir(sandbox: SandboxProtocol) -> Path:
+def _sidecar_dir(sandbox: SandboxProtocol, *, create: bool = False) -> Path:
+    try:
+        return _sidecar_dir_checked(sandbox, create=create)
+    except OSError as exc:
+        raise FilesystemAccessError.from_exception(
+            exc,
+            operation="create_annotated_pdf_sidecar" if create else "read_annotated_pdf_record",
+            path=Path(sandbox.root).parent / ".goodnotes-cli",
+            kind="output" if create else "source",
+        ) from exc
+
+
+def _sidecar_dir_checked(sandbox: SandboxProtocol, *, create: bool) -> Path:
     root = Path(sandbox.root).resolve(strict=True)
     sidecar_parent = root.parent / ".goodnotes-cli"
     snapshot_key = hashlib.sha256(os.fsencode(root)).hexdigest()[:24]
     sidecar_dir = sidecar_parent / snapshot_key
     if sidecar_parent.is_symlink() or sidecar_dir.is_symlink():
         raise GoodnotesError("The annotated-PDF sidecar must not be a symbolic link.")
-    # Validate this sibling path against the same production-path and overlap checks as outputs.
-    sentinel = sidecar_dir / f".validate-{uuid.uuid4().hex}"
-    sandbox.ensure_output(sentinel)
-    try:
-        sidecar_parent.mkdir(mode=0o700, exist_ok=True)
-        sidecar_dir.mkdir(mode=0o700, exist_ok=True)
-    except OSError as exc:
-        raise GoodnotesError(f"Could not create the annotated-PDF sidecar: {exc}") from exc
+    _require_not_production(sidecar_dir, purpose="an annotated-PDF sidecar")
+    if create:
+        sentinel = sidecar_dir / f".validate-{uuid.uuid4().hex}"
+        sandbox.ensure_output(sentinel)
+        try:
+            sidecar_parent.mkdir(mode=0o700, exist_ok=True)
+            sidecar_dir.mkdir(mode=0o700, exist_ok=True)
+        except OSError as exc:
+            raise FilesystemAccessError.from_exception(
+                exc, operation="create_annotated_pdf_sidecar", path=sidecar_dir, kind="output"
+            ) from exc
     if sidecar_parent.is_symlink() or sidecar_dir.is_symlink():
         raise GoodnotesError("The annotated-PDF sidecar must not be a symbolic link.")
-    resolved_dir = sidecar_dir.resolve(strict=True)
+    resolved_dir = sidecar_dir.resolve(strict=create)
     overlaps_snapshot = (
         resolved_dir == root
         or root.is_relative_to(resolved_dir)
@@ -522,13 +600,21 @@ def _sidecar_dir(sandbox: SandboxProtocol) -> Path:
     return resolved_dir
 
 
-def _registry_path(sandbox: SandboxProtocol, document_id: str) -> Path:
+def _registry_path(sandbox: SandboxProtocol, document_id: str, *, create: bool = False) -> Path:
     _validate_document_id(document_id)
-    sidecar = _sidecar_dir(sandbox)
+    sidecar = _sidecar_dir(sandbox, create=create)
     document_key = hashlib.sha256(document_id.encode("utf-8")).hexdigest()
     registry = sidecar / f"{document_key}.json"
-    if registry.is_symlink():
-        raise GoodnotesError("The notebook's annotated-PDF record must not be a symbolic link.")
+    try:
+        if registry.is_symlink():
+            raise GoodnotesError("The notebook's annotated-PDF record must not be a symbolic link.")
+    except OSError as exc:
+        raise FilesystemAccessError.from_exception(
+            exc,
+            operation="write_annotated_pdf_record" if create else "read_annotated_pdf_record",
+            path=registry,
+            kind="output" if create else "source",
+        ) from exc
     return registry
 
 
@@ -547,11 +633,18 @@ def _validate_document_id(document_id: str) -> None:
 
 
 def _read_registry(path: Path, document_id: str) -> dict[str, object] | None:
-    if not path.exists():
-        return None
     try:
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode):
+            raise GoodnotesError("The annotated-PDF record must be a regular file.")
         raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise FilesystemAccessError.from_exception(
+            exc, operation="read_annotated_pdf_record", path=path, kind="source"
+        ) from exc
+    except json.JSONDecodeError as exc:
         raise GoodnotesError(f"Could not read the annotated-PDF record: {exc}") from exc
     if (
         not isinstance(raw, dict)
@@ -563,8 +656,15 @@ def _read_registry(path: Path, document_id: str) -> dict[str, object] | None:
 
 
 def _write_registry(path: Path, record: dict[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.stem}-", suffix=".json", dir=path.parent)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=f".{path.stem}-", suffix=".json", dir=path.parent
+        )
+    except OSError as exc:
+        raise FilesystemAccessError.from_exception(
+            exc, operation="write_annotated_pdf_record", path=path, kind="output"
+        ) from exc
     temporary = Path(temporary_name)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
@@ -574,7 +674,9 @@ def _write_registry(path: Path, record: dict[str, object]) -> None:
             os.fsync(stream.fileno())
         os.replace(temporary, path)
     except OSError as exc:
-        raise GoodnotesError(f"Could not write the annotated-PDF record: {exc}") from exc
+        raise FilesystemAccessError.from_exception(
+            exc, operation="write_annotated_pdf_record", path=path, kind="output"
+        ) from exc
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -715,11 +817,11 @@ def _publish_new_file(
     writer: Callable[[str], object],
 ) -> None:
     """Write to a sibling temporary file, then create the destination without overwriting."""
-    destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(
         f".{destination.stem}.tmp-{os.getpid()}-{uuid.uuid4().hex}{destination.suffix}"
     )
     try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
         writer(str(temporary))
         if not temporary.is_file() or temporary.stat().st_size == 0:
             raise GoodnotesError("The document renderer did not create an output file.")
@@ -730,6 +832,8 @@ def _publish_new_file(
     except GoodnotesError:
         raise
     except OSError as exc:
-        raise GoodnotesError(f"Could not write output file {destination}: {exc}") from exc
+        raise FilesystemAccessError.from_exception(
+            exc, operation="write_document_output", path=destination, kind="output"
+        ) from exc
     finally:
         temporary.unlink(missing_ok=True)

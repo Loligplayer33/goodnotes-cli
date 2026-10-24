@@ -6,6 +6,30 @@ Run `uv run goodnotes` from the repository root. Start with `uv run goodnotes sc
 
 Setup runs `sync` with read access to the source and write access to the cache. Browsing, searching, and reading then need only cache read access, including the existing `.view.lock`. Use the installed `goodnotes` executable directly if your runner cannot update the project environment. Keep the same `--data-dir` or `GOODNOTES_DATA_DIR` selection as setup. `doctor.storage` gives the resolved cache directory, snapshot path, and capture time. Cache permission failures return `cache_permission_denied`; missing setup or lock files return `cache_not_initialized`; malformed cache state returns `cache_invalid`. Follow `error.details` for the path, operation, and remedy. Do not bypass locking, create replacement locks, or silently choose another cache. A missing-lock repair requires stopping other CLI processes before a process with write access runs `sync`.
 
+`doctor --access-only` checks the selected cache or explicit sandbox without opening databases or writing files. It can report access problems even before initialization. Use its optional `--library`, `--scratch-dir`, and `--output-dir` checks to distinguish source read access, temporary scratch access, and export access. Write-access hints are preflight checks, not a successful write test. The CLI does not grant permissions or change runner restrictions.
+
+## Inspect notes while the user studies
+
+For questions about recent edits, refresh once at the start of the agent request. The refresh process needs source read access and cache write access. Use the same cache for the subsequent commands:
+
+```sh
+goodnotes --data-dir /path/to/cli-cache sync --library /path/to/Library
+```
+
+Read `snapshot_id` from that result and pass it as `--expect-snapshot SNAPSHOT_ID` to the request's reads, searches, and renders. Do not sync again between those commands unless restarting the request. This avoids repeated metadata scans and prevents mixing generations. An unchanged sync reuses the active generation; changed refreshes reuse verified unchanged files. If sync fails, report the refresh failure rather than silently presenting the old copy as current.
+
+`watch` is optional. Use it when a separate process should refresh continuously, or when the agent can only read the cache. The watcher needs source read access and cache write access; the reading agent does not need source access. Keep it running and use its selected cache. Even with a watcher, pin each request's snapshot; on `stale_snapshot`, restart against the new generation.
+
+When the user asks about notes on a page, use the image as the visual source:
+
+```sh
+goodnotes --data-dir /path/to/cli-cache --expect-snapshot SNAPSHOT_ID bundle "Notebook name" --pages 3 --layer native --output /tmp/study-page-3
+```
+
+Open the image named in `text.json`. Read `native_annotations`, `annotation_status`, warnings, `snapshot`, and `captured_at` alongside the image. Native reconstruction is approximate. `includes_handwriting: true` only establishes that supported strokes were rendered; coverage and unsupported-object counts limit what an agent can conclude. If coverage is partial, say which reported limitations affect the answer. Missing native data is unknown availability, not proof that the page has no writing. Never substitute a clean background and describe it as the user's complete notes.
+
+Both sync and watch observe files already present on the Mac. They cannot confirm that a particular iPad edit has arrived. A newer `captured_at` alone does not prove that the expected note is present. Compare the actual page image or ask for the expected edit when needed. A refresh error preserves the prior copy, so continued readable output is not evidence of successful refresh.
+
 ## Find pages and stored recognition text
 
 Use `info`, `ls`, or `tree` to find a notebook. Use `pages` for its current one-based page numbers. Select notebooks by exact UUID, full path, or unique exact name; use the full path or UUID when a name is ambiguous.
@@ -32,6 +56,6 @@ Successful data responses are compact JSON by default. `--text` only indents it.
 
 ## Use exports carefully
 
-`export --pages EXPR` selects distinct one-based pages in the listed order; omitting it exports all pages. It has no 20-page cap. `render`, `export`, and `bundle` require new destinations outside the snapshot and production Goodnotes locations. The default `background` layer does not overlay native ink. An `annotated` layer requires a user-supplied PDF registered with `attach-pdf`; the CLI checks the file and page count but cannot verify annotation inclusion or page order. Preserve `annotation_status: "user-provided-unverified"` and warnings with any conclusion.
+`export --pages EXPR` selects distinct one-based pages in the listed order; omitting it exports all pages. It has no 20-page cap. `render`, `export`, and `bundle` require new destinations outside the snapshot and production Goodnotes locations. The default `background` layer does not overlay native ink. Use explicit `--layer native` for supported native pen reconstruction and retain its coverage diagnostics. An `annotated` layer uses a user-supplied PDF registered with `attach-pdf`; the CLI checks the file and page count but cannot verify annotation inclusion or page order. Preserve `annotation_status: "user-provided-unverified"` and warnings with any conclusion.
 
 For source and annotation details, see [PDFs and handwriting](pdf-and-handwriting.md). For development and checks, see [Contributing](../CONTRIBUTING.md).

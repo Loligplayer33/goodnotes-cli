@@ -20,7 +20,12 @@ from . import __version__
 from .cache import read_view, refresh_cache
 from .config import Settings, default_data_dir, default_library
 from .documents import export_pdf, register_annotated_pdf, render_page
-from .errors import CacheAccessError, GoodnotesError, TextIndexUnavailableError
+from .errors import (
+    CacheAccessError,
+    FilesystemAccessError,
+    GoodnotesError,
+    TextIndexUnavailableError,
+)
 from .library import Library
 from .output import (
     Projection,
@@ -35,6 +40,7 @@ from .output import (
     window,
 )
 from .snapshot import create_snapshot
+from .watch import watch_library
 
 ItemSelector = Annotated[
     str, typer.Argument(help="Exact UUID, full library path, or unique exact name.")
@@ -185,12 +191,57 @@ def sync(
     """
 
     cfg = settings(ctx)
+    if cfg.sandbox is not None:
+        raise GoodnotesError("sync uses --library as its source; omit the global --sandbox option.")
     emit(
         refresh_cache(
             library or default_library(), cfg.data_dir or default_data_dir(), force=force
         ),
         cfg,
     )
+
+
+@command()
+def watch(
+    ctx: typer.Context,
+    library: Annotated[Path | None, typer.Option(help="Goodnotes Library directory.")] = None,
+    interval: Annotated[
+        float, typer.Option(min=0.05, max=3600, help="Seconds between metadata checks.")
+    ] = 2,
+    debounce: Annotated[
+        float, typer.Option(min=0, max=60, help="Seconds to coalesce edits before capture.")
+    ] = 1,
+    iterations: Annotated[
+        int | None, typer.Option(min=1, help="Stop after this many polling iterations.")
+    ] = None,
+) -> None:
+    """Keep the copied library refreshed while this foreground process runs.
+
+    Emits one JSON object per ready, updated, recovery, or error event. Unchanged
+    checks stay quiet. Ctrl-C stops the watcher. This observes files on the Mac;
+    it cannot establish whether the latest iPad changes have reached this Mac.
+
+    Example: goodnotes watch --library /path/to/Library --interval 2
+    """
+    cfg = settings(ctx)
+    if cfg.sandbox is not None:
+        raise GoodnotesError(
+            "watch uses --library as its source; omit the global --sandbox option."
+        )
+    failed = False
+    for event in watch_library(
+        library or default_library(),
+        cfg.data_dir or default_data_dir(),
+        interval=interval,
+        debounce=debounce,
+        iterations=iterations,
+    ):
+        emit(event, cfg)
+        failed = event.get("event") == "error"
+    if failed:
+        # The error is already present in the JSONL stream. A bounded watcher
+        # must also let process supervisors detect an unrecovered failure.
+        raise SystemExit(1)
 
 
 @command()
@@ -426,7 +477,7 @@ def export_notebook(
     ctx: typer.Context,
     notebook: ItemSelector,
     output: Annotated[Path, typer.Option(help="New PDF file to write.")],
-    layer: Annotated[str, typer.Option(help="background or annotated.")] = "background",
+    layer: Annotated[str, typer.Option(help="background, native, or annotated.")] = "background",
     pages: Annotated[
         str | None,
         typer.Option(help="Selected pages in listed order, e.g. 1-3,7. Defaults to all."),
@@ -464,8 +515,9 @@ def render(
 ) -> None:
     """Render one page to a new PNG for visual inspection.
 
-    --layer accepts background or annotated. Background omits native ink; annotated
-    requires attach-pdf. Page numbers start at 1. Existing outputs are never replaced.
+    --layer native reconstructs supported copied ink and reports coverage. Background
+    omits native ink; annotated requires attach-pdf. Page numbers start at 1.
+    Existing outputs are never replaced.
 
     Example: goodnotes render "Course Notes" --page 3 --output /tmp/page-3.png
     """
@@ -517,8 +569,8 @@ def bundle(
     """Save page images and source-labeled text.json in a new directory.
 
     Select up to 10 distinct pages with --pages, e.g. 1-3,7. One character budget
-    covers all text. --layer accepts background or annotated; annotated requires
-    attach-pdf. Text comes from read sources regardless of the image layer.
+    covers all text. --layer native reconstructs supported copied ink and reports
+    coverage; annotated requires attach-pdf. Text keeps its original source labels.
 
     Example: goodnotes bundle "Course Notes" --pages 1-3 --output /tmp/course-pages
     """
@@ -553,10 +605,18 @@ def bundle(
                 )
             truncated = bound_page_text([entry["text"] for entry in manifest], max_chars)
             (temporary / "text.json").write_text(
-                json.dumps({"pages": manifest, "truncated": truncated}, ensure_ascii=False)
+                json.dumps(
+                    {
+                        "snapshot": cfg.snapshot_id,
+                        "captured_at": sandbox.captured_at,
+                        "pages": manifest,
+                        "truncated": truncated,
+                    },
+                    ensure_ascii=False,
+                )
             )
             publish_bundle(temporary, destination)
-        except BaseException:
+        except BaseException as exc:
             if temporary is not None:
                 shutil.rmtree(temporary, ignore_errors=True)
             if not parent_existed:
@@ -564,6 +624,10 @@ def bundle(
                     destination.parent.rmdir()
                 except OSError:
                     pass
+            if isinstance(exc, OSError):
+                raise FilesystemAccessError.from_exception(
+                    exc, operation="write_bundle_output", path=destination, kind="output"
+                ) from exc
             raise
         emit(
             {
@@ -572,6 +636,7 @@ def bundle(
                 "pages": selected,
                 "layer": layer,
                 "truncated": truncated,
+                "captured_at": sandbox.captured_at,
             },
             cfg,
         )
@@ -601,7 +666,22 @@ def publish_bundle(temporary: Path, destination: Path) -> None:
 
 
 @command()
-def doctor(ctx: typer.Context) -> None:
+def doctor(
+    ctx: typer.Context,
+    access_only: Annotated[
+        bool,
+        typer.Option(help="Check filesystem access without opening databases or writing files."),
+    ] = False,
+    library: Annotated[
+        Path | None, typer.Option(help="Optional source Library to check with --access-only.")
+    ] = None,
+    scratch_dir: Annotated[
+        Path | None, typer.Option(help="Native scratch directory to check with --access-only.")
+    ] = None,
+    output_dir: Annotated[
+        Path | None, typer.Option(help="Output directory to check with --access-only.")
+    ] = None,
+) -> None:
     """Report local library counts, missing metadata, and text-source warnings.
 
     storage contains cache_dir, snapshot_path, and captured_at; unknown values are null.
@@ -609,6 +689,23 @@ def doctor(ctx: typer.Context) -> None:
 
     Example: goodnotes doctor
     """
+    cfg = settings(ctx)
+    if access_only:
+        from .diagnostics import inspect_environment
+        from .native import runtime_status
+
+        result = inspect_environment(
+            cfg.data_dir or default_data_dir(),
+            library,
+            sandbox=cfg.sandbox,
+            scratch_dir=scratch_dir,
+            output_dir=output_dir,
+        )
+        result["native_runtime"] = runtime_status()
+        emit(result, cfg)
+        return
+    if any(value is not None for value in (library, scratch_dir, output_dir)):
+        raise GoodnotesError("--library, --scratch-dir, and --output-dir require --access-only.")
     with repository(ctx) as lib:
         cfg = settings(ctx)
         result = lib.stats()
@@ -617,6 +714,9 @@ def doctor(ctx: typer.Context) -> None:
             "snapshot_path": lib.sandbox.root,
             "captured_at": lib.sandbox.captured_at,
         }
+        from .native import runtime_status
+
+        result["native_runtime"] = runtime_status()
         emit(result, cfg)
 
 
@@ -671,6 +771,7 @@ def schema(
             "page_numbers": "one-based",
             "commands": {
                 "sync": "[--library PATH --force]",
+                "watch": "[--library PATH --interval SECONDS --debounce SECONDS --iterations N]",
                 "snapshot": "LIBRARY DESTINATION",
                 "ls": "[--folder FOLDER --limit N --offset N]",
                 "tree": "[--folder FOLDER --depth N --limit N --offset N]",
@@ -688,11 +789,13 @@ def schema(
                     "QUERY [--folder FOLDER | --notebook NOTEBOOK] "
                     "[--page-limit N --page-offset N --limit N]"
                 ),
-                "export": "NOTEBOOK --output FILE [--pages 1-3,7 --layer background|annotated]",
+                "export": (
+                    "NOTEBOOK --output FILE [--pages 1-3,7 --layer background|native|annotated]"
+                ),
                 "render": "NOTEBOOK --output PNG [--page N --layer LAYER --dpi N]",
                 "bundle": "NOTEBOOK --output DIR [--pages 1-3 --layer LAYER --dpi N --max-chars N]",
                 "attach-pdf": "NOTEBOOK PDF",
-                "doctor": "",
+                "doctor": "[--access-only --library PATH --scratch-dir PATH --output-dir PATH]",
                 "schema": "[COMMAND]",
             },
             "limits": {
@@ -722,11 +825,17 @@ def schema(
                 "schema COMMAND includes output field hints for row-based responses.",
                 "Notebook selectors accept an exact UUID, full path, or unique exact name.",
                 "Follow next_offset or next_page_offset; pin snapshot with --expect-snapshot.",
+                "For recent edits, sync once per request and pin its snapshot_id across reads.",
                 "Check source labels, coverage, warnings, and truncated when interpreting results.",
                 "--text indents JSON; --fields selects row fields or top-level keys.",
                 "Source files are read-only; some commands write local copies or exports.",
             ],
-            "annotations": "Native ink rendering unavailable. Annotated layers require attach-pdf.",
+            "annotations": (
+                "--layer native reconstructs supported copied pen/highlighter records with "
+                "coverage diagnostics. It requires a compatible RocksDB runtime and writable "
+                "scratch storage. Full visual fidelity is unverified. --layer annotated uses "
+                "a PDF registered with attach-pdf."
+            ),
             "exit_codes": {
                 "0": "success",
                 "1": "operation failed",
@@ -763,7 +872,9 @@ def parameter_contract(parameter: Any) -> dict[str, Any]:
 def main() -> None:
 
     try:
-        app(standalone_mode=False)
+        exit_code = app(standalone_mode=False)
+        if isinstance(exit_code, int):
+            raise SystemExit(exit_code)
     except typer.TyperException as exc:
         emit_error("invalid_arguments", exc.format_message())
         raise SystemExit(2) from None

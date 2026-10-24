@@ -74,7 +74,13 @@ jobs:
       - name: Install locked dependencies
         run: uv sync --locked --all-groups
 
+      - name: Install native annotation reader
+        if: runner.os == 'macOS'
+        run: brew install rocksdb
+
       - name: Run tests
+        env:
+          GOODNOTES_REQUIRE_NATIVE_TESTS: ${{ runner.os == 'macOS' && '1' || '0' }}
         run: uv run --locked pytest
 
   package:

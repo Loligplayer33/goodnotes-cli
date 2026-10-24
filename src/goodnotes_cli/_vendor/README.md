@@ -1,0 +1,1 @@
+These MIT licensed decoders are adapted from https://github.com/Kaih1825/parser-for-goodnotes at commit 66028455fd7fc61b7931679915d811a25485e3ad. Local changes bound decompression, protobuf fields, TPL arrays and nesting. No archive, heuristic ink, document or application integration code is included.

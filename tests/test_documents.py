@@ -13,7 +13,7 @@ import pymupdf as fitz
 import pytest
 
 from goodnotes_cli.documents import export_pdf, register_annotated_pdf, render_page
-from goodnotes_cli.errors import GoodnotesError
+from goodnotes_cli.errors import FilesystemAccessError, GoodnotesError
 from goodnotes_cli.models import Page
 from goodnotes_cli.safety import Sandbox
 
@@ -170,6 +170,62 @@ def test_export_orders_pages_and_uses_each_pages_attachment(tmp_path: Path) -> N
     assert result["includes_handwriting"] is False
     assert result["layer"] == "background"
     assert result["warnings"]
+
+
+def test_missing_annotated_registration_does_not_create_sidecar(tmp_path: Path) -> None:
+    sandbox = FakeSandbox(tmp_path / "snapshot")
+    sandbox.add_notebook("generated-notebook", 1)
+    _make_pdf(sandbox.attachments_dir / "background.pdf", ["Generated background"])
+    page = _page("generated-page", 1, "background.pdf", document_id="generated-notebook")
+    before = {path.relative_to(tmp_path) for path in tmp_path.rglob("*")}
+    with pytest.raises(GoodnotesError, match="No annotated PDF is registered"):
+        render_page(sandbox, page, Path("missing.png"), layer="annotated")
+    assert {path.relative_to(tmp_path) for path in tmp_path.rglob("*")} == before
+
+
+def test_registry_stat_permission_failure_has_details(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from goodnotes_cli.documents import _read_registry
+
+    path = tmp_path / "denied.json"
+    original_lstat = Path.lstat
+
+    def denied(target: Path) -> os.stat_result:
+        if target == path:
+            raise PermissionError(13, "denied by generated fixture", str(target))
+        return original_lstat(target)
+
+    monkeypatch.setattr(Path, "lstat", denied)
+    with pytest.raises(FilesystemAccessError) as captured:
+        _read_registry(path, "generated-notebook")
+    assert captured.value.code == "source_permission_denied"
+    assert captured.value.details["operation"] == "read_annotated_pdf_record"
+    assert captured.value.details["path"] == str(path)
+
+
+def test_registry_parent_permission_failure_has_details(tmp_path: Path) -> None:
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        pytest.skip("A root process can traverse despite directory mode bits")
+    sandbox = FakeSandbox(tmp_path / "snapshot")
+    sandbox.add_notebook("generated-notebook", 1)
+    parent = tmp_path / ".goodnotes-cli"
+    parent.mkdir(mode=0o700)
+    parent.chmod(0)
+    try:
+        with pytest.raises(FilesystemAccessError) as captured:
+            render_page(
+                sandbox,
+                _page("generated-page", 1, None, document_id="generated-notebook"),
+                Path("denied.png"),
+                layer="annotated",
+            )
+    finally:
+        parent.chmod(0o700)
+    assert captured.value.code == "source_permission_denied"
+    assert captured.value.details["operation"] == "read_annotated_pdf_record"
+    assert Path(captured.value.details["path"]).is_relative_to(parent)
+    assert list(parent.iterdir()) == []
 
 
 def test_export_selects_reversed_noncontiguous_pages_from_mixed_attachments(

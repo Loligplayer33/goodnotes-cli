@@ -62,6 +62,105 @@ def successful(result: subprocess.CompletedProcess[str]) -> dict:
     return json.loads(result.stdout)
 
 
+def test_watch_runs_as_json_lines_and_leaves_unchanged_checks_quiet(
+    library_copy: Path, tmp_path: Path
+) -> None:
+    before = _tree_manifest(library_copy)
+    result = invoke(
+        [
+            "watch",
+            "--library",
+            str(library_copy / "Library"),
+            "--interval",
+            "0.05",
+            "--debounce",
+            "0",
+            "--iterations",
+            "3",
+        ],
+        tmp_path,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == ""
+    events = [json.loads(line) for line in result.stdout.splitlines()]
+    assert len(events) == 1
+    assert events[0]["event"] == "ready"
+    assert events[0]["iteration"] == 1
+    assert events[0]["captured_at"]
+    assert events[0]["capture_stats"]["source_captured_files"] > 0
+    assert _tree_manifest(library_copy) == before
+    assert len(list((tmp_path / "state" / "snapshots").glob("20*"))) == 1
+
+
+@pytest.mark.parametrize("command", ["sync", "watch"])
+def test_refresh_rejects_global_sandbox_instead_of_selecting_default_source(
+    command: str, library_copy: Path, tmp_path: Path
+) -> None:
+    response = invoke([command], tmp_path, sandbox=library_copy)
+    assert response.returncode == 1
+    assert response.stdout == ""
+    assert "omit the global --sandbox" in json.loads(response.stderr)["error"]["message"]
+    assert not (tmp_path / "state").exists()
+
+
+def test_doctor_access_only_reports_uninitialized_cache_without_creating_it(tmp_path: Path) -> None:
+    response = successful(invoke(["doctor", "--access-only"], tmp_path))
+    assert response["scope"] == "filesystem-access"
+    assert response["status"] == "issues"
+    assert not (tmp_path / "state").exists()
+
+
+def test_doctor_access_only_honors_explicit_sandbox(library_copy: Path, tmp_path: Path) -> None:
+    before = _tree_manifest(library_copy)
+    response = successful(invoke(["doctor", "--access-only"], tmp_path, sandbox=library_copy))
+    assert response["sandbox"] == str(library_copy)
+    assert response["cache_dir"] is None
+    assert not (tmp_path / "state").exists()
+    assert _tree_manifest(library_copy) == before
+
+
+def test_doctor_access_paths_require_access_only(tmp_path: Path) -> None:
+    response = invoke(["doctor", "--library", str(tmp_path / "source")], tmp_path)
+    assert response.returncode == 1
+    assert "require --access-only" in json.loads(response.stderr)["error"]["message"]
+
+
+def test_bounded_watch_ending_in_error_exits_unsuccessfully(tmp_path: Path) -> None:
+    response = invoke(
+        ["watch", "--library", str(tmp_path / "missing-source"), "--iterations", "1"],
+        tmp_path,
+    )
+    assert response.returncode == 1
+    assert response.stderr == ""
+    event = json.loads(response.stdout)
+    assert event["event"] == "error"
+    assert event["error"]["message"]
+
+
+def test_bundle_output_permission_error_retains_operation_and_path(
+    library_copy: Path, tmp_path: Path
+) -> None:
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        pytest.skip("A root process can write despite directory mode bits")
+    parent = tmp_path / "denied-output"
+    parent.mkdir(mode=0o700)
+    parent.chmod(0o500)
+    try:
+        response = invoke(
+            ["bundle", "doc-hostile", "--output", str(parent / "bundle")],
+            tmp_path,
+            sandbox=library_copy,
+        )
+    finally:
+        parent.chmod(0o700)
+    assert response.returncode == 1
+    error = json.loads(response.stderr)["error"]
+    assert error["code"] == "output_permission_denied"
+    assert error["details"]["operation"] == "write_bundle_output"
+    assert Path(error["details"]["path"]).is_relative_to(parent)
+    assert not list(parent.iterdir())
+
+
 def _tree_manifest(root: Path) -> tuple[tuple[object, ...], ...]:
     entries: list[tuple[object, ...]] = []
     paths = [root, *sorted(root.rglob("*"))]

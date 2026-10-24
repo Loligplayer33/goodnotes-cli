@@ -14,6 +14,7 @@ Use `uv run goodnotes --help` for the command index, `uv run goodnotes COMMAND -
 | Command | Use |
 | --- | --- |
 | [sync](#sync) | Refresh the managed local read view. |
+| [watch](#watch) | Refresh the copy automatically while a foreground process runs. |
 | [snapshot](#snapshot) | Create a separate named copy of a Library directory. |
 | [ls](#ls) | List a folder's direct children. |
 | [tree](#tree) | List descendants within a depth and result limit. |
@@ -68,6 +69,25 @@ goodnotes sync [--library PATH] [--force | --no-force]
 | `--force` / `--no-force` | `--no-force` | Capture and validate a fresh generation even when inventory checks match. |
 
 Refreshes the active managed copy and removes superseded managed generations after readers finish. It reads source Library files but does not open source SQLite databases, control Goodnotes, or write to the source library. The result includes `status` (`ready` or `unchanged`), `snapshot` (the generation path), `snapshot_id` (the generation ID), `checked_at`, `source_changed_during_refresh`, and, when available, `captured_at` and `warnings`. A true `source_changed_during_refresh` means the published copy is valid as of `captured_at`; it does not promise that the source stayed unchanged until the command returned.
+
+`capture_stats` reports logical file and byte counts for captured, reused, cloned, copied, and hashed data. Unchanged files can reuse a prior verified digest when both source and cached-file metadata match. A clone shares storage blocks but has an independent file identity; byte counts do not measure physical disk allocation. `--force` bypasses reuse. Sync includes the optional `notes_main.db` native store and its WAL files. Do not combine `sync` with the global `--sandbox` option; choose the source with `--library`.
+
+### watch
+
+```text
+goodnotes watch [--library PATH] [--interval SECONDS] [--debounce SECONDS] [--iterations N]
+```
+
+| Option | Default | Bounds or effect |
+| --- | --- | --- |
+| `--library PATH` | Same discovery as `sync` | Source Library directory; excludes global `--sandbox`. |
+| `--interval SECONDS` | `2` | `0.05` to `3600` seconds between metadata checks |
+| `--debounce SECONDS` | `1` | `0` to `60` seconds to coalesce edits before capture |
+| `--iterations N` | Unset | Stop after `N` polling iterations, at least `1`; otherwise run until interrupted. |
+
+Runs serial copied-data refreshes. Compact output is one JSON object per event: `ready`, `updated`, `recovered`, or `error`. Unchanged checks after startup emit nothing. Success events contain the sync result plus `event` and `iteration`; error events contain structured `error` details and `retry_in_seconds`. Transient failures leave the prior copy selected and retry with backoff. If a bounded run ends with an unrecovered error, it exits `1`; Ctrl-C exits `130`. With `--text`, each event is indented across multiple lines.
+
+Watch checks files on the Mac. It does not confirm that the latest iPad edit has reached Goodnotes on this Mac, and it does not start a background service after the command exits.
 
 ### snapshot
 
@@ -185,9 +205,9 @@ goodnotes export NOTEBOOK --output FILE [--pages EXPR] [--layer LAYER]
 | --- | --- | --- |
 | `--output FILE` | Required | New `.pdf` path |
 | `--pages EXPR` | All pages | Distinct one-based page numbers; preserves listed order, with no 20-page cap |
-| `--layer LAYER` | `background` | `background` or `annotated` |
+| `--layer LAYER` | `background` | `background`, `native`, or `annotated` |
 
-Exports all active notebook pages in current order when `--pages` is omitted. For example, `--pages 1-3,7` exports those pages in that listed order. The result includes the output path, `pages` count, `selected_pages`, source, `includes_handwriting`, `annotation_status`, and warnings. The background layer contains PDF page backgrounds and does not overlay native Goodnotes ink. The annotated layer requires a PDF registered with [attach-pdf](#attach-pdf); registration cannot verify whether annotations were included or whether page order matches. Existing output paths are never overwritten; outputs must be outside the snapshot and production Goodnotes locations.
+Exports all active notebook pages in current order when `--pages` is omitted. For example, `--pages 1-3,7` exports those pages in that listed order. The result includes the output path, `pages` count, `selected_pages`, source, `includes_handwriting`, `annotation_status`, and warnings. The background layer does not overlay native Goodnotes ink. The native layer reconstructs supported objects from the copied native store and reports coverage; it never silently substitutes background-only output when native data is unavailable. See [native ink](pdf-and-handwriting.md#native-ink-without-manual-pdf-exports) for setup and limitations. The annotated layer requires a PDF registered with [attach-pdf](#attach-pdf); registration cannot verify annotation inclusion or page order. Existing output paths are never overwritten; outputs must be outside the snapshot and production Goodnotes locations.
 
 ### render
 
@@ -199,7 +219,7 @@ goodnotes render NOTEBOOK --output PNG [--page N] [--layer LAYER] [--dpi N]
 | --- | --- | --- |
 | `--output PNG` | Required | New `.png` path |
 | `--page N` | `1` | `1` or greater, within the notebook |
-| `--layer LAYER` | `background` | `background` or `annotated` |
+| `--layer LAYER` | `background` | `background`, `native`, or `annotated` |
 | `--dpi N` | `150` | `72` to `300` |
 
 Renders one page for visual inspection. Returns the output path, notebook and page IDs, source page, layer, DPI, annotation status, and warnings. Output-path and annotation limits are the same as [export](#export).
@@ -222,7 +242,7 @@ goodnotes bundle NOTEBOOK --output DIR [--pages EXPR] [--layer LAYER] [--dpi N] 
 | --- | --- | --- |
 | `--output DIR` | Required | New directory |
 | `--pages EXPR` | `1` | Up to 10 distinct pages, for example `1-3,7` |
-| `--layer LAYER` | `background` | `background` or `annotated` |
+| `--layer LAYER` | `background` | `background`, `native`, or `annotated` |
 | `--dpi N` | `150` | `72` to `300` |
 | `--max-chars N` | `12000` | `1` to `1000000` characters across all selected pages |
 
@@ -231,12 +251,14 @@ Creates `page-NNNN.png` files and `text.json` in the new directory. The result r
 ### doctor
 
 ```text
-goodnotes doctor
+goodnotes doctor [--access-only] [--library PATH] [--scratch-dir PATH] [--output-dir PATH]
 ```
 
 Reports active and deleted item counts, tree consistency issues, search-index availability, available content tables, page-metadata gaps, and warnings for the selected read view. It does not refresh the source library.
 
 `storage` contains the resolved managed `cache_dir`, selected `snapshot_path`, and `captured_at` from the snapshot marker. `cache_dir` is `null` for a caller-owned named snapshot; `captured_at` is `null` when an older marker has no capture time. The result also retains the generation ID as `snapshot`.
+
+`--access-only` checks filesystem access without opening a database or writing files. It works before cache initialization and honors global `--data-dir` or `--sandbox`. The other three options require `--access-only`: `--library` checks an explicitly selected source, `--scratch-dir` selects the native scratch directory, and `--output-dir` checks an output directory. The result separates checks with `ok`, `missing`, `denied`, or `invalid` status and includes remedies. Write-access hints do not prove that an actual write will succeed. Doctor does not change permissions, create locks, or repair a cache.
 
 ### schema
 
@@ -248,6 +270,6 @@ Prints the command contract without loading notebook data. With no command, it r
 
 ## Output, errors, and pagination
 
-Successful commands that return data write one JSON value to stdout. Compact JSON is the default; `--text` indents it. Help and version output are plain text. Expected runtime errors write `{"error":{"code":"...","message":"..."}}` to stderr and exit `1`. Errors may include `details` with recovery context; unavailable-index search errors include scoped coverage and PDF fallback guidance. Invalid command syntax or parser-checked option bounds exit `2` with `invalid_arguments`; application-checked values such as an invalid page expression are runtime errors and exit `1`. Keyboard interruption or a broken pipe exits `130`.
+Successful commands that return data write one JSON value to stdout. `watch` emits a sequence of event objects. Compact JSON is the default; `--text` indents it. Help and version output are plain text. Expected runtime errors write `{"error":{"code":"...","message":"..."}}` to stderr and exit `1`; watcher retry errors are events on stdout. Errors may include `details` with recovery context; unavailable-index search errors include scoped coverage and PDF fallback guidance. Invalid command syntax or parser-checked option bounds exit `2` with `invalid_arguments`; application-checked values such as an invalid page expression are runtime errors and exit `1`. Keyboard interruption or a broken pipe exits `130`.
 
 Cache-backed commands include the read-view generation ID as `snapshot`. For `ls`, `tree`, `pages`, and `search`, pass `next_offset` as the next `--offset`. For `scan-pdfs`, pass `next_page_offset` as the next `--page-offset`. Include the same generation ID with global `--expect-snapshot ID` on every request in a multi-call sequence. If the command returns `stale_snapshot`, restart the sequence against the new view; do not combine results from different generations. The `snapshot` field from `sync` is a filesystem path; use its `snapshot_id` field for the generation ID. The standalone `snapshot` command's `snapshot` field is also a destination path.

@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from .errors import CacheAccessError, GoodnotesError
+from .errors import CacheAccessError, FilesystemAccessError, GoodnotesError, _permission_denied
 
 SNAPSHOT_MARKER = "goodnotes-snapshot.json"
 _SQLITE_SIDECAR_PREFIX = "-"
@@ -82,6 +82,22 @@ class Sandbox:
 
     @classmethod
     def load(cls, path: str | Path) -> Sandbox:
+        try:
+            return cls._load(path)
+        except CacheAccessError:
+            raise
+        except (OSError, GoodnotesError) as exc:
+            if not _permission_denied(exc):
+                raise
+            raise CacheAccessError.from_exception(
+                exc,
+                f"Could not read the selected snapshot: {path}",
+                operation="resolve_read_view",
+                path=Path(path).expanduser(),
+            ) from exc
+
+    @classmethod
+    def _load(cls, path: str | Path) -> Sandbox:
         requested_root = Path(path).expanduser()
         if requested_root.is_symlink():
             raise GoodnotesError("The snapshot root must not be a symlink.")
@@ -156,6 +172,23 @@ def safe_output(
 ) -> Path:
     """Validate a new output path, including paths reached through symlinked parents."""
 
+    try:
+        return _safe_output(path, sandbox, inputs=inputs)
+    except OSError as exc:
+        if not _permission_denied(exc):
+            raise
+        raise FilesystemAccessError.from_exception(
+            exc, operation="validate_output", path=path, kind="output"
+        ) from exc
+
+
+def _safe_output(
+    path: str | Path,
+    sandbox: Sandbox,
+    *,
+    inputs: tuple[str | Path, ...] | list[str | Path] = (),
+) -> Path:
+
     requested = Path(path).expanduser()
     resolved = _resolved(requested)
     for candidate in (requested.absolute(), resolved):
@@ -223,6 +256,27 @@ def _check_database_read_access(path: Path) -> None:
 def open_database(path: str | Path) -> Iterator[sqlite3.Connection]:
     """Open a snapshot SQLite file in immutable read-only mode."""
 
+    try:
+        connection = _open_database(path)
+    except CacheAccessError:
+        raise
+    except (OSError, GoodnotesError) as exc:
+        if not _permission_denied(exc):
+            raise
+        raise CacheAccessError.from_exception(
+            exc,
+            f"Could not read snapshot database: {path}",
+            operation="open_snapshot_database",
+            path=Path(path).expanduser(),
+        ) from exc
+    try:
+        yield connection
+    finally:
+        connection.close()
+
+
+def _open_database(path: str | Path) -> sqlite3.Connection:
+
     database_path = Path(path).expanduser()
     if database_path.is_symlink():
         raise GoodnotesError(f"Refusing to open a symlinked SQLite database: {database_path}")
@@ -254,7 +308,4 @@ def open_database(path: str | Path) -> Iterator[sqlite3.Connection]:
             path=absolute_path,
         ) from exc
     assert connection is not None
-    try:
-        yield connection
-    finally:
-        connection.close()
+    return connection

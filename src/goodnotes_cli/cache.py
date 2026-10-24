@@ -15,7 +15,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
-from .errors import CacheAccessError, GoodnotesError, StaleSnapshotError, _os_cause
+from .errors import (
+    CacheAccessError,
+    FilesystemAccessError,
+    GoodnotesError,
+    StaleSnapshotError,
+    _os_cause,
+    _permission_denied,
+)
 from .safety import (
     SNAPSHOT_MARKER,
     Sandbox,
@@ -35,6 +42,7 @@ _STAGING = re.compile(r"^\.staging-[0-9a-f]{32}$")
 _SIDECAR_KEY = re.compile(r"^[0-9a-f]{24}$")
 _DATABASES = ("projection.sqlite", "fts.sqlite")
 _DATABASE_SIDECARS = ("-wal", "-shm", "-journal")
+_NATIVE_STORES = ("notes_main.db",)
 
 
 def _stat_key(info: os.stat_result) -> tuple[int, int, int, int, int, int]:
@@ -433,6 +441,9 @@ def _input_signature(source: Path, *, include_root: bool = False) -> str:
             raise GoodnotesError(f"Source directory changed while it was inspected: {directory}")
 
     scan(attachments_dir, Path("Attachments"))
+    for name in _NATIVE_STORES:
+        if name in names:
+            scan(database_dir / name, Path("Databases") / name)
     for path, expected_key in paths_to_recheck:
         if _stat_key(_lstat(path)) != expected_key:
             raise GoodnotesError(f"Snapshot input changed while it was fingerprinted: {path}")
@@ -455,6 +466,45 @@ def _snapshot_captured_at(root: Path) -> str:
     if not isinstance(value, str):
         raise GoodnotesError(f"Snapshot marker has no capture time: {marker}")
     return value
+
+
+def _snapshot_capture_stats(root: Path, *, unchanged: bool = False) -> dict[str, Any]:
+    marker = root / SNAPSHOT_MARKER
+    try:
+        data = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise GoodnotesError(f"Could not read snapshot capture statistics: {marker}") from exc
+    stats = data.get("capture_stats", {}) if isinstance(data, dict) else {}
+    result = dict(stats) if isinstance(stats, dict) else {}
+    if unchanged:
+        result["scope"] = "unchanged"
+        for name in (
+            "source_captured_files",
+            "source_captured_bytes",
+            "cache_reused_files",
+            "cache_reused_bytes",
+            "source_bytes_hashed",
+            "cloned_files",
+            "cloned_logical_bytes",
+            "byte_copied_files",
+            "byte_copied_bytes",
+        ):
+            result[name] = 0
+        result["attempts"] = 0
+        result["capture_seconds"] = 0.0
+        result["bytes_are_logical"] = True
+    return result
+
+
+def _source_input_signature(source: Path) -> str:
+    try:
+        return _input_signature(source)
+    except (GoodnotesError, OSError) as exc:
+        if _permission_denied(exc):
+            raise FilesystemAccessError.from_exception(
+                exc, operation="inventory_source_library", path=source, kind="source"
+            ) from exc
+        raise
 
 
 def _write_json_atomic(state: Path, name: str, data: dict[str, Any]) -> None:
@@ -705,6 +755,7 @@ def _result(
     captured_at: str | None,
     warnings: list[str] | None = None,
     source_changed_during_refresh: bool = False,
+    capture_stats: dict[str, Any] | None = None,
 ) -> dict[str, object]:
     result: dict[str, object] = {
         "status": status,
@@ -715,6 +766,8 @@ def _result(
     if captured_at is not None:
         result["captured_at"] = captured_at
     result["source_changed_during_refresh"] = source_changed_during_refresh
+    if capture_stats is not None:
+        result["capture_stats"] = capture_stats
     final_warnings = list(warnings or [])
     if source_changed_during_refresh:
         final_warnings.append(
@@ -732,15 +785,26 @@ def refresh_cache(
     """Capture or reuse one immutable snapshot and atomically publish it as active."""
 
     requested_source = Path(source_library).expanduser()
-    if requested_source.is_symlink():
-        raise GoodnotesError("The source Library directory must not be a symlink.")
     try:
+        if requested_source.is_symlink():
+            raise GoodnotesError("The source Library directory must not be a symlink.")
         source = requested_source.resolve(strict=True)
     except OSError as exc:
+        if _permission_denied(exc):
+            raise FilesystemAccessError.from_exception(
+                exc, operation="resolve_source_library", path=requested_source, kind="source"
+            ) from exc
         raise GoodnotesError(
             f"Source Library directory does not exist: {requested_source}"
         ) from exc
-    _require_directory(source, purpose="Source Library path")
+    try:
+        _require_directory(source, purpose="Source Library path")
+    except (GoodnotesError, OSError) as exc:
+        if _permission_denied(exc):
+            raise FilesystemAccessError.from_exception(
+                exc, operation="inspect_source_library", path=source, kind="source"
+            ) from exc
+        raise
     requested_data_dir = Path(data_dir).expanduser()
     try:
         state, snapshots = _prepare_state(requested_data_dir, source)
@@ -762,7 +826,7 @@ def refresh_cache(
         _validate_generated_snapshots(snapshots)
         with _file_lock(state / _VIEW_LOCK, exclusive=False):
             active = _load_active(state, snapshots)
-        source_signature = _input_signature(source)
+        source_signature = _source_input_signature(source)
 
         # Refreshes serialize on .sync.lock. The shared view lock protects pointer resolution
         # while allowing existing readers to continue during the source capture.
@@ -807,6 +871,7 @@ def refresh_cache(
                         checked_at=checked_at,
                         captured_at=captured_at if isinstance(captured_at, str) else None,
                         warnings=cleanup_warnings,
+                        capture_stats=_snapshot_capture_stats(root, unchanged=True),
                     )
 
         checked_at = _timestamp()
@@ -819,7 +884,18 @@ def refresh_cache(
 
         published = False
         try:
-            create_snapshot(source, staging)
+            previous_snapshot = (
+                active[1]
+                if not force
+                and active is not None
+                and active[2] is not None
+                and active[0].get("source_path") == str(source)
+                else None
+            )
+            if previous_snapshot is None:
+                create_snapshot(source, staging)
+            else:
+                create_snapshot(source, staging, previous_snapshot=previous_snapshot)
             sandbox = Sandbox.load(staging)
             if destination.exists() or destination.is_symlink():
                 raise GoodnotesError(f"Refusing to overwrite a cache generation: {destination}")
@@ -827,7 +903,7 @@ def refresh_cache(
             sandbox = Sandbox.load(destination)
             cache_signature = _input_signature(sandbox.library_dir, include_root=True)
             captured_at = _snapshot_captured_at(destination)
-            signature_after = _input_signature(source)
+            signature_after = _source_input_signature(source)
             source_changed_during_refresh = signature_after != source_signature
             saved_signature = None if source_changed_during_refresh else source_signature
             pointer_data: dict[str, Any] = {
@@ -886,6 +962,7 @@ def refresh_cache(
             captured_at=captured_at,
             warnings=cleanup_warnings,
             source_changed_during_refresh=source_changed_during_refresh,
+            capture_stats=_snapshot_capture_stats(sandbox.root),
         )
 
 

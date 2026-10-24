@@ -1,10 +1,12 @@
+import errno
 import json
 import sqlite3
+from contextlib import ExitStack
 from pathlib import Path
 
 import pytest
 
-from goodnotes_cli.errors import GoodnotesError
+from goodnotes_cli.errors import CacheAccessError, FilesystemAccessError, GoodnotesError
 from goodnotes_cli.safety import Sandbox, open_database, safe_output
 
 
@@ -176,3 +178,98 @@ def test_safe_output_rejects_input_overlap(tmp_path: Path) -> None:
         safe_output(input_file, sandbox, inputs=[input_file])
     with pytest.raises(GoodnotesError, match="overlap any input"):
         safe_output(input_dir / "export.pdf", sandbox, inputs=[input_dir])
+
+
+def test_snapshot_marker_permission_error_is_structured_even_for_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "snapshot"
+    make_snapshot(root)
+    marker = root / "goodnotes-snapshot.json"
+    original_read = Path.read_text
+
+    def denied_read(path: Path, *args: object, **kwargs: object) -> str:
+        if path == marker:
+            raise PermissionError(errno.EACCES, "generated marker denial", str(marker))
+        return original_read(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "read_text", denied_read)
+    with pytest.raises(CacheAccessError) as caught:
+        Sandbox.load(root)
+    assert caught.value.code == "cache_permission_denied"
+    assert caught.value.details["operation"] == "resolve_read_view"
+    assert caught.value.details["path"] == str(marker)
+
+
+def test_database_sidecar_inspection_permission_error_is_structured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sandbox = make_snapshot(tmp_path / "snapshot")
+    database_dir = sandbox.projection_path.parent
+    original_iterdir = Path.iterdir
+
+    def denied_iterdir(path: Path):
+        if path == database_dir:
+            raise PermissionError(errno.EPERM, "generated directory denial", str(database_dir))
+        return original_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", denied_iterdir)
+    with pytest.raises(CacheAccessError) as caught:
+        with open_database(sandbox.projection_path):
+            pass
+    assert caught.value.code == "cache_permission_denied"
+    assert caught.value.details["operation"] == "open_snapshot_database"
+    assert caught.value.details["path"] == str(database_dir)
+
+
+def test_output_validation_permission_error_is_structured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sandbox = make_snapshot(tmp_path / "snapshot")
+    destination = tmp_path / "output.png"
+    original_resolve = Path.resolve
+
+    def denied_resolve(path: Path, *args: object, **kwargs: object) -> Path:
+        if path == destination:
+            raise PermissionError(errno.EACCES, "generated output denial", str(destination))
+        return original_resolve(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "resolve", denied_resolve)
+    with pytest.raises(FilesystemAccessError) as caught:
+        safe_output(destination, sandbox)
+    assert caught.value.code == "output_permission_denied"
+    assert caught.value.details["operation"] == "validate_output"
+    assert caught.value.details["path"] == str(destination)
+
+
+@pytest.mark.parametrize("structured", [False, True])
+def test_open_database_preserves_caller_output_permission_errors(
+    tmp_path: Path, structured: bool
+) -> None:
+    sandbox = make_snapshot(tmp_path / "snapshot")
+    output_path = tmp_path / "output.png"
+    underlying = PermissionError(errno.EACCES, "generated output denial", str(output_path))
+    error: PermissionError | FilesystemAccessError = underlying
+    if structured:
+        error = FilesystemAccessError.from_exception(
+            underlying,
+            operation="publish_output",
+            path=output_path,
+            kind="output",
+        )
+        error.__cause__ = underlying
+
+    with pytest.raises(type(error)) as caught:
+        with ExitStack() as stack:
+            first = stack.enter_context(open_database(sandbox.projection_path))
+            second = stack.enter_context(open_database(sandbox.projection_path))
+            raise error
+
+    assert caught.value is error
+    if structured:
+        assert isinstance(caught.value, FilesystemAccessError)
+        assert caught.value.code == "output_permission_denied"
+        assert caught.value.details["operation"] == "publish_output"
+    for connection in (first, second):
+        with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+            connection.execute("SELECT 1")
