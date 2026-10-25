@@ -210,7 +210,7 @@ goodnotes export NOTEBOOK --output FILE [--pages EXPR] [--layer LAYER]
 | `--pages EXPR` | All pages | Distinct one-based page numbers; preserves listed order, with no 20-page cap |
 | `--layer LAYER` | `background` | `background`, `native`, or `annotated` |
 
-Exports all active notebook pages in current order when `--pages` is omitted. For example, `--pages 1-3,7` exports those pages in that listed order. The result includes the output path, `pages` count, `selected_pages`, source, `includes_handwriting`, `annotation_status`, and warnings. The background layer does not overlay native Goodnotes ink. The native layer reconstructs supported objects from the copied native store and reports coverage; it never silently substitutes background-only output when native data is unavailable. See [native ink](pdf-and-handwriting.md#native-ink-without-manual-pdf-exports) for setup and limitations. The annotated layer requires a PDF registered with [attach-pdf](#attach-pdf); registration cannot verify annotation inclusion or page order. Existing output paths are never overwritten; outputs must be outside the snapshot and production Goodnotes locations.
+Exports all active notebook pages in current order when `--pages` is omitted. For example, `--pages 1-3,7` exports those pages in that listed order. The result includes the output path, `pages` count, `selected_pages`, source, `includes_handwriting`, `annotation_status`, and warnings. Native output also reports stroke, filled-path, and image counts; images do not count as handwriting. The background layer does not overlay native Goodnotes ink. The native layer reconstructs supported objects from the copied native store and reports coverage; it never silently substitutes background-only output when native data is unavailable. See [native ink](pdf-and-handwriting.md#native-ink-without-manual-pdf-exports) for setup and limitations. The annotated layer requires a PDF registered with [attach-pdf](#attach-pdf); registration cannot verify annotation inclusion or page order. Existing output paths are never overwritten; outputs must be outside the snapshot and production Goodnotes locations.
 
 ### render
 
@@ -225,7 +225,7 @@ goodnotes render NOTEBOOK [--output PNG] [--page N] [--layer LAYER] [--dpi N]
 | `--layer LAYER` | `background` | `background`, `native`, or `annotated` |
 | `--dpi N` | `150` | `72` to `300` |
 
-Renders one page for visual inspection. Returns the output path, notebook and page IDs, source page, layer, DPI, annotation status, and warnings. Without `--output`, the response includes `temporary: true` and follows the [artifact retention policy](#artifact-retention). Explicit output-path and annotation limits are the same as [export](#export).
+Renders one page for visual inspection. Returns the output path, notebook and page IDs, source page, layer, DPI, annotation status, and warnings. Native output also includes a `native_annotations` summary with separate `rendered_strokes`, `rendered_paths`, and `rendered_images` counts. Native images do not count as handwriting. Without `--output`, the response includes `temporary: true` and follows the [artifact retention policy](#artifact-retention). Explicit output-path and annotation limits are the same as [export](#export).
 
 ### attach-pdf
 
@@ -250,7 +250,7 @@ goodnotes bundle NOTEBOOK [--output DIR] [--pages EXPR] [--source SOURCE] [--lay
 | `--dpi N` | `150` | `72` to `300` |
 | `--max-chars N` | `12000` | `1` to `1000000` characters across all selected pages |
 
-Creates `page-NNNN.png` files and `text.json` in a managed temporary directory, or the new persistent directory supplied through `--output`. By default, it returns concise `page_evidence` with native annotated images and PDF text, plus the manifest path, selected pages, layer, text source, truncation status, capture time, and active read-view `snapshot` ID. Managed responses include `temporary: true`. Native cache misses require the optional runtime and copied store; a previously verified cached image can be reused without opening the engine. Missing or unsafe native data remains an error, and the CLI never silently substitutes a clean background. Explicit destinations are not overwritten; outputs must be outside the snapshot and production Goodnotes locations.
+Creates `page-NNNN.png` files and `text.json` in a managed temporary directory, or the new persistent directory supplied through `--output`. By default, it returns concise `page_evidence` with native annotated images and PDF text, plus the manifest path, selected pages, layer, text source, truncation status, capture time, and active read-view `snapshot` ID. Native evidence includes separate stroke, filled-path, and image counts; images do not count as handwriting. Managed responses include `temporary: true`. Native cache misses require the optional runtime and copied store; a previously verified cached image can be reused without opening the engine. Missing or unsafe native data remains an error, and the CLI never silently substitutes a clean background. Explicit destinations are not overwritten; outputs must be outside the snapshot and production Goodnotes locations.
 
 ### Artifact retention
 

@@ -11,7 +11,7 @@ Live library discovery is for macOS. On Linux, point `sync --library` at an avai
 | Browse notebooks and pages | Yes | Reads the last synced copy. Run `watch` to refresh it automatically as files change on the Mac. |
 | Search and read text | Yes | `search` checks the stored text index. `read` returns PDF text, stored handwriting recognition candidates, and typed text. Use `scan-pdfs` explicitly for copied PDF backgrounds. The CLI does not OCR images. |
 | View and export page backgrounds | Yes | Uses each page's PDF or image background. Native Goodnotes ink is not included. |
-| View and export native ink | Experimental | `--layer native` reconstructs supported pen and highlight objects from the copied native store. Check its coverage and warnings; complete Goodnotes rendering is not established. Requires a compatible RocksDB runtime. |
+| View and export native annotations | Partial | `--layer native` reconstructs observed pens, highlights, filled paths, variable-width pencil strokes, and some linked PNG/JPEG images. Brush texture and other unmodeled details remain approximate; full Goodnotes fidelity is not verified. Requires a compatible RocksDB runtime. |
 | Use a Goodnotes-exported PDF | Yes | Register it with `attach-pdf` for `--layer annotated`. The CLI cannot verify annotation inclusion or page order. |
 | Edit Goodnotes notebooks | No | The CLI does not write to the Goodnotes library. |
 
@@ -76,7 +76,7 @@ You need macOS or Linux, Python 3.11 or newer, and [`uv`](https://docs.astral.sh
 
 After sync, browse and read commands need only read access to the cache. An agent can use that copy without access to the live Goodnotes library. `doctor` reports its location and capture time. See [restricted agent setup](docs/usage.md#read-access-for-an-agent) for permissions and custom cache locations.
 
-For recent notes, have the agent sync once at the start of each request. Once [native rendering is set up](docs/pdf-and-handwriting.md#native-ink-without-manual-pdf-exports), one bundle provides actual pen annotations and slide text:
+For recent notes, have the agent sync once at the start of each request. Once [native rendering is set up](docs/pdf-and-handwriting.md#native-ink-without-manual-pdf-exports), one bundle provides supported native annotations and slide text:
 
 ```sh
 uv run goodnotes bundle "Notebook name" --pages 3

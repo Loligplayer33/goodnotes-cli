@@ -698,6 +698,48 @@ def test_annotated_batch_detects_midbatch_mutation_without_rehashing(
     assert source_docs[0].is_closed
 
 
+@pytest.mark.parametrize("operation", ["render", "export"])
+def test_native_nonstroke_overlay_is_composited(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    from goodnotes_cli.annotations import NativeOverlay
+
+    sandbox = FakeSandbox(tmp_path / "sandbox")
+    _make_pdf(sandbox.attachments_dir / "background.pdf", ["background"])
+    page = _page(str(uuid4()), 1, "background.pdf")
+
+    class FakeSession:
+        def __init__(self, _sandbox: Any) -> None:
+            pass
+
+        def __enter__(self) -> FakeSession:
+            return self
+
+        def __exit__(self, *_args: object) -> Literal[False]:
+            return False
+
+        def read_page_records(self, _root_uuid: str) -> list[tuple[bytes, bytes]]:
+            return []
+
+    def fake_overlay(*_args: Any, **_kwargs: Any) -> NativeOverlay:
+        return NativeOverlay(
+            b'<svg xmlns="http://www.w3.org/2000/svg" width="612pt" height="792pt" '
+            b'viewBox="0 0 612 792"><rect x="40" y="40" width="80" height="80" '
+            b'fill="#ff0000"/></svg>',
+            {"rendered_objects": 1, "rendered_strokes": 0, "warnings": []},
+        )
+
+    monkeypatch.setattr("goodnotes_cli.native.NativeStoreSession", FakeSession)
+    monkeypatch.setattr("goodnotes_cli.annotations.render_native_overlay", fake_overlay)
+    if operation == "render":
+        result = render_page(sandbox, page, Path("native.png"), layer="native", dpi=72)
+    else:
+        result = export_pdf(sandbox, [page], Path("native.pdf"), layer="native")
+    with fitz.open(result["path"]) as rendered:
+        assert rendered[0].get_pixmap(dpi=72).pixel(80, 80) == (255, 0, 0)
+    assert result["includes_handwriting"] is False
+
+
 def test_render_pages_uses_one_native_store_session(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

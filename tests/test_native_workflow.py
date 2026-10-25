@@ -14,6 +14,7 @@ import struct
 import subprocess
 import sys
 import time
+import zlib
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,9 @@ LOGICAL_IDS = (
     "00000000-0000-4000-8000-000000000500",
     "00000000-0000-4000-8000-000000000600",
 )
+IMAGE_LOGICAL_ID = "00000000-0000-4000-8000-000000000700"
+IMAGE_RESOURCE_ID = "00000000-0000-4000-8000-000000000800"
+IMAGE_ATTACHMENT_ID = "00000000-0000-4000-8000-000000000900"
 
 
 def _varint(value: int) -> bytes:
@@ -60,6 +64,66 @@ def _field(number: int, value: bytes | int) -> bytes:
 
 def _fixed(number: int, value: float) -> bytes:
     return _varint(number * 8 + 5) + struct.pack("<f", value)
+
+
+def _native_image(page: int, *, sequence: int = 2) -> dict[bytes, bytes]:
+    def point(x: float, y: float) -> bytes:
+        return _fixed(1, x) + _fixed(2, y)
+
+    def rectangle(x: float, y: float, width: float, height: float) -> bytes:
+        return _field(1, point(x, y)) + _field(2, point(width, height))
+
+    x, y, width, height = 110.0, 55.0, 55.0, 55.0
+    body = (
+        _field(1, IMAGE_LOGICAL_ID.encode())
+        + _field(2, rectangle(x, y, width, height))
+        + _field(3, rectangle(x + width / 2, y + height / 2, width, height))
+        + _field(4, IMAGE_RESOURCE_ID.encode())
+        + _field(5, b"")
+        + _field(6, 1)
+        + _field(15, b"")
+        + _field(18, 24)
+    )
+    descriptor = (
+        _field(1, IMAGE_LOGICAL_ID.encode())
+        + _field(4, IMAGE_RESOURCE_ID.encode())
+        + _field(7, IMAGE_ATTACHMENT_ID.encode())
+        + _field(8, 1)
+        + _field(9, sequence)
+        + _field(16, 24)
+    )
+    root = str(UUID(int=UUID(PAGE_IDS[page]).int + 1)).upper()
+    prefix = f"{root}.normal.{IMAGE_LOGICAL_ID}.".encode()
+    return {prefix + b"descriptor": descriptor, prefix + b"item": _field(1, body)}
+
+
+def _solid_png(color: tuple[int, int, int], *, width: int = 8, height: int = 8) -> bytes:
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data))
+            + kind
+            + data
+            + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+        )
+
+    pixels = bytes(color) * width
+    raw = b"".join(b"\0" + pixels for _ in range(height))
+    header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", header)
+        + chunk(b"IDAT", zlib.compress(raw))
+        + chunk(b"IEND", b"")
+    )
+
+
+def _add_image_attachment(source: Path, data: bytes) -> None:
+    (source / "Attachments" / "generated-image.png").write_bytes(data)
+    with sqlite3.connect(source / "Databases" / "projection.sqlite") as database:
+        database.execute(
+            "INSERT INTO attachments VALUES (?, ?, ?, 1)",
+            (IMAGE_ATTACHMENT_ID, "generated-image.png", NOTEBOOK),
+        )
 
 
 def _stroke(
@@ -185,7 +249,8 @@ def generated_source(
                 position TEXT, group_id TEXT, deleted INTEGER);
             CREATE TABLE templates (id TEXT PRIMARY KEY, document_id TEXT, attachment_id TEXT,
                 page_number INTEGER, size_width REAL, size_height REAL);
-            CREATE TABLE attachments (id TEXT PRIMARY KEY, path TEXT);
+            CREATE TABLE attachments (id TEXT PRIMARY KEY, path TEXT,
+                document_id TEXT, available INTEGER);
             CREATE TABLE notes_items (id TEXT PRIMARY KEY, group_id TEXT, deleted INTEGER);
         """)
         database.execute(
@@ -196,7 +261,10 @@ def generated_source(
             "('generated-link', 1, ?, '', 'generated-root', 'a', 0)",
             (NOTEBOOK,),
         )
-        database.execute("INSERT INTO attachments VALUES ('generated-pdf', 'generated.pdf')")
+        database.execute(
+            "INSERT INTO attachments VALUES ('generated-pdf', 'generated.pdf', ?, 1)",
+            (NOTEBOOK,),
+        )
         for number, page_id in enumerate(PAGE_IDS, 1):
             template = f"generated-template-{number}"
             database.execute(
@@ -213,8 +281,15 @@ def generated_source(
             page.insert_text((10, 160), f"Generated background {number}")
         pdf.save(attachments / "generated.pdf")
     store = GeneratedNativeStore(native_runtime, databases / "notes_main.db")
-    store.direct_identity = bool(getattr(request, "param", False))
-    store.write(_stroke(0, direct_identity=store.direct_identity))
+    parameter = getattr(request, "param", False)
+    image_only = bool(parameter.get("image_only", False)) if isinstance(parameter, dict) else False
+    store.direct_identity = (
+        bool(parameter.get("direct_identity", False))
+        if isinstance(parameter, dict)
+        else bool(parameter)
+    )
+    if not image_only:
+        store.write(_stroke(0, direct_identity=store.direct_identity))
     store.write(_stroke(1, offset_y=110, direct_identity=store.direct_identity))
     assert not list((databases / "notes_main.db").glob("*.sst"))
     assert any(path.stat().st_size for path in (databases / "notes_main.db").glob("*.log"))
@@ -416,6 +491,76 @@ def test_native_png_pdf_bundle_preserve_sources_and_readonly_cache(
     finally:
         for path, mode in sorted(modes.items(), key=lambda pair: len(pair[0].parts)):
             path.chmod(mode)
+
+
+@pytest.mark.parametrize("generated_source", [{"image_only": True}], indirect=True)
+def test_native_png_only_image_renders_in_render_and_default_bundle(
+    generated_source: tuple[Path, GeneratedNativeStore], tmp_path: Path
+) -> None:
+    source, store = generated_source
+    png = _solid_png((0, 240, 0))
+    _add_image_attachment(source, png)
+    store.write(_native_image(0))
+    environment = _environment(tmp_path)
+    captured = _command(["sync", "--library", str(source)], environment)
+
+    rendered_path = tmp_path / "native-image-only.png"
+    rendered = _command(_native_render(1, rendered_path), environment)
+    annotations = rendered["native_annotations"]
+    assert annotations["rendered_objects"] == 1
+    assert annotations["rendered_images"] == 1
+    assert annotations["rendered_strokes"] == 0
+    assert annotations["unsupported_objects"] == 0
+    assert annotations["coverage"] == "partial"
+    assert rendered["includes_handwriting"] is False
+    assert rendered["snapshot"] == captured["snapshot_id"]
+    assert _pixel(rendered_path, 65, 35)[:3] == (0, 240, 0)
+
+    bundle_directory = tmp_path / "native-image-bundle"
+    bundle = _command(
+        [
+            "bundle",
+            NOTEBOOK,
+            "--pages",
+            "1",
+            "--dpi",
+            "72",
+            "--output",
+            str(bundle_directory),
+        ],
+        environment,
+    )
+    manifest = json.loads(Path(bundle["manifest"]).read_text())
+    entry = manifest["pages"][0]
+    assert bundle["layer"] == "native"
+    assert entry["render"]["native_annotations"]["rendered_images"] == 1
+    assert entry["render"]["native_annotations"]["rendered_strokes"] == 0
+    assert entry["render"]["includes_handwriting"] is False
+    assert _pixel(bundle_directory / entry["image"], 65, 35)[:3] == (0, 240, 0)
+
+
+@pytest.mark.parametrize(
+    ("image_sequence", "expected_pixel"),
+    [(0, (255, 0, 0)), (2, (0, 240, 0))],
+)
+def test_native_image_and_ink_keep_creation_order(
+    image_sequence: int,
+    expected_pixel: tuple[int, int, int],
+    generated_source: tuple[Path, GeneratedNativeStore],
+    tmp_path: Path,
+) -> None:
+    source, store = generated_source
+    _add_image_attachment(source, _solid_png((0, 240, 0)))
+    store.write(_native_image(0, sequence=image_sequence))
+    environment = _environment(tmp_path)
+    _command(["sync", "--library", str(source)], environment)
+
+    output = tmp_path / f"native-order-{image_sequence}.png"
+    rendered = _command(_native_render(1, output), environment)
+
+    assert rendered["native_annotations"]["rendered_strokes"] == 1
+    assert rendered["native_annotations"]["rendered_images"] == 1
+    assert _pixel(output, 65, 30)[:3] == expected_pixel
 
 
 def _watch_event(process: subprocess.Popen[str], *, timeout: float = 15) -> dict:

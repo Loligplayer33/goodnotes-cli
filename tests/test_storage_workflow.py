@@ -148,6 +148,27 @@ def test_identical_images_across_distinct_views_share_storage(
     assert os.path.samefile(first["page_evidence"][0]["image"], second["page_evidence"][0]["image"])
 
 
+def test_renderer_upgrade_invalidates_cached_images(
+    visual_snapshot: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = documents._render_page_with_resources
+    calls = []
+
+    def traced(*args: Any, **kwargs: Any) -> dict[str, object]:
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(documents, "_render_page_with_resources", traced)
+    first = _bundle(visual_snapshot, tmp_path)
+    monkeypatch.setattr(documents, "_RENDER_CACHE_VERSION", documents._RENDER_CACHE_VERSION + 1)
+    second = _bundle(visual_snapshot, tmp_path)
+    third = _bundle(visual_snapshot, tmp_path)
+
+    assert len(calls) == 2
+    assert first["manifest"] != second["manifest"]
+    assert second == third
+
+
 def test_render_settings_invalidate_reuse(visual_snapshot: Path, tmp_path: Path) -> None:
     first = _bundle(visual_snapshot, tmp_path, "--dpi", "72")
     second = _bundle(visual_snapshot, tmp_path, "--dpi", "150")
@@ -251,6 +272,49 @@ def test_missing_background_does_not_return_a_cached_image(
     )
     assert failed.returncode == 1
     assert Path(first["page_evidence"][0]["image"]).is_file()
+
+
+def test_native_attachment_changes_invalidate_cached_images(
+    generated_source: tuple[Path, GeneratedNativeStore],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, _store = generated_source
+    with sqlite3.connect(source / "Databases" / "projection.sqlite") as database:
+        database.execute(
+            "INSERT INTO attachments(id, path, document_id, available) "
+            "VALUES ('auxiliary', 'auxiliary.bin', ?, 1)",
+            (NOTEBOOK,),
+        )
+    (source / "Attachments" / "auxiliary.bin").write_bytes(b"original auxiliary asset")
+    state = tmp_path / "state"
+    view = refresh_cache(source, state)
+    original = NativeStoreSession.__enter__
+    opens = []
+
+    def traced(self: NativeStoreSession) -> NativeStoreSession:
+        opens.append(1)
+        return original(self)
+
+    monkeypatch.setattr(NativeStoreSession, "__enter__", traced)
+    arguments = ["bundle", NOTEBOOK, "--pages", "1", "--dpi", "72"]
+    first = successful(invoke_in_process(arguments, tmp_path, data_dir=state))
+    assert successful(invoke_in_process(arguments, tmp_path, data_dir=state)) == first
+    assert len(opens) == 1
+
+    # Deliberately damage a generated fixture to exercise cache-hit validation.
+    snapshot_path = view["snapshot"]
+    assert isinstance(snapshot_path, str)
+    snapshot = Path(snapshot_path)
+    asset = snapshot / "Library" / "Attachments" / "auxiliary.bin"
+    original_mode = asset.stat().st_mode
+    asset.chmod(0o600)
+    asset.write_bytes(b"changed auxiliary")
+    asset.chmod(original_mode)
+    second = successful(invoke_in_process(arguments, tmp_path, data_dir=state))
+    assert len(opens) == 2
+    assert second["snapshot"] == first["snapshot"]
+    assert second["manifest"] != first["manifest"]
 
 
 def test_native_cached_request_skips_engine_and_refresh_invalidates_images(
