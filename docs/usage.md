@@ -10,6 +10,8 @@ On macOS, sync discovers the Goodnotes library and prepares the local read view:
 uv run goodnotes sync
 ```
 
+macOS can ask the terminal or agent application for permission to read Goodnotes data. A pending privacy prompt can leave `sync` waiting without output. Respond to the relevant macOS prompt; the CLI does not grant or change those permissions. Access to the copied cache for later reads is separate.
+
 On Linux, give `sync` a path to an available copy of the `Library` folder:
 
 ```sh
