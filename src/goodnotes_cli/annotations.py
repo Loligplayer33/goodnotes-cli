@@ -11,6 +11,7 @@ from __future__ import annotations
 import math
 import struct
 from collections import Counter, defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import cast
 from uuid import UUID
@@ -98,6 +99,51 @@ def _fixed(message: Message, number: int, default: float) -> float:
     return value
 
 
+def _segment_paths(
+    starts: list[tuple[float, float]],
+    segments: list[tuple[tuple[float, float], tuple[float, float]]],
+) -> list[list[tuple[float, float]]]:
+    """Decode only start/segment relationships established by observed records."""
+    if not segments:
+        return [[point] for point in starts]
+
+    # One start plus the ordered four-u sample stream is the observed stroke
+    # representation. Its tuples are not endpoint-connected graph edges.
+    # Multiple starts may denote additional subpaths, but their relationship
+    # to this stream is not established; do not infer boundaries by proximity.
+    if len(starts) > 1:
+        raise ValueError("Ambiguous native ink starts and segments relationship")
+
+    def ordered_path(
+        initial: tuple[float, float] | None,
+        segment_slice: list[tuple[tuple[float, float], tuple[float, float]]],
+    ) -> list[tuple[float, float]]:
+        points: list[tuple[float, float]] = []
+
+        def append(point: tuple[float, float]) -> None:
+            if not points or math.dist(points[-1], point) >= 1e-3:
+                points.append(point)
+
+        if initial is not None:
+            append(initial)
+        for segment_start, segment_end in segment_slice:
+            append(segment_start)
+            append(segment_end)
+        return points
+
+    if len(starts) == 1:
+        return [ordered_path(starts[0], segments)]
+
+    if not starts:
+        # With no explicit path starts, only a single stored segment has an
+        # unambiguous interpretation. Several segments could be one sampled
+        # path or multiple paths; do not guess at their relationship.
+        if len(segments) > 1:
+            raise ValueError("Ambiguous native ink segments without start markers")
+        return [ordered_path(None, segments)]
+    raise ValueError("Ambiguous native ink starts and segments relationship")
+
+
 def decode_ink(body: Message, budget: _DecodeBudget | None = None) -> list[Ink]:
     """Decode the observed legacy pen schemas, preserving colour and lasso moves."""
     if any(item.number not in {1, 2, 4, 5, 6, 7, 9, 15, 20, 21} for item in body.fields):
@@ -166,18 +212,11 @@ def decode_ink(body: Message, budget: _DecodeBudget | None = None) -> list[Ink]:
     dy = _fixed(offset_message, 2, 0.0) if offset_message else 0.0
     if abs(dx) > 100_000 or abs(dy) > 100_000:
         raise ValueError("Native translation exceeds coordinate bounds")
-    groups: list[list[tuple[float, float]]] = [[]]
-
-    def append(point: tuple[float, float]) -> None:
-        group = groups[-1]
-        if not group or math.dist(group[-1], point) >= 1e-3:
-            group.append(point)
-
-    for start in starts:
-        append(_point(*start))
-    for segment in segments:
-        append(_point(segment[0], segment[1]))
-        append(_point(segment[2], segment[3]))
+    start_points = [_point(*start) for start in starts]
+    segment_points = [
+        (_point(segment[0], segment[1]), _point(segment[2], segment[3])) for segment in segments
+    ]
+    groups = _segment_paths(start_points, segment_points)
     dash: tuple[float, ...] = ()
     if len(values) == 7:
         candidate = cast(list[float], values[6])
@@ -391,7 +430,12 @@ def decode_native_records(
 
 
 def render_native_overlay(
-    sandbox: SnapshotProtocol, page: Page, *, width_points: float, height_points: float
+    sandbox: SnapshotProtocol,
+    page: Page,
+    *,
+    width_points: float,
+    height_points: float,
+    record_reader: Callable[[str], list[tuple[bytes, bytes]]] | None = None,
 ) -> NativeOverlay:
     if page.rotation != 0:
         raise NativeError(
@@ -429,7 +473,9 @@ def render_native_overlay(
             "Invalid native page UUID mapping.",
             operation="map_native_page",
         ) from exc
-    records = read_page_records(sandbox, root_uuid)
+    records = (
+        read_page_records(sandbox, root_uuid) if record_reader is None else record_reader(root_uuid)
+    )
     if not records:
         raise NativeError(
             "native_data_unavailable",

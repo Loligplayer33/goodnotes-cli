@@ -4,14 +4,19 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import AbstractContextManager
 from pathlib import Path
+from types import SimpleNamespace
 
 import pymupdf
 import pytest
 
+from goodnotes_cli import library as library_module
 from goodnotes_cli.errors import GoodnotesError, TextIndexUnavailableError
 from goodnotes_cli.library import Library
+from goodnotes_cli.models import PageRef
 from goodnotes_cli.safety import Sandbox
+from goodnotes_cli.text_index import SchemaCache, _PDFPageBindings
 
 ROOT_ID = "virtual-root"
 
@@ -22,6 +27,7 @@ def _create_snapshot(
     with_fts: bool = True,
     with_cycle: bool = False,
     with_scan_page: bool = False,
+    fts_encoding: str | None = None,
 ) -> Sandbox:
     database_dir = root / "Library" / "Databases"
     attachments_dir = root / "Library" / "Attachments"
@@ -33,7 +39,7 @@ def _create_snapshot(
         with_scan_page=with_scan_page,
     )
     if with_fts:
-        _create_fts(database_dir / "fts.sqlite")
+        _create_fts(database_dir / "fts.sqlite", encoding=fts_encoding)
     _write_pdf(attachments_dir / "safe.pdf", "ignored indexed PDF page")
     _write_pdf(attachments_dir / "fallback.pdf", "Copied attachment fallback text")
     (root / "goodnotes-snapshot.json").write_text(
@@ -181,8 +187,10 @@ def _create_projection(
             )
 
 
-def _create_fts(path: Path) -> None:
+def _create_fts(path: Path, *, encoding: str | None = None) -> None:
     with sqlite3.connect(path) as db:
+        if encoding is not None:
+            db.execute(f"PRAGMA encoding = '{encoding}'")
         db.executescript(
             """
             CREATE TABLE annotation_text_content (
@@ -263,6 +271,32 @@ def _make_library(
     )
 
 
+def _add_repeated_fallback_pages(sandbox: Sandbox, count: int) -> None:
+    assert count >= 0
+    with sqlite3.connect(sandbox.projection_path) as db:
+        db.executemany(
+            "INSERT INTO templates VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                (f"batch-template-{index:04d}", "doc-hostile", "attachment-fallback", 1, 600, 800)
+                for index in range(count)
+            ],
+        )
+        db.executemany(
+            "INSERT INTO pages VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    f"batch-page-{index:04d}",
+                    "doc-hostile",
+                    f"batch-template-{index:04d}",
+                    f"batch-{index:04d}",
+                    "group-02",
+                    0,
+                )
+                for index in range(count)
+            ],
+        )
+
+
 def test_root_listing_paths_order_and_deleted_rows_are_explicit(tmp_path: Path) -> None:
     library = _make_library(tmp_path)
     with library:
@@ -312,6 +346,38 @@ def test_full_path_collisions_and_kind_mismatches_are_reported(tmp_path: Path) -
             library.resolve("doc-a", kind="folder")
 
 
+def test_required_catalog_names_and_numbers_reject_malformed_values(tmp_path: Path) -> None:
+    bad_name = _create_snapshot(tmp_path / "bad-name")
+    with sqlite3.connect(bad_name.projection_path) as db:
+        db.execute(
+            "UPDATE documents SET name = ? WHERE id = ?", (sqlite3.Binary(b"bad"), "doc-root")
+        )
+    with pytest.raises(GoodnotesError, match=r"documents\.name.*non-empty text"):
+        Library(bad_name).__enter__()
+
+    bad_number = _create_snapshot(tmp_path / "bad-number")
+    with sqlite3.connect(bad_number.projection_path) as db:
+        db.execute("UPDATE folders SET updated_at = ? WHERE id = ?", (float("inf"), "folder-a"))
+    with pytest.raises(GoodnotesError, match=r"folders\.updated_at.*finite number"):
+        Library(bad_number).__enter__()
+
+
+def test_malformed_optional_template_geometry_is_reported_as_unknown(tmp_path: Path) -> None:
+    sandbox = _create_snapshot(tmp_path / "snapshot")
+    with sqlite3.connect(sandbox.projection_path) as db:
+        db.execute(
+            "UPDATE templates SET size_width = ?, size_height = ? WHERE id = ?",
+            ("not-a-number", float("inf"), "template-02"),
+        )
+        db.execute("UPDATE templates SET page_number = ? WHERE id = ?", (1.5, "template-02"))
+
+    with Library(sandbox) as library:
+        page = library.pages("doc-hostile")[0]
+        assert page.width is None
+        assert page.height is None
+        assert page.pdf_page is None
+
+
 def test_pages_are_one_based_ordered_and_text_candidates_keep_provenance(
     tmp_path: Path,
 ) -> None:
@@ -353,6 +419,217 @@ def test_pages_are_one_based_ordered_and_text_candidates_keep_provenance(
             library.read_page("doc-hostile", 0)
 
 
+def test_page_hydration_queries_stay_bounded_for_500_pages_and_20_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sandbox = _create_snapshot(tmp_path / "large")
+    _add_repeated_fallback_pages(sandbox, 497)
+    resolved_candidates: list[Path] = []
+    actual_resolve = library_module.resolve_confined_file
+    repeated_reference = (
+        sandbox.attachments_dir / "original" / "goodnotes" / "attachments" / "fallback.pdf"
+    )
+    fallback_file = sandbox.attachments_dir / "fallback.pdf"
+
+    def record_resolve(root: str | Path, candidate: str | Path) -> Path | None:
+        resolved_candidates.append(Path(candidate))
+        return actual_resolve(root, candidate)
+
+    monkeypatch.setattr(library_module, "resolve_confined_file", record_resolve)
+
+    with Library(sandbox) as library:
+        assert library._projection is not None
+        statements: list[str] = []
+        library._projection.set_trace_callback(statements.append)
+        pages = library.pages("doc-hostile")
+        assert len(pages) == 500
+        assert resolved_candidates.count(repeated_reference) == 1
+        assert pages[0].annotation_count == 2
+        assert pages[1].annotation_count == 0
+        assert pages[2].annotation_count == 0
+        assert all(page.annotation_count == 2 for page in pages[3:])
+        for page in range(1, 21):
+            library.read_page("doc-hostile", page, source="handwriting", max_chars=64)
+
+        hydration_queries = [
+            statement
+            for statement in statements
+            if any(
+                marker in statement.casefold()
+                for marker in (
+                    "from pages",
+                    "from templates",
+                    "from attachments",
+                    "from notes_items",
+                )
+            )
+        ]
+        assert len(hydration_queries) <= 6
+        assert sum("from pages" in statement.casefold() for statement in hydration_queries) == 1
+        assert sum("from templates" in statement.casefold() for statement in hydration_queries) <= 2
+        assert (
+            sum("from attachments" in statement.casefold() for statement in hydration_queries) == 1
+        )
+        assert (
+            sum("from notes_items" in statement.casefold() for statement in hydration_queries) == 1
+        )
+
+        before_reads = resolved_candidates.count(fallback_file)
+        library.read_page("doc-hostile", 3, source="pdf")
+        assert resolved_candidates.count(fallback_file) == before_reads + 1
+        library.read_page("doc-hostile", 3, source="pdf")
+        assert resolved_candidates.count(fallback_file) == before_reads + 1
+
+
+def test_metadata_navigation_does_not_open_fts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sandbox = _create_snapshot(tmp_path / "snapshot")
+    opened: list[Path] = []
+    actual_open_database = library_module.open_database
+
+    def record_open(path: Path) -> AbstractContextManager[sqlite3.Connection]:
+        opened.append(Path(path))
+        return actual_open_database(path)
+
+    def fail_pdf_import() -> None:
+        raise AssertionError("metadata navigation should not import PyMuPDF")
+
+    monkeypatch.setattr(library_module, "open_database", record_open)
+    monkeypatch.setattr(library_module, "_pymupdf", fail_pdf_import)
+    with Library(sandbox) as library:
+        library.list_items("/")
+        library.resolve("doc-hostile")
+        library.pages("doc-hostile")
+        assert library._fts is None
+    assert opened == [Path(sandbox.projection_path)]
+
+
+def test_search_and_coverage_share_pdf_bindings_and_page_references(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    library = _make_library(tmp_path)
+    binding_calls = 0
+    original_bind = library_module.text_index.pdf_page_bindings
+
+    def count_bindings(
+        fts: sqlite3.Connection | None,
+        page_refs: list[PageRef],
+        *,
+        schema: SchemaCache | None = None,
+    ) -> _PDFPageBindings:
+        nonlocal binding_calls
+        binding_calls += 1
+        return original_bind(fts, page_refs, schema=schema)
+
+    monkeypatch.setattr(library_module.text_index, "pdf_page_bindings", count_bindings)
+    with library:
+        assert library._projection is not None
+        statements: list[str] = []
+        library._projection.set_trace_callback(statements.append)
+        library.search("direct", source="pdf", notebook="doc-hostile")
+        library.search_coverage(source="pdf", notebook="doc-hostile")
+
+    assert binding_calls == 1
+    page_ref_queries = [
+        statement for statement in statements if "select p.id as page_id" in statement.casefold()
+    ]
+    assert len(page_ref_queries) == 1
+
+
+def test_schema_metadata_is_cached_for_one_library_session(tmp_path: Path) -> None:
+    library = _make_library(tmp_path)
+    with library:
+        library._ensure_fts()
+        assert library._fts is not None
+        statements: list[str] = []
+        library._fts.set_trace_callback(statements.append)
+        library.search("STRASSE", source="handwriting", notebook="doc-hostile")
+        library.search_coverage(source="handwriting", notebook="doc-hostile")
+        schema_reads = [
+            statement
+            for statement in statements
+            if "sqlite_master" in statement.casefold()
+            or "pragma table_info" in statement.casefold()
+        ]
+        assert sum("sqlite_master" in statement.casefold() for statement in schema_reads) == 1
+        assert sum("pragma table_info" in statement.casefold() for statement in schema_reads) <= 3
+
+
+def test_scan_reuses_pdf_documents_until_library_session_closes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sandbox = _create_snapshot(tmp_path / "scan", with_fts=False)
+    _add_repeated_fallback_pages(sandbox, 20)
+    actual_open = pymupdf.open
+    opened: list[pymupdf.Document] = []
+
+    def record_pdf_open(path: Path) -> pymupdf.Document:
+        document = actual_open(path)
+        opened.append(document)
+        return document
+
+    monkeypatch.setattr(library_module, "_pymupdf", lambda: SimpleNamespace(open=record_pdf_open))
+    with Library(sandbox) as library:
+        result = library.scan_pdfs("not present", notebook="doc-hostile", page_limit=23)
+        assert result["pages_scanned"] == 23
+        assert len(opened) == 2
+        assert not any(document.is_closed for document in opened)
+    assert all(document.is_closed for document in opened)
+
+
+def test_pdf_document_lru_closes_evictions_and_all_documents_on_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sandbox = _create_snapshot(tmp_path / "snapshot", with_fts=False)
+    paths = [sandbox.attachments_dir / "safe.pdf", sandbox.attachments_dir / "fallback.pdf"]
+    for index in range(library_module._MAX_OPEN_PDFS - len(paths) + 1):
+        path = sandbox.attachments_dir / f"cached-{index}.pdf"
+        _write_pdf(path, f"Cached document {index}")
+        paths.append(path)
+
+    actual_open = pymupdf.open
+    opened: list[pymupdf.Document] = []
+
+    def record_pdf_open(path: str | Path) -> pymupdf.Document:
+        document = actual_open(path)
+        opened.append(document)
+        return document
+
+    monkeypatch.setattr(library_module, "_pymupdf", lambda: SimpleNamespace(open=record_pdf_open))
+    with pytest.raises(RuntimeError, match="forced library error"):
+        with Library(sandbox) as library:
+            with library._pdf_session():
+                for path in paths:
+                    with library._pdf_document(path):
+                        pass
+                assert len(opened) == library_module._MAX_OPEN_PDFS + 1
+                assert library._pdf_documents is not None
+                assert len(library._pdf_documents.documents) == library_module._MAX_OPEN_PDFS
+                assert opened[0].is_closed
+            raise RuntimeError("forced library error")
+
+    assert all(document.is_closed for document in opened)
+
+
+def test_missing_attachment_reference_survives_hydration_and_reports_reason(tmp_path: Path) -> None:
+    sandbox = _create_snapshot(tmp_path / "snapshot")
+    with sqlite3.connect(sandbox.projection_path) as db:
+        db.execute(
+            "UPDATE attachments SET path = 'missing-background.pdf' WHERE id = ?",
+            ("attachment-fallback",),
+        )
+
+    with Library(sandbox) as library:
+        page = library.pages("doc-hostile")[2]
+        assert page.attachment_path == "missing-background.pdf"
+        result = library.read_page("doc-hostile", 3, source="pdf")
+        assert result.parts == []
+        assert any("mapped copied attachment is missing" in warning for warning in result.warnings)
+        scan = library.scan_pdfs("anything", notebook="doc-hostile", page_offset=2, page_limit=1)
+        assert scan["extraction_issues"][0]["issue"] == "missing-attachment"
+
+
 def test_read_page_can_limit_sources_without_loading_unselected_sources(
     tmp_path: Path,
 ) -> None:
@@ -366,6 +643,7 @@ def test_read_page_can_limit_sources_without_loading_unselected_sources(
 
     with Library(sandbox) as library:
         sql: list[str] = []
+        library._ensure_fts()
         assert library._fts is not None
         library._fts.set_trace_callback(sql.append)
         page_text = library.read_page("doc-hostile", 1, source="handwriting")
@@ -373,6 +651,13 @@ def test_read_page_can_limit_sources_without_loading_unselected_sources(
         assert any("machine-recognized" in warning for warning in page_text.warnings)
         assert not any("FROM textbox_text_content" in statement for statement in sql)
         assert not any("FROM pdf_text_content" in statement for statement in sql)
+        handwriting_reads = [
+            statement
+            for statement in sql
+            if "with candidates as" in statement.casefold()
+            and "from annotation_text_content" in statement.casefold()
+        ]
+        assert len(handwriting_reads) == 1
 
     with sqlite3.connect(sandbox.fts_path) as db:
         db.execute("DROP TABLE textbox_text_content")
@@ -381,6 +666,103 @@ def test_read_page_can_limit_sources_without_loading_unselected_sources(
         page_text = library.read_page("doc-hostile", 1, source="handwriting")
         assert not any("Textbox text is unavailable" in warning for warning in page_text.warnings)
         assert not any("PDF text is unavailable" in warning for warning in page_text.warnings)
+
+
+@pytest.mark.parametrize(
+    "malformation",
+    ["handwriting-blob", "handwriting-text-id", "pdf-blob", "pdf-text-id", "pdf-pointer"],
+)
+def test_read_page_rejects_malformed_index_text_rows(tmp_path: Path, malformation: str) -> None:
+    sandbox = _create_snapshot(tmp_path / malformation)
+    assert sandbox.fts_path is not None
+    with sqlite3.connect(sandbox.fts_path) as db:
+        if malformation == "handwriting-blob":
+            db.execute(
+                "UPDATE annotation_text_content SET text = ? WHERE text_id = ?",
+                (sqlite3.Binary(b"\xffinvalid UTF-8"), 1),
+            )
+        elif malformation == "handwriting-text-id":
+            db.execute("DROP TABLE annotation_text_content")
+            db.execute(
+                "CREATE TABLE annotation_text_content "
+                "(text_id TEXT, page_id TEXT, text TEXT, engine_type TEXT, priority TEXT)"
+            )
+            db.execute(
+                "INSERT INTO annotation_text_content VALUES (?, ?, ?, ?, ?)",
+                ("invalid-id", "page-02", "stored text", "myscript", "primary"),
+            )
+        elif malformation == "pdf-blob":
+            db.execute(
+                "UPDATE pdf_text_content SET text = ? WHERE text_id = ?",
+                (sqlite3.Binary(b"\xffinvalid UTF-8"), 101),
+            )
+        elif malformation == "pdf-text-id":
+            db.execute("DROP TABLE pdf_text_content")
+            db.execute(
+                "CREATE TABLE pdf_text_content "
+                "(text_id TEXT, text TEXT, attachment_id TEXT, pdf_page_no INTEGER, "
+                "document_id TEXT)"
+            )
+            db.execute(
+                "INSERT INTO pdf_text_content VALUES (?, ?, ?, ?, ?)",
+                ("invalid-id", "stored PDF text", "attachment-safe", 9, "doc-hostile"),
+            )
+        else:
+            db.execute(
+                "UPDATE page_meta SET pdf_text_id = ? WHERE page_id = ?",
+                ("invalid-id", "page-02"),
+            )
+
+    with Library(sandbox) as library:
+        expected = {
+            "handwriting-blob": "annotation_text_content.text",
+            "handwriting-text-id": "annotation_text_content.text_id",
+            "pdf-blob": "pdf_text_content.text",
+            "pdf-text-id": "pdf_text_content.text_id",
+            "pdf-pointer": "page_meta.pdf_text_id",
+        }[malformation]
+        with pytest.raises(GoodnotesError, match=expected.replace(".", r"\.")):
+            source = "pdf" if malformation.startswith("pdf-") else "handwriting"
+            library.read_page("doc-hostile", 1, source=source)
+
+
+@pytest.mark.parametrize(
+    ("source", "table", "text_id"),
+    [
+        ("handwriting", "annotation_text_content", 1),
+        ("textbox", "textbox_text_content", 10),
+        ("pdf", "pdf_text_content", 101),
+    ],
+)
+@pytest.mark.parametrize("encoding", ["UTF-8", "UTF-16le"])
+def test_embedded_nul_text_is_preserved_unbounded_and_rejected_when_bounded(
+    tmp_path: Path, source: str, table: str, text_id: int, encoding: str
+) -> None:
+    sandbox = _create_snapshot(tmp_path / f"{source}-{encoding}", fts_encoding=encoding)
+    assert sandbox.fts_path is not None
+    with Library(sandbox) as library:
+        normal_text = library.read_page("doc-hostile", 1, source=source, max_chars=4)
+        assert sum(len(part.text) for part in normal_text.parts) <= 4
+        assert normal_text.truncated is True
+
+    with sqlite3.connect(sandbox.fts_path) as db:
+        db.execute(
+            f"UPDATE {table} SET text = ? WHERE text_id = ?",
+            ("before\x00after", text_id),
+        )
+
+    with Library(sandbox) as library:
+        unbounded = library.read_page("doc-hostile", 1, source=source, max_chars=None)
+        assert unbounded.parts[0].text == "before\x00after"
+        assert unbounded.parts[0].truncated is False
+        assert unbounded.truncated is False
+
+        with pytest.raises(GoodnotesError, match="embedded NUL"):
+            library.read_page("doc-hostile", 1, source=source, max_chars=4)
+
+        zero_budget = library.read_page("doc-hostile", 1, source=source, max_chars=0)
+        assert zero_budget.parts == []
+        assert zero_budget.truncated is True
 
 
 def test_read_page_character_budget_marks_clipped_and_omitted_text(tmp_path: Path) -> None:
@@ -415,13 +797,74 @@ def test_zero_budget_does_not_materialize_content_text(tmp_path: Path) -> None:
     library = _make_library(tmp_path)
     with library:
         sql: list[str] = []
+        library._ensure_fts()
         assert library._fts is not None
         library._fts.set_trace_callback(sql.append)
         page_text = library.read_page("doc-hostile", 1, source="handwriting", max_chars=0)
         assert page_text.truncated is True
         assert page_text.parts == []
-        assert not any("SELECT text FROM annotation_text_content" in statement for statement in sql)
-        assert not any("substr(text" in statement for statement in sql)
+        pdf_page_text = library.read_page("doc-hostile", 1, source="pdf", max_chars=0)
+        assert pdf_page_text.truncated is True
+        assert pdf_page_text.parts == []
+        assert not any("substr(" in statement.casefold() for statement in sql)
+
+
+def test_pdf_text_reads_use_one_bounded_query_and_preserve_row_order(
+    tmp_path: Path,
+) -> None:
+    sandbox = _create_snapshot(tmp_path / "snapshot")
+    assert sandbox.fts_path is not None
+    with sqlite3.connect(sandbox.fts_path) as db:
+        db.execute("UPDATE page_meta SET pdf_text_id = NULL WHERE page_id = 'page-02'")
+        db.execute("UPDATE pdf_text_content SET text = 'abcd' WHERE text_id = 101")
+        db.executemany(
+            "INSERT INTO pdf_text_content VALUES (?, ?, ?, ?, ?)",
+            [
+                (201, "efgh", "attachment-safe", 9, "doc-hostile"),
+                (202, "tail", "attachment-safe", 9, "doc-hostile"),
+            ],
+        )
+
+    with Library(sandbox) as library:
+        library._ensure_fts()
+        assert library._fts is not None
+        statements: list[str] = []
+        library._fts.set_trace_callback(statements.append)
+        page_text = library.read_page("doc-hostile", 1, source="pdf", max_chars=5)
+
+    pdf_reads = [
+        statement
+        for statement in statements
+        if "with candidates as" in statement.casefold()
+        and "from pdf_text_content" in statement.casefold()
+    ]
+    assert len(pdf_reads) == 1
+    assert "substr(content.text" in pdf_reads[0].casefold()
+    assert [part.text for part in page_text.parts] == ["abcd", "e"]
+    assert [part.truncated for part in page_text.parts] == [False, True]
+    assert page_text.truncated is True
+
+
+def test_pdf_read_preserves_parts_when_budget_expires_at_id_batch_boundary(
+    tmp_path: Path,
+) -> None:
+    sandbox = _create_snapshot(tmp_path / "snapshot")
+    assert sandbox.fts_path is not None
+    with sqlite3.connect(sandbox.fts_path) as db:
+        db.execute("UPDATE page_meta SET pdf_text_id = NULL WHERE page_id = 'page-02'")
+        db.execute("UPDATE pdf_text_content SET text = 'a' WHERE text_id = 101")
+        db.executemany(
+            "INSERT INTO pdf_text_content VALUES (?, ?, ?, ?, ?)",
+            [(text_id, "a", "attachment-safe", 9, "doc-hostile") for text_id in range(201, 601)],
+        )
+
+    with Library(sandbox) as library:
+        page_text = library.read_page("doc-hostile", 1, source="pdf", max_chars=400)
+
+    assert len(page_text.parts) == 400
+    assert all(part.text == "a" for part in page_text.parts)
+    assert all(part.truncated is False for part in page_text.parts)
+    assert page_text.truncated is True
 
 
 def test_pdf_fallback_respects_read_budget_and_reports_truncation(
@@ -433,12 +876,16 @@ def test_pdf_fallback_respects_read_budget_and_reports_truncation(
         assert page_text.truncated is True
         assert page_text.parts[0].text == "Copie"
         assert page_text.parts[0].truncated is True
+        assert any(
+            "truncated to the requested character budget" in warning
+            for warning in page_text.warnings
+        )
         assert len(page_text.parts[0].text) <= 5
 
         def fail_if_opened(*_args: object, **_kwargs: object) -> None:
             raise AssertionError("zero-budget PDF read should not extract page text")
 
-        monkeypatch.setattr("goodnotes_cli.library.pymupdf.open", fail_if_opened)
+        monkeypatch.setattr("goodnotes_cli.library._pymupdf", fail_if_opened)
         zero = library.read_page("doc-hostile", 3, source="pdf", max_chars=0)
         assert zero.parts == []
         assert zero.truncated is True
@@ -626,7 +1073,7 @@ def test_stale_attachment_prefix_is_not_remapped_when_basename_is_ambiguous(
         assert library.pages("doc-hostile")[2].attachment_path is None
         page_text = library.read_page("doc-hostile", 3)
         assert page_text.parts == []
-        assert any("No confined copied attachment" in warning for warning in page_text.warnings)
+        assert any("basename is ambiguous" in warning for warning in page_text.warnings)
 
 
 def test_pdf_scan_is_bounded_paginated_and_independent_of_the_search_index(
@@ -642,7 +1089,9 @@ def test_pdf_scan_is_bounded_paginated_and_independent_of_the_search_index(
         assert first["coverage_complete"] is False
         assert first["stop_reason"] == "hit-limit"
         assert first["scope"]["type"] == "folder"
-        assert any(issue["issue"] == "missing-background" for issue in first["extraction_issues"])
+        assert any(
+            issue["issue"] == "unsafe-attachment-path" for issue in first["extraction_issues"]
+        )
         assert len(first["hits"]) == 1
         assert first["hits"][0].source == "pdf"
         assert first["hits"][0].page == 3
@@ -858,6 +1307,7 @@ def test_pdf_binding_uses_bounded_indexed_identity_joins(tmp_path: Path) -> None
         db.executemany("INSERT INTO pdf_text_content VALUES (?, ?, ?, ?, ?)", pdf_rows)
 
     with Library(sandbox) as library:
+        library._ensure_fts()
         assert library._fts is not None
         statements: list[str] = []
         library._fts.set_trace_callback(statements.append)
@@ -984,7 +1434,6 @@ def test_partial_page_metadata_is_safe_for_pdf_read_and_doctor(tmp_path: Path) -
         page_text = library.read_page("doc-hostile", 3, source="pdf")
         assert page_text.parts[0].text == "Copied attachment fallback text"
         assert not any("page_meta" in warning for warning in page_text.warnings)
-        assert library._page_template_mapping("page-30") is None
         stats = library.stats()
         assert stats["pages_without_index_metadata"] == 0
         assert stats["search_index_available"] is True
@@ -1006,6 +1455,7 @@ def test_search_coverage_is_batched_metadata_only_and_handles_missing_tables(
 ) -> None:
     sandbox = _create_snapshot(tmp_path / "snapshot")
     with Library(sandbox) as library:
+        library._ensure_fts()
         assert library._fts is not None
         statements: list[str] = []
         library._fts.set_trace_callback(statements.append)

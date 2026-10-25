@@ -11,6 +11,9 @@ Notable changes to the project are recorded here. Versions follow Semantic Versi
 
 ### Changed
 
+- Page hydration, search bindings and PDF scans reuse work within one read view. Multipage rendering and export share native-store and PDF resources.
+- Non-PDF commands defer PDF-library loading. Routine CLI contract tests run in process while process-specific tests retain subprocess coverage.
+- Incremental capture reuses unchanged original SQLite digests with copied-byte verification and reuses compatible prior projection validation for unchanged complete families.
 - Browse and read commands open the initialized cache lock read-only. Sync owns lock creation, so restricted agents need no cache write access to read notes.
 - `doctor` includes the selected cache directory, snapshot path, and capture time. Cache setup, permission, and validation errors include a specific path and remedy.
 - Reorganized the README around capabilities, setup, and a complete command index, with separate task and command references.
@@ -20,6 +23,12 @@ Notable changes to the project are recorded here. Versions follow Semantic Versi
 
 ### Fixed
 
+- Filesystem overlap checks recognize case and directory-identity aliases. Cleanup does not follow symlinks or change their targets' permissions.
+- Source edits during the final freshness scan preserve a validated view and trigger another refresh; watch coalesces transient inventory changes.
+- Genuine hot rollback journals recover only on independent staging copies. Fallback SQLite output leaves WAL mode before publication.
+- Search snippets retain matches after Unicode casefold expansion. Missing mapped PDFs and malformed catalog values report specific diagnostics.
+- Separate native start-only dots no longer gain connecting lines. Ambiguous mixed-start geometry is reported as unsupported while single-start stroke ordering is preserved.
+- Query-time cache errors retain structured details, doctor projections validate before access, and closed output pipes avoid generic operation errors.
 - Field selection on bundle results now handles numeric page lists without crashing.
 - Field-selection errors identify the response level and valid keys. Snapshot metadata is selectable on top-level responses and always retained.
 - Invalid field projections fail before files or cache state are written, including when row results are empty.

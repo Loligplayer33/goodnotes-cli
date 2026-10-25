@@ -58,9 +58,28 @@ def _decode_lz4_block(source: bytes, expected_size: int, dictionary: bytes) -> b
         match_length += 4
         if len(output) + match_length > expected_size:
             raise CompressionError("LZ4 output exceeds declared size")
-        for _ in range(match_length):
-            index = len(history) + len(output) - offset
-            output.append(history[index] if index < len(history) else output[index - len(history)])
+        # Seed the match from the bytes that precede it, which may span both
+        # the prior-block dictionary and current output. LZ4 overlap repeats
+        # this seed, so grow it geometrically instead of copying one byte at a
+        # time in Python. Keep the byte loop out of the common decoder path.
+        source_index = len(history) + len(output) - offset
+        seed_length = min(offset, match_length)
+        if source_index < len(history):
+            dictionary_length = min(seed_length, len(history) - source_index)
+            seed = bytearray(history[source_index : source_index + dictionary_length])
+            remaining_seed = seed_length - dictionary_length
+            if remaining_seed:
+                seed.extend(output[:remaining_seed])
+        else:
+            output_index = source_index - len(history)
+            seed = output[output_index : output_index + seed_length]
+        output.extend(seed)
+        copied = len(seed)
+        while copied < match_length:
+            copy_length = min(copied, match_length - copied)
+            copy_start = len(output) - copied
+            output.extend(output[copy_start : copy_start + copy_length])
+            copied += copy_length
     if len(output) != expected_size:
         raise CompressionError(f"LZ4 size mismatch: expected {expected_size}, got {len(output)}")
     return bytes(output)

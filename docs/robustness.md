@@ -12,7 +12,7 @@ Generated tests cover inventory reuse, cache metadata damage, forced refresh, so
 
 This remains a file-copy workflow, not a transaction coordinated with the Goodnotes app. A continuously changing source can make sync fail after three attempts.
 
-WAL consolidation checkpoints only an independent staging copy. The copied SHM index is discarded before opening that copy so SQLite can rebuild its index and checkpoint state. An incomplete or failed checkpoint fails capture and preserves the previous active view. Non-WAL databases and rollback-journal families use the existing backup path. Source files and completed snapshots are never opened for SQLite writes. SQLite determines the valid committed WAL prefix; successful consolidation and integrity checks do not prove that an invalid or torn tail contained no additional edits. This limitation also applies to the backup path.
+WAL consolidation checkpoints only an independent staging copy. The copied SHM index is discarded before opening that copy so SQLite can rebuild its index and checkpoint state. An incomplete or failed checkpoint fails capture and preserves the previous active view. A genuine hot rollback journal is recovered only on the independent staging copy before backup. Fallback output uses DELETE journal mode. Source files and completed snapshots are never opened for SQLite writes. SQLite determines the valid committed WAL prefix; successful consolidation and integrity checks do not prove that an invalid or torn tail contained no additional edits. This limitation also applies to the backup path.
 
 Generated snapshot tests cover stale SHM reconstruction, owner-read-only source files, incomplete checkpoints, failed journal-mode changes, nonempty leftover sidecars, rollback-journal fallback, stray WALs on non-WAL databases, valid commits before torn or reset WAL tails, and FTS databases whose custom tokenizer is unavailable. Source byte hashes and metadata stay unchanged; failed capture removes unpublished output. See [test_snapshot.py](../tests/test_snapshot.py).
 
@@ -28,6 +28,8 @@ Native rendering opens the engine only on disposable scratch cloned from a valid
 
 Only the observed pen/highlighter schemas are supported. Unsupported active types, uncertain visibility, ambiguous versions, parent transforms, and decoding failures reduce coverage or fail when nothing usable remains. Rendering retains its approximation warning even when every observed pen record decodes. Missing native roots mean unavailable data, not an empty page. Rotated or cropped backgrounds are currently rejected. See [native safety tests](../tests/test_native.py) and [decoder tests](../tests/test_annotations.py).
 
+Ink with a single start retains its ordered point stream. Differences between adjacent stored coordinates do not establish a pen lift. Start-only records render separate dots; records that mix multiple starts and coordinate pairs remain unsupported because their command boundaries have not been established. Decoder tests cover these distinctions, long segments, retracing, dash validation, and bounded decompression. [Low-level decoder tests](../tests/test_decoders.py) cover LZ4 back-references, overlapping matches and cross-block history, plus TPL field widths and string lengths.
+
 The [native workflow tests](../tests/test_native_workflow.py) create their own writable RocksDB store and leave its writer open. They verify native WAL updates, lasso moves, whole-object erasure, watch-driven refresh, PNG/PDF/bundle consistency, read-only cache access, source and snapshot preservation, reader retention, pruning, and SIGINT. These tests require an optional compatible engine. macOS CI installs it and makes these tests mandatory. Generated tests do not establish fidelity to Goodnotes or fresh iPad acceptance.
 
 ## Readers and refreshes
@@ -37,6 +39,8 @@ The [native workflow tests](../tests/test_native_workflow.py) create their own w
 The managed cache retains the active generation. Once existing readers release the view lock, a successful refresh removes older managed generations and their annotated-PDF registrations. An explicit `--sandbox` path inside this cache follows the same lock and lifetime rules. The separate `snapshot LIBRARY DESTINATION` command creates a caller-owned copy. Keep its destination outside the managed cache; normal sync does not remove it.
 
 Tests cover unchanged reuse, one active generation after refresh, old-reader retention while capture proceeds, serialized concurrent syncs, and explicit managed-sandbox locking. See `test_refresh_retains_only_active_generated_snapshot_and_removes_registration`, `test_old_reader_holds_snapshot_while_capture_progresses_and_publication_waits`, `test_concurrent_refreshes_serialize_and_second_sees_fresh_cache`, and `test_explicit_managed_sandbox_takes_shared_view_lock` in [test_cache.py](../tests/test_cache.py). `test_render_loads_read_view_only_once` in [test_cli.py](../tests/test_cli.py) checks that one command resolves the read view once.
+
+Immutable schema, page and search-binding caches live only inside that read view. Generated query-count tests bound repeated hydration across a 500-page notebook and multiple reads. PDF scans reuse bounded document handles. Multipage native and annotated operations share their engine or verified PDF within the command; tests check open/hash counts, failure cleanup, pixels, selected-page order and resource sharing in [Library tests](../tests/test_library.py) and [document tests](../tests/test_documents.py).
 
 ## Read-only cache access
 
@@ -80,6 +84,8 @@ The CLI resolves a notebook by exact ID, exact full path, or unique name. An amb
 
 See `test_basename_ambiguity_and_orphaned_items_are_not_guessed`, `test_full_path_collisions_and_kind_mismatches_are_reported`, and `test_stale_attachment_prefix_is_not_remapped_when_basename_is_ambiguous` in [test_library.py](../tests/test_library.py), plus path and symlink checks in [test_safety.py](../tests/test_safety.py).
 
+Containment uses filesystem identity for aliases, including aliases with different path depths, without folding distinct names on case-sensitive volumes. Cleanup uses directory descriptors and rejects replaced parents before deletion. It unlinks symlinks without changing their targets. Generated tests cover alias identities, missing output leaves, symlink targets and replacement races. Volume-specific tests exercise actual case behavior when the host supports it. Malformed required catalog values fail with explicit diagnostics; optional unknown geometry remains unknown.
+
 ## Registered annotated PDFs
 
 `attach-pdf` checks that a PDF is readable and has the notebook's current page count. The CLI stores registration metadata outside the immutable read view. Before rendering or exporting the `annotated` layer, it checks the page count and PDF content signature again. If the PDF moves, changes, or no longer matches the current notebook page count, the operation fails instead of falling back to background-only output.
@@ -101,3 +107,7 @@ See `test_read_reports_budget_and_preserves_handwriting`, `test_bundle_budget_an
 ## Structured errors
 
 Expected operation errors return compact JSON on stderr with exit code 1. Invalid arguments return a structured error with exit code 2. These errors do not print a Python traceback. See `test_missing_library_is_structured_stderr` and `test_argument_errors_are_structured` in [test_cli.py](../tests/test_cli.py).
+
+Query-time SQLite failures retain the cache operation, path and remedy. Output failures retain their output context. A closed output pipe follows the existing interruption exit code 130 without a generic operation error. Doctor field projections are validated before accessing data, including its separate `--access-only` shape. Unicode casefold expansion is mapped back to original text before constructing search snippets.
+
+[Generated CLI audit workflows](../tests/test_audit_workflow.py) exercise capture followed by navigation and Unicode search, missing-PDF scan/render diagnostics, and disconnected native dots. They verify source and completed-snapshot bytes and metadata remain unchanged by readers. Native writer, refresh, read-only cache, watch and signal workflows remain in [native workflow tests](../tests/test_native_workflow.py).

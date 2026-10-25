@@ -11,7 +11,7 @@ from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
 from functools import wraps
 from pathlib import Path
-from typing import Annotated, Any, cast
+from typing import TYPE_CHECKING, Annotated, Any, cast
 
 import typer
 from typer.core import TyperGroup
@@ -19,14 +19,12 @@ from typer.core import TyperGroup
 from . import __version__
 from .cache import read_view, refresh_cache
 from .config import Settings, default_data_dir, default_library
-from .documents import export_pdf, register_annotated_pdf, render_page
 from .errors import (
     CacheAccessError,
     FilesystemAccessError,
     GoodnotesError,
     TextIndexUnavailableError,
 )
-from .library import Library
 from .native import NativeError
 from .output import (
     Projection,
@@ -42,6 +40,9 @@ from .output import (
 )
 from .snapshot import create_snapshot
 from .watch import watch_library
+
+if TYPE_CHECKING:
+    from .library import Library
 
 ItemSelector = Annotated[
     str, typer.Argument(help="Exact UUID, full library path, or unique exact name.")
@@ -106,6 +107,9 @@ def command(*args: Any, **kwargs: Any) -> Any:
                 validate_projection(cfg.fields, projection)
             try:
                 return function(*fargs, **fkwargs)
+            except BrokenPipeError:
+                # Preserve the process-level broken-pipe contract in main().
+                raise
             except (OSError, sqlite3.Error, ValueError) as exc:
                 raise GoodnotesError(str(exc)) from exc
 
@@ -173,6 +177,8 @@ def repository(ctx: typer.Context) -> Iterator[Library]:
         cfg.snapshot_id = sandbox.root.name
         with ExitStack() as stack:
             try:
+                from .library import Library
+
                 lib = stack.enter_context(Library(sandbox))
             except sqlite3.Error as exc:
                 raise CacheAccessError(
@@ -183,6 +189,23 @@ def repository(ctx: typer.Context) -> Iterator[Library]:
                     cache_dir=cfg.cache_dir,
                 ) from exc
             yield lib
+
+
+def repository_query(
+    ctx: typer.Context, lib: Library, query: Any, *args: Any, **kwargs: Any
+) -> Any:
+    """Run a snapshot query and retain cache details for SQLite read failures."""
+    try:
+        return query(*args, **kwargs)
+    except sqlite3.Error as exc:
+        cfg = settings(ctx)
+        raise CacheAccessError(
+            "cache_invalid",
+            f"Could not query the copied library snapshot: {lib.sandbox.root}",
+            operation="query_snapshot_library",
+            path=lib.sandbox.root,
+            cache_dir=cfg.cache_dir,
+        ) from exc
 
 
 @command()
@@ -289,7 +312,8 @@ def list_items(
     Example: goodnotes ls --folder "Course" --limit 20
     """
     with repository(ctx) as lib:
-        emit(window(lib.list_items(folder), limit, offset), settings(ctx))
+        items = repository_query(ctx, lib, lib.list_items, folder)
+        emit(window(items, limit, offset), settings(ctx))
 
 
 @command()
@@ -308,7 +332,8 @@ def tree(
     Example: goodnotes tree --folder "Course" --depth 2
     """
     with repository(ctx) as lib:
-        emit(window(lib.tree(folder, max_depth=depth), limit, offset), settings(ctx))
+        items = repository_query(ctx, lib, lib.tree, folder, max_depth=depth)
+        emit(window(items, limit, offset), settings(ctx))
 
 
 @command()
@@ -321,7 +346,7 @@ def info(ctx: typer.Context, notebook: ItemSelector) -> None:
     Example: goodnotes info "Course Notes"
     """
     with repository(ctx) as lib:
-        emit(lib.resolve(notebook), settings(ctx))
+        emit(repository_query(ctx, lib, lib.resolve, notebook), settings(ctx))
 
 
 @command()
@@ -344,10 +369,10 @@ def pages(
     Example: goodnotes pages "Course Notes" --limit 20
     """
     with repository(ctx) as lib:
-        result = window(lib.pages(notebook), limit, offset)
+        result = window(repository_query(ctx, lib, lib.pages, notebook), limit, offset)
         result["pages"] = result.pop("items")
         if with_recognition:
-            recognition = lib.recognition_status(notebook)
+            recognition = repository_query(ctx, lib, lib.recognition_status, notebook)
             result["pages"] = [
                 {**serializable(page), "recognition": serializable(recognition[page.id])}
                 for page in result["pages"]
@@ -378,11 +403,21 @@ def read_text(
     if source not in {"all", "pdf", "handwriting", "textbox"}:
         raise GoodnotesError("--source must be all, pdf, handwriting, or textbox.")
     with repository(ctx) as lib:
-        selected = select_pages(pages or str(page or 1), len(lib.pages(notebook)))
+        all_pages = repository_query(ctx, lib, lib.pages, notebook)
+        selected = select_pages(pages or str(page or 1), len(all_pages))
         results = []
         remaining = max_chars
         for number in selected:
-            data = serializable(lib.read_page(notebook, number, source=source, max_chars=remaining))
+            page_data = repository_query(
+                ctx,
+                lib,
+                lib.read_page,
+                notebook,
+                number,
+                source=source,
+                max_chars=remaining,
+            )
+            data = serializable(page_data)
             remaining -= sum(len(part["text"]) for part in data["parts"])
             results.append(data)
         truncated = bound_page_text(results, max_chars)
@@ -411,7 +446,10 @@ def search(
     selected_folder = _search_folder(folder, notebook)
     with repository(ctx) as lib:
         try:
-            hits = lib.search(
+            hits = repository_query(
+                ctx,
+                lib,
+                lib.search,
                 query,
                 folder=selected_folder,
                 notebook=notebook,
@@ -419,7 +457,14 @@ def search(
                 limit=offset + limit + 1,
             )
         except TextIndexUnavailableError as exc:
-            coverage = lib.search_coverage(folder=selected_folder, notebook=notebook, source=source)
+            coverage = repository_query(
+                ctx,
+                lib,
+                lib.search_coverage,
+                folder=selected_folder,
+                notebook=notebook,
+                source=source,
+            )
             warnings = coverage.pop("warnings", [])
             emit_error(
                 "operation_failed",
@@ -432,7 +477,14 @@ def search(
             )
             raise SystemExit(1) from None
         selected = snippet_hits(hits[offset : offset + limit], query)
-        coverage = lib.search_coverage(folder=selected_folder, notebook=notebook, source=source)
+        coverage = repository_query(
+            ctx,
+            lib,
+            lib.search_coverage,
+            folder=selected_folder,
+            notebook=notebook,
+            source=source,
+        )
         warnings = coverage.pop("warnings")
         emit(
             {
@@ -466,7 +518,10 @@ def scan_pdfs(
     """
     selected_folder = _search_folder(folder, notebook)
     with repository(ctx) as lib:
-        result = lib.scan_pdfs(
+        result = repository_query(
+            ctx,
+            lib,
+            lib.scan_pdfs,
             query,
             folder=selected_folder,
             notebook=notebook,
@@ -504,7 +559,9 @@ def export_notebook(
     """
 
     with repository(ctx) as lib:
-        all_pages = lib.pages(notebook)
+        from .documents import export_pdf
+
+        all_pages = repository_query(ctx, lib, lib.pages, notebook)
         selected = (
             select_pages(pages, len(all_pages), maximum=len(all_pages))
             if pages is not None
@@ -535,7 +592,9 @@ def render(
     """
 
     with repository(ctx) as lib:
-        all_pages = lib.pages(notebook)
+        from .documents import render_page
+
+        all_pages = repository_query(ctx, lib, lib.pages, notebook)
         number = select_pages(str(page), len(all_pages))[0]
         emit(
             render_page(lib.sandbox, all_pages[number - 1], output, layer=layer, dpi=dpi),
@@ -559,11 +618,12 @@ def attach_pdf(
     """
 
     with repository(ctx) as lib:
-        item = lib.resolve(notebook, kind="notebook")
+        from .documents import register_annotated_pdf
+
+        item = repository_query(ctx, lib, lib.resolve, notebook, kind="notebook")
+        page_count = len(repository_query(ctx, lib, lib.pages, notebook))
         emit(
-            register_annotated_pdf(
-                lib.sandbox, item.id, pdf, expected_pages=len(lib.pages(notebook))
-            ),
+            register_annotated_pdf(lib.sandbox, item.id, pdf, expected_pages=page_count),
             settings(ctx),
         )
 
@@ -594,8 +654,10 @@ def bundle(
         raise GoodnotesError("--source must be all, pdf, handwriting, or textbox.")
     cfg = settings(ctx)
     with repository(ctx) as lib:
+        from .documents import render_pages
+
         sandbox = lib.sandbox
-        all_pages = lib.pages(notebook)
+        all_pages = repository_query(ctx, lib, lib.pages, notebook)
         selected = select_pages(pages, len(all_pages), maximum=10)
         destination = sandbox.ensure_output(output)
         parent_existed = destination.parent.exists()
@@ -605,14 +667,25 @@ def bundle(
             temporary = Path(tempfile.mkdtemp(prefix=".goodnotes-bundle-", dir=destination.parent))
             manifest = []
             remaining = max_chars
-            for number in selected:
-                filename = f"page-{number:04d}.png"
-                rendered = render_page(
-                    sandbox, all_pages[number - 1], temporary / filename, layer=layer, dpi=dpi
+            filenames = [f"page-{number:04d}.png" for number in selected]
+            rendered_pages = render_pages(
+                sandbox,
+                [all_pages[number - 1] for number in selected],
+                [temporary / filename for filename in filenames],
+                layer=layer,
+                dpi=dpi,
+            )
+            for number, filename, rendered in zip(selected, filenames, rendered_pages, strict=True):
+                page_data = repository_query(
+                    ctx,
+                    lib,
+                    lib.read_page,
+                    notebook,
+                    number,
+                    source=source,
+                    max_chars=remaining,
                 )
-                text = serializable(
-                    lib.read_page(notebook, number, source=source, max_chars=remaining)
-                )
+                text = serializable(page_data)
                 remaining -= sum(len(part["text"]) for part in text["parts"])
                 manifest.append(
                     {
@@ -731,7 +804,7 @@ def doctor(
         raise GoodnotesError("--library, --scratch-dir, and --output-dir require --access-only.")
     with repository(ctx) as lib:
         cfg = settings(ctx)
-        result = lib.stats()
+        result = repository_query(ctx, lib, lib.stats)
         result["storage"] = {
             "cache_dir": cfg.cache_dir,
             "snapshot_path": lib.sandbox.root,
@@ -909,7 +982,11 @@ def main() -> None:
         emit_error("invalid_arguments", exc.format_message())
         raise SystemExit(2) from None
     except GoodnotesError as exc:
-        emit_error(getattr(exc, "code", "operation_failed"), str(exc))
+        emit_error(
+            getattr(exc, "code", "operation_failed"),
+            str(exc),
+            details=getattr(exc, "details", None),
+        )
         raise SystemExit(1) from None
     except (BrokenPipeError, KeyboardInterrupt):
         raise SystemExit(130) from None

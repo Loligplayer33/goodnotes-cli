@@ -52,10 +52,13 @@ def tpl(
     width: float = 4.0,
     flags: list[int] | None = None,
     format_string: str = FORMAT,
+    starts: list[tuple[float, float]] | None = None,
+    segments: list[tuple[tuple[float, float], tuple[float, float]]] | None = None,
+    dash: tuple[float, ...] = (),
 ) -> bytes:
     points = points if points is not None else [(10.0, 20.0), (40.0, 20.0), (40.0, 50.0)]
-    starts = points[:1]
-    segments = list(zip(points, points[1:], strict=False))
+    starts = points[:1] if starts is None else starts
+    segments = list(zip(points, points[1:], strict=False)) if segments is None else segments
     flags = flags if flags is not None else [1] * (len(segments) + 1)
     values = struct.pack("<HfI", 0, width, len(flags))
     values += b"".join(struct.pack("<H", value) for value in flags)
@@ -64,7 +67,8 @@ def tpl(
     values += struct.pack("<I", len(segments))
     values += b"".join(struct.pack("<ffff", *start, *end) for start, end in segments)
     if format_string.endswith("vA(f)"):
-        values += struct.pack("<HI", 0, 0)
+        values += struct.pack("<HI", 0, len(dash))
+        values += b"".join(struct.pack("<d", value) for value in dash)
     contents = format_string.encode() + b"\0" + values
     return b"tpl\0" + struct.pack("<I", len(contents) + 8) + contents
 
@@ -227,6 +231,29 @@ def test_lasso_translation_and_rgba_survive_to_rendered_pixels(
     assert 120 <= green <= 135 and 120 <= blue <= 135
 
 
+def test_native_overlay_accepts_a_session_record_reader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    def read_from_session(root_uuid: str) -> list[tuple[bytes, bytes]]:
+        calls.append(root_uuid)
+        return native_records()
+
+    monkeypatch.setattr(
+        annotation_module, "read_page_records", lambda *_: pytest.fail("opened one-shot store")
+    )
+    overlay = render_native_overlay(
+        _FixtureSnapshot(),
+        page(),
+        width_points=72,
+        height_points=72,
+        record_reader=read_from_session,
+    )
+    assert calls == [ROOT_ID]
+    assert overlay.metadata["rendered_strokes"] == 1
+
+
 @pytest.mark.parametrize("compressed", [False, True])
 def test_both_apple_block_encodings_and_dot(compressed: bool) -> None:
     payload = framed(tpl(points=[(25.0, 35.0)]), compressed=compressed)
@@ -248,6 +275,166 @@ def test_observed_leading_zero_then_visible_segments_is_supported() -> None:
     body = decode_message(field(2, framed(tpl(flags=[0, 1, 1]))))
     inks = decode_ink(body)
     assert len(inks) == 1 and inks[0].points == ((10.0, 20.0), (40.0, 20.0), (40.0, 50.0))
+
+
+def test_exact_start_to_segment_matches_do_not_guess_multi_start_paths() -> None:
+    body = decode_message(
+        field(
+            2,
+            framed(
+                tpl(
+                    starts=[(10.0, 20.0), (80.0, 90.0)],
+                    segments=[
+                        ((10.0, 20.0), (40.0, 20.0)),
+                        ((80.0, 90.0), (100.0, 90.0)),
+                    ],
+                )
+            ),
+        )
+    )
+    with pytest.raises(ValueError, match="Ambiguous native ink starts and segments"):
+        decode_ink(body)
+
+
+def test_multiple_start_dots_are_not_joined() -> None:
+    body = decode_message(
+        field(
+            2,
+            framed(
+                tpl(
+                    starts=[(10.0, 20.0), (80.0, 90.0)],
+                    segments=[],
+                )
+            ),
+        )
+    )
+    inks = decode_ink(body)
+    svg = annotation_module._svg(inks, 72, 72, 72 / 132)
+    assert [ink.points for ink in inks] == [((10.0, 20.0),), ((80.0, 90.0),)]
+    assert svg.count(b"<circle") == 2 and b"<polyline" not in svg
+
+
+def test_unmatched_multiple_starts_with_segments_are_rejected() -> None:
+    body = decode_message(
+        field(
+            2,
+            framed(
+                tpl(
+                    starts=[(5.0, 6.0), (7.0, 8.0)],
+                    segments=[((10.0, 20.0), (40.0, 20.0))],
+                )
+            ),
+        )
+    )
+    with pytest.raises(ValueError, match="Ambiguous native ink starts and segments"):
+        decode_ink(body)
+
+
+def test_single_start_keeps_ordered_segment_samples_in_one_stroke() -> None:
+    body = decode_message(
+        field(
+            2,
+            framed(
+                tpl(
+                    starts=[(10.0, 20.0)],
+                    segments=[
+                        ((10.0, 20.0), (40.0, 20.0)),
+                        ((44.0, 20.0), (70.0, 20.0)),
+                    ],
+                )
+            ),
+        )
+    )
+    inks = decode_ink(body)
+    assert len(inks) == 1
+    assert inks[0].points == (
+        (10.0, 20.0),
+        (40.0, 20.0),
+        (44.0, 20.0),
+        (70.0, 20.0),
+    )
+
+
+def test_single_start_preserves_explicitly_ordered_retraced_segments() -> None:
+    body = decode_message(
+        field(
+            2,
+            framed(
+                tpl(
+                    starts=[(10.0, 20.0)],
+                    segments=[
+                        ((10.0, 20.0), (40.0, 20.0)),
+                        ((40.0, 20.0), (50.0, 20.0)),
+                        ((50.0, 20.0), (40.0, 20.0)),
+                        ((40.0, 20.0), (40.0, 30.0)),
+                    ],
+                )
+            ),
+        )
+    )
+    inks = decode_ink(body)
+    assert len(inks) == 1
+    assert inks[0].points == (
+        (10.0, 20.0),
+        (40.0, 20.0),
+        (50.0, 20.0),
+        (40.0, 20.0),
+        (40.0, 30.0),
+    )
+
+
+def test_multiple_segments_without_start_markers_are_rejected_as_ambiguous() -> None:
+    body = decode_message(
+        field(
+            2,
+            framed(
+                tpl(
+                    starts=[],
+                    segments=[
+                        ((10.0, 20.0), (40.0, 20.0)),
+                        ((80.0, 90.0), (100.0, 90.0)),
+                    ],
+                )
+            ),
+        )
+    )
+    with pytest.raises(ValueError, match="segments without start markers"):
+        decode_ink(body)
+
+
+def test_conflicting_start_markers_with_segments_are_rejected() -> None:
+    body = decode_message(
+        field(
+            2,
+            framed(
+                tpl(
+                    starts=[(10.0, 20.0), (10.0005, 20.0)],
+                    segments=[
+                        ((10.0, 20.0), (40.0, 20.0)),
+                        ((80.0, 90.0), (100.0, 90.0)),
+                    ],
+                )
+            ),
+        )
+    )
+    with pytest.raises(ValueError, match="Ambiguous native ink starts and segments"):
+        decode_ink(body)
+
+
+def test_nonempty_native_dash_pattern_is_preserved() -> None:
+    body = decode_message(field(2, framed(tpl(format_string=FORMAT + "vA(f)", dash=(4.5, 2.25)))))
+    ink = decode_ink(body)[0]
+    assert ink.dash == (4.5, 2.25)
+    assert b'stroke-dasharray="2.454545 1.227273"' in annotation_module._svg(
+        [ink], 72, 72, 72 / 132
+    )
+
+
+@pytest.mark.parametrize("dash", [(-1.0, 2.0), (math.nan, 2.0)])
+def test_invalid_nonempty_native_dash_pattern_is_rejected(dash: tuple[float, ...]) -> None:
+    body = decode_message(field(2, framed(tpl(format_string=FORMAT + "vA(f)", dash=dash))))
+    with pytest.raises(ValueError, match="Unsupported native dash pattern"):
+        decode_ink(body)
 
 
 @pytest.mark.parametrize(

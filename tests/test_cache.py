@@ -18,8 +18,14 @@ import pytest
 
 import goodnotes_cli.cache as cache_module
 from goodnotes_cli.config import Settings
-from goodnotes_cli.errors import GoodnotesError, StaleSnapshotError
+from goodnotes_cli.errors import (
+    CacheAccessError,
+    FilesystemAccessError,
+    GoodnotesError,
+    StaleSnapshotError,
+)
 from goodnotes_cli.safety import Sandbox
+from goodnotes_cli.snapshot import _InventoryChanged
 
 
 def make_library(root: Path) -> Path:
@@ -106,6 +112,56 @@ def test_refresh_skips_capture_when_source_inventory_is_unchanged(
     assert stats["source_captured_files"] == stats["source_captured_bytes"] == 0
     assert stats["cache_reused_files"] == stats["cache_reused_bytes"] == 0
     assert stats["source_bytes_hashed"] == stats["byte_copied_bytes"] == 0
+
+
+def test_missing_source_library_root_is_a_structured_input_error(tmp_path: Path) -> None:
+    missing = tmp_path / "missing-library"
+
+    with pytest.raises(FilesystemAccessError) as captured:
+        cache_module._input_signature(missing)
+
+    error = captured.value
+    assert error.code == "source_unavailable"
+    assert error.details["operation"] == "inspect_source_library"
+    assert error.details["path"] == str(missing)
+
+
+def test_disappearing_child_directory_remains_a_transient_inventory_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = make_library(tmp_path / "source")
+    database_dir = source / "Databases"
+    original_source_lstat = cache_module._source_lstat
+
+    def disappear_child(path: Path) -> os.stat_result:
+        if path == database_dir:
+            raise _InventoryChanged(f"Generated child disappeared: {path}")
+        return original_source_lstat(path)
+
+    monkeypatch.setattr(cache_module, "_source_lstat", disappear_child)
+    with pytest.raises(_InventoryChanged, match="Generated child disappeared"):
+        cache_module._input_signature(source)
+
+
+def test_changed_source_skips_unnecessary_active_cache_inventory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = make_library(tmp_path / "source")
+    data_dir = tmp_path / "cache"
+    first = cache_module.refresh_cache(source, data_dir)
+    (source / "Attachments/page.pdf").write_bytes(b"changed source attachment")
+    active_library = Path(str(first["snapshot"])) / "Library"
+    original_signature = cache_module._input_signature
+    inspected: list[Path] = []
+
+    def record_signature(path: Path, *, include_root: bool = False) -> str:
+        inspected.append(path)
+        return original_signature(path, include_root=include_root)
+
+    monkeypatch.setattr(cache_module, "_input_signature", record_signature)
+    cache_module.refresh_cache(source, data_dir)
+
+    assert active_library not in inspected
 
 
 def test_native_change_refreshes_only_changed_files_and_prunes_previous_generation(
@@ -348,6 +404,114 @@ def test_source_change_during_refresh_is_reported_with_snapshot_time(
     assert pointer["source_changed_during_refresh"] is True
     assert "source_signature" not in pointer
     assert (root / "Library" / "Attachments" / "page.pdf").read_bytes() == before_capture
+
+
+def test_mid_final_inventory_mutation_publishes_the_validated_stale_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = make_library(tmp_path / "source")
+    attachment = source / "Attachments/page.pdf"
+    captured_bytes = attachment.read_bytes()
+    data_dir = tmp_path / "cache"
+    original_input_signature = cache_module._input_signature
+    original_lstat = cache_module._lstat
+    source_scans = 0
+    final_scan = False
+    mutated = False
+
+    def mark_final_scan(path: Path, *, include_root: bool = False) -> str:
+        nonlocal source_scans, final_scan
+        if path == source and not include_root:
+            source_scans += 1
+            final_scan = source_scans == 2
+        return original_input_signature(path, include_root=include_root)
+
+    def mutate_after_inventory_stat(path: Path) -> os.stat_result:
+        nonlocal final_scan, mutated
+        info = original_lstat(path)
+        if final_scan and path == attachment and not mutated:
+            attachment.write_bytes(b"edited during final source scan")
+            mutated = True
+            final_scan = False
+        return info
+
+    monkeypatch.setattr(cache_module, "_input_signature", mark_final_scan)
+    monkeypatch.setattr(cache_module, "_lstat", mutate_after_inventory_stat)
+    result = cache_module.refresh_cache(source, data_dir)
+    root = Path(str(result["snapshot"]))
+    pointer = active_pointer(data_dir)
+
+    assert mutated
+    assert result["source_changed_during_refresh"] is True
+    assert pointer["source_changed_during_refresh"] is True
+    assert "source_signature" not in pointer
+    assert (root / "Library/Attachments/page.pdf").read_bytes() == captured_bytes
+    assert Sandbox.load(root).root == root
+
+
+def test_final_inventory_permission_error_preserves_active_pointer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = make_library(tmp_path / "source")
+    data_dir = tmp_path / "cache"
+    first = cache_module.refresh_cache(source, data_dir)
+    old_pointer = (data_dir / "active.json").read_bytes()
+    old_snapshot = Path(str(first["snapshot"]))
+    (source / "Attachments/page.pdf").write_bytes(b"changed before denied scan")
+    original_signature = cache_module._source_input_signature
+    signatures = 0
+
+    def deny_final_scan(path: Path) -> str:
+        nonlocal signatures
+        signatures += 1
+        if signatures == 2:
+            raise FilesystemAccessError(
+                "source_permission_denied",
+                "Generated final inventory denial",
+                operation="inventory_source_library",
+                path=path / "Attachments",
+                remedy="Generated read remedy.",
+            )
+        return original_signature(path)
+
+    monkeypatch.setattr(cache_module, "_source_input_signature", deny_final_scan)
+    with pytest.raises(FilesystemAccessError) as error:
+        cache_module.refresh_cache(source, data_dir)
+
+    assert error.value.code == "source_permission_denied"
+    assert (data_dir / "active.json").read_bytes() == old_pointer
+    assert old_snapshot.is_dir()
+    assert len(generated_snapshots(data_dir)) == 1
+
+
+def test_final_inventory_unsafe_state_is_not_treated_as_a_source_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = make_library(tmp_path / "source")
+    data_dir = tmp_path / "cache"
+    first = cache_module.refresh_cache(source, data_dir)
+    old_pointer = (data_dir / "active.json").read_bytes()
+    old_snapshot = Path(str(first["snapshot"]))
+    attachment = source / "Attachments/page.pdf"
+    attachment.write_bytes(b"change that starts refresh")
+    original_signature = cache_module._source_input_signature
+    signatures = 0
+
+    def install_unsafe_source(path: Path) -> str:
+        nonlocal signatures
+        signatures += 1
+        if signatures == 2:
+            attachment.unlink()
+            attachment.symlink_to(tmp_path / "external-target")
+        return original_signature(path)
+
+    monkeypatch.setattr(cache_module, "_source_input_signature", install_unsafe_source)
+    with pytest.raises(GoodnotesError, match="Symlinks are not allowed"):
+        cache_module.refresh_cache(source, data_dir)
+
+    assert (data_dir / "active.json").read_bytes() == old_pointer
+    assert old_snapshot.is_dir()
+    assert len(generated_snapshots(data_dir)) == 1
 
 
 def test_attachment_and_wal_metadata_changes_trigger_refresh(tmp_path: Path) -> None:
@@ -690,6 +854,28 @@ def test_read_view_reports_malformed_active_pointer(tmp_path: Path) -> None:
             pass
 
     _assert_cache_access_error(error.value, code="cache_invalid", path=pointer)
+
+
+def test_settings_load_uses_canonical_pointer_validation_and_relative_cache_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = make_library(tmp_path / "source")
+    cache = tmp_path / "cache"
+    first = cache_module.refresh_cache(source, cache)
+    monkeypatch.chdir(tmp_path)
+
+    loaded = Settings(data_dir=Path("./cache")).load_sandbox()
+    assert loaded.root == Path(str(first["snapshot"]))
+
+    outside = cache_module.create_snapshot(source, tmp_path / "outside")
+    pointer_path = cache / "active.json"
+    pointer = active_pointer(cache)
+    pointer["snapshot"] = str(outside)
+    pointer["absolutePath"] = str(outside)
+    pointer_path.write_text(json.dumps(pointer), encoding="utf-8")
+    with pytest.raises(CacheAccessError) as error:
+        Settings(data_dir=Path("./cache")).load_sandbox()
+    assert error.value.code == "cache_invalid"
 
 
 @pytest.mark.parametrize("error_type", [PermissionError, GoodnotesError])

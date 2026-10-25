@@ -6,16 +6,53 @@ import sqlite3
 from collections.abc import Iterator, Mapping
 from typing import Any, Literal, TypedDict, TypeVar
 
+from .errors import GoodnotesError
 from .models import PageRef
 
 SQL_BIND_LIMIT = 400
-_TEXT_TABLES = {
+TEXT_TABLES = {
     "handwriting": "annotation_text_content",
     "textbox": "textbox_text_content",
     "pdf": "pdf_text_content",
 }
-_TEXT_LABELS = {"handwriting": "Handwriting", "textbox": "Textbox", "pdf": "PDF"}
+TEXT_LABELS = {"handwriting": "Handwriting", "textbox": "Textbox", "pdf": "PDF"}
 _Value = TypeVar("_Value")
+
+
+def _required_integer(value: Any, field: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise GoodnotesError(f"Search index has an invalid `{field}`; expected an integer.")
+    return value
+
+
+class SchemaCache:
+    """Cache immutable schema metadata for one read-only SQLite session."""
+
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self.connection = connection
+        self._tables: set[str] | None = None
+        self._columns: dict[str, set[str]] = {}
+
+    def table_exists(self, name: str) -> bool:
+        if self._tables is None:
+            self._tables = {
+                str(row[0])
+                for row in self.connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type IN ('table', 'view')"
+                )
+            }
+        return name in self._tables
+
+    def table_columns(self, table: str) -> set[str]:
+        if table not in self._columns:
+            if not self.table_exists(table):
+                self._columns[table] = set()
+            else:
+                quoted = '"' + table.replace('"', '""') + '"'
+                self._columns[table] = {
+                    str(row[1]) for row in self.connection.execute(f"PRAGMA table_info({quoted})")
+                }
+        return set(self._columns[table])
 
 
 class _PDFPageBinding(TypedDict):
@@ -36,19 +73,26 @@ class _PDFPageBindings(TypedDict):
     pages: dict[str, _PDFPageBinding]
 
 
-def table_exists(connection: sqlite3.Connection | None, name: str) -> bool:
-    return (
-        connection is not None
-        and connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type IN ('table', 'view') AND name = ?",
-            (name,),
-        ).fetchone()
-        is not None
+def table_exists(
+    connection: sqlite3.Connection | None,
+    name: str,
+    *,
+    schema: SchemaCache | None = None,
+) -> bool:
+    return connection is not None and (
+        schema.table_exists(name)
+        if schema is not None
+        else SchemaCache(connection).table_exists(name)
     )
 
 
-def table_columns(connection: sqlite3.Connection, table: str) -> set[str]:
-    return {str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
+def table_columns(
+    connection: sqlite3.Connection,
+    table: str,
+    *,
+    schema: SchemaCache | None = None,
+) -> set[str]:
+    return (schema or SchemaCache(connection)).table_columns(table)
 
 
 def _parse_template_mapping(value: Any) -> tuple[str, int] | None:
@@ -64,28 +108,34 @@ def _parse_template_mapping(value: Any) -> tuple[str, int] | None:
     return (attachment_id, page_number) if page_number > 0 else None
 
 
-def page_meta_supports_search(connection: sqlite3.Connection | None) -> bool:
+def page_meta_supports_search(
+    connection: sqlite3.Connection | None, *, schema: SchemaCache | None = None
+) -> bool:
     return (
         connection is not None
-        and table_exists(connection, "page_meta")
+        and table_exists(connection, "page_meta", schema=schema)
         and {
             "page_id",
             "document_id",
         }
-        <= table_columns(connection, "page_meta")
+        <= table_columns(connection, "page_meta", schema=schema)
     )
 
 
-def page_meta_supports_pdf_mapping(connection: sqlite3.Connection | None) -> bool:
+def page_meta_supports_pdf_mapping(
+    connection: sqlite3.Connection | None, *, schema: SchemaCache | None = None
+) -> bool:
     """Whether page ids can be mapped to the current document catalog."""
-    return page_meta_supports_search(connection)
+    return page_meta_supports_search(connection, schema=schema)
 
 
-def pdf_identity_schema_available(connection: sqlite3.Connection | None) -> bool:
+def pdf_identity_schema_available(
+    connection: sqlite3.Connection | None, *, schema: SchemaCache | None = None
+) -> bool:
     return (
         connection is not None
-        and page_meta_supports_pdf_mapping(connection)
-        and table_exists(connection, "pdf_text_content")
+        and page_meta_supports_pdf_mapping(connection, schema=schema)
+        and table_exists(connection, "pdf_text_content", schema=schema)
         and {
             "text_id",
             "text",
@@ -93,15 +143,20 @@ def pdf_identity_schema_available(connection: sqlite3.Connection | None) -> bool
             "attachment_id",
             "pdf_page_no",
         }
-        <= table_columns(connection, "pdf_text_content")
+        <= table_columns(connection, "pdf_text_content", schema=schema)
     )
 
 
-def search_source_available(connection: sqlite3.Connection, source: str) -> bool:
-    table = _TEXT_TABLES[source]
-    if not table_exists(connection, table):
+def search_source_available(
+    connection: sqlite3.Connection,
+    source: str,
+    *,
+    schema: SchemaCache | None = None,
+) -> bool:
+    table = TEXT_TABLES[source]
+    if not table_exists(connection, table, schema=schema):
         return False
-    columns = table_columns(connection, table)
+    columns = table_columns(connection, table, schema=schema)
     required = {"text"}
     if source in {"handwriting", "textbox"}:
         required |= {"page_id", "text_id"}
@@ -114,12 +169,15 @@ def recognition_status(
     projection: sqlite3.Connection,
     fts: sqlite3.Connection | None,
     page_ids: list[str],
+    *,
+    projection_schema: SchemaCache | None = None,
+    fts_schema: SchemaCache | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Return per-page row counts and index flags without materializing text values."""
     if not page_ids:
         return {}
     needs_index_by_page: dict[str, Any] = {}
-    if "needs_index" in table_columns(projection, "pages"):
+    if "needs_index" in table_columns(projection, "pages", schema=projection_schema):
         for batch in id_batches(page_ids):
             placeholders = ", ".join("?" for _ in batch)
             rows = projection.execute(
@@ -129,9 +187,9 @@ def recognition_status(
             needs_index_by_page.update({row["id"]: row["needs_index"] for row in rows})
 
     text_rows_by_page: dict[str, tuple[int, int]] = {}
-    content_available = table_exists(fts, "annotation_text_content")
+    content_available = table_exists(fts, "annotation_text_content", schema=fts_schema)
     if content_available and fts is not None:
-        columns = table_columns(fts, "annotation_text_content")
+        columns = table_columns(fts, "annotation_text_content", schema=fts_schema)
         content_available = {"page_id", "text"} <= columns
         if content_available:
             for batch in id_batches(page_ids):
@@ -195,7 +253,12 @@ def matches_pdf_identity(row: Mapping[str, Any], page_ref: PageRef) -> bool:
     )
 
 
-def pdf_page_bindings(fts: sqlite3.Connection | None, page_refs: list[PageRef]) -> _PDFPageBindings:
+def pdf_page_bindings(
+    fts: sqlite3.Connection | None,
+    page_refs: list[PageRef],
+    *,
+    schema: SchemaCache | None = None,
+) -> _PDFPageBindings:
     """Bind active pages to indexed PDF rows only when full PDF identity matches."""
     bindings: dict[str, _PDFPageBinding] = {
         ref.page_id: {
@@ -213,10 +276,10 @@ def pdf_page_bindings(fts: sqlite3.Connection | None, page_refs: list[PageRef]) 
         for ref in page_refs
     }
     unavailable: _PDFPageBindings = {"available": False, "pages": bindings}
-    if not pdf_identity_schema_available(fts) or fts is None:
+    if not pdf_identity_schema_available(fts, schema=schema) or fts is None:
         return unavailable
 
-    page_meta_columns = table_columns(fts, "page_meta")
+    page_meta_columns = table_columns(fts, "page_meta", schema=schema)
     selected = ["page_id", "document_id"]
     for optional in (
         "pdf_text_id",
@@ -273,13 +336,14 @@ def pdf_page_bindings(fts: sqlite3.Connection | None, page_refs: list[PageRef]) 
         binding["reason"] = None
         eligible[page_ref.page_id] = page_ref
         if direct_id is not None:
+            direct_id = _required_integer(direct_id, "page_meta.pdf_text_id")
             direct_id_to_pages.setdefault(direct_id, []).append(page_ref)
 
     candidate_lengths: dict[str, dict[int, int]] = {page_id: {} for page_id in eligible}
     direct_ids = list(direct_id_to_pages)
     for direct_id_batch in batches(direct_ids):
         placeholders = ", ".join("?" for _ in direct_id_batch)
-        rows = fts.execute(
+        direct_rows = fts.execute(
             f"""
             SELECT text_id, document_id, attachment_id, pdf_page_no,
                    length(COALESCE(text, '')) AS text_length
@@ -287,15 +351,26 @@ def pdf_page_bindings(fts: sqlite3.Connection | None, page_refs: list[PageRef]) 
             WHERE text_id IN ({placeholders})
             """,
             direct_id_batch,
-        )
-        rows_by_id = {row["text_id"]: row for row in rows}
+        ).fetchall()
+        rows_by_id: dict[int, sqlite3.Row] = {}
+        for row in direct_rows:
+            text_id = _required_integer(row["text_id"], "pdf_text_content.text_id")
+            text_length = _required_integer(row["text_length"], "pdf_text_content.text length")
+            if text_length < 0:
+                raise GoodnotesError(
+                    "Search index has an invalid `pdf_text_content.text` length; "
+                    "expected a non-negative integer."
+                )
+            rows_by_id[text_id] = row
         for direct_id in direct_id_batch:
             row = rows_by_id.get(direct_id)
             for page_ref in direct_id_to_pages[direct_id]:
                 if row is not None and matches_pdf_identity(dict(row), page_ref):
-                    text_length = int(row["text_length"] or 0)
+                    text_length = _required_integer(
+                        row["text_length"], "pdf_text_content.text length"
+                    )
                     if text_length:
-                        candidate_lengths[page_ref.page_id][int(direct_id)] = text_length
+                        candidate_lengths[page_ref.page_id][direct_id] = text_length
                 else:
                     bindings[page_ref.page_id]["mismatched_direct_pointer"] = True
 
@@ -340,9 +415,14 @@ def pdf_page_bindings(fts: sqlite3.Connection | None, page_refs: list[PageRef]) 
             if candidate_page_ref is not None and matches_pdf_identity(
                 dict(row), candidate_page_ref
             ):
-                candidate_lengths[candidate_page_ref.page_id][int(row["text_id"])] = int(
-                    row["text_length"] or 0
-                )
+                text_id = _required_integer(row["text_id"], "pdf_text_content.text_id")
+                text_length = _required_integer(row["text_length"], "pdf_text_content.text length")
+                if text_length < 0:
+                    raise GoodnotesError(
+                        "Search index has an invalid `pdf_text_content.text` length; "
+                        "expected a non-negative integer."
+                    )
+                candidate_lengths[candidate_page_ref.page_id][text_id] = text_length
 
     for page_id, lengths in candidate_lengths.items():
         binding = bindings[page_id]
@@ -358,9 +438,12 @@ def coverage(
     fts: sqlite3.Connection | None,
     page_refs: list[PageRef],
     requested_sources: list[str] | None = None,
+    *,
+    schema: SchemaCache | None = None,
+    pdf_bindings: _PDFPageBindings | None = None,
 ) -> dict[str, Any]:
     """Return scoped mapping diagnostics and aggregates for requested text sources."""
-    page_meta = _page_meta_diagnostics(fts, page_refs)
+    page_meta = _page_meta_diagnostics(fts, page_refs, schema=schema)
     sources: dict[str, dict[str, Any]] = {}
     warnings: list[str] = []
     if not page_meta["available"]:
@@ -377,10 +460,18 @@ def coverage(
         )
 
     page_ids = [page_ref.page_id for page_ref in page_refs]
-    source_names = list(_TEXT_TABLES) if requested_sources is None else requested_sources
+    source_names = list(TEXT_TABLES) if requested_sources is None else requested_sources
     for source in source_names:
-        table = _TEXT_TABLES[source]
-        details, source_warnings = _source_coverage(fts, source, table, page_ids, page_refs)
+        table = TEXT_TABLES[source]
+        details, source_warnings = _source_coverage(
+            fts,
+            source,
+            table,
+            page_ids,
+            page_refs,
+            schema=schema,
+            pdf_bindings=pdf_bindings if source == "pdf" else None,
+        )
         sources[source] = details
         warnings.extend(source_warnings)
         if details.get("metadata_without_nonempty_text_pages", 0):
@@ -397,8 +488,11 @@ def _source_coverage(
     table: str,
     page_ids: list[str],
     page_refs: list[PageRef],
+    *,
+    schema: SchemaCache | None,
+    pdf_bindings: _PDFPageBindings | None,
 ) -> tuple[dict[str, Any], list[str]]:
-    label = _TEXT_LABELS[source]
+    label = TEXT_LABELS[source]
     details: dict[str, Any] = {
         "availability": "unavailable",
         "pages_with_stored_nonempty_text": None,
@@ -406,10 +500,10 @@ def _source_coverage(
         "text_chars": None,
         "completeness": "unknown",
     }
-    if not table_exists(fts, table) or fts is None:
+    if not table_exists(fts, table, schema=schema) or fts is None:
         return details, [f"{label} text is unavailable in the stored search index."]
 
-    columns = table_columns(fts, table)
+    columns = table_columns(fts, table, schema=schema)
     required = {"text"}
     if source in {"handwriting", "textbox"}:
         required.add("page_id")
@@ -443,7 +537,7 @@ def _source_coverage(
         details["text_chars"] = sum(chars for _, chars in counts.values())
         return details, []
 
-    pdf_stats, warnings = _pdf_coverage(fts, page_refs)
+    pdf_stats, warnings = _pdf_coverage(fts, page_refs, schema=schema, binding_result=pdf_bindings)
     details.update(pdf_stats)
     if pdf_stats["pages_with_stored_nonempty_text"] is None:
         details["availability"] = "unavailable"
@@ -451,7 +545,11 @@ def _source_coverage(
 
 
 def _pdf_coverage(
-    fts: sqlite3.Connection | None, page_refs: list[PageRef]
+    fts: sqlite3.Connection | None,
+    page_refs: list[PageRef],
+    *,
+    schema: SchemaCache | None = None,
+    binding_result: _PDFPageBindings | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     empty_stats = {
         "pages_with_stored_nonempty_text": None,
@@ -461,7 +559,7 @@ def _pdf_coverage(
         "unverifiable_pages": len(page_refs),
         "mismatched_direct_pointers": None,
     }
-    binding_result = pdf_page_bindings(fts, page_refs)
+    binding_result = binding_result or pdf_page_bindings(fts, page_refs, schema=schema)
     if not binding_result["available"]:
         return empty_stats, [
             "PDF text identity cannot be verified because required page or content metadata "
@@ -499,7 +597,10 @@ def _pdf_coverage(
 
 
 def _page_meta_diagnostics(
-    fts: sqlite3.Connection | None, page_refs: list[PageRef]
+    fts: sqlite3.Connection | None,
+    page_refs: list[PageRef],
+    *,
+    schema: SchemaCache | None = None,
 ) -> dict[str, Any]:
     active_page_ids = {page_ref.page_id for page_ref in page_refs}
     empty = {
@@ -509,9 +610,9 @@ def _page_meta_diagnostics(
         "active_pages_without_metadata": None,
         "stale_or_mismatched_pages": None,
     }
-    if not table_exists(fts, "page_meta") or fts is None:
+    if not table_exists(fts, "page_meta", schema=schema) or fts is None:
         return empty
-    columns = table_columns(fts, "page_meta")
+    columns = table_columns(fts, "page_meta", schema=schema)
     if "page_id" not in columns:
         return empty
     valid_mapping = {"page_id", "document_id"} <= columns
@@ -558,7 +659,7 @@ def page_meta_live_filter(columns: set[str], *, alias: str) -> str:
 def search_pdf_rows(
     fts: sqlite3.Connection,
     binding_result: _PDFPageBindings,
-    query: str,
+    folded_query: str,
     document_ids: list[str] | None = None,
 ) -> Iterator[sqlite3.Row]:
     """Search only rows already bound to projection-derived page identities."""
@@ -581,7 +682,7 @@ def search_pdf_rows(
     batch_size = max(1, SQL_BIND_LIMIT // 6)
     for batch in batches(bound_rows, batch_size):
         values_sql = ", ".join("(?, ?, ?, ?, ?)" for _ in batch)
-        parameters = tuple(value for row in batch for value in row) + (query,)
+        parameters = tuple(value for row in batch for value in row) + (folded_query,)
         yield from fts.execute(
             f"""
             WITH bound_rows(page_id, document_id, attachment_id, pdf_page_no, text_id)
@@ -595,7 +696,7 @@ def search_pdf_rows(
              AND content.attachment_id = bound.attachment_id
              AND content.pdf_page_no = bound.pdf_page_no
             WHERE COALESCE(content.text, '') <> ''
-              AND instr(casefold(content.text), casefold(?)) > 0
+              AND instr(casefold(content.text), ?) > 0
             ORDER BY content.text_id
             """,
             parameters,

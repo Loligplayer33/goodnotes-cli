@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from helpers import invoke_in_process
 from test_cli import _tree_manifest, successful
 from test_cli import invoke as invoke_full
 from test_library import _create_snapshot
@@ -435,7 +436,7 @@ def test_invalid_bundle_source_fails_before_cache_or_output_access(tmp_path: Pat
 
 
 def test_schema_advertises_concise_defaults_and_verbose_without_a_library(tmp_path: Path) -> None:
-    result = successful(invoke(["schema", "bundle"], tmp_path))
+    result = successful(invoke_in_process(["schema", "bundle"], tmp_path))
     assert "page_evidence" in result["output"]["fields"]
     assert "text_source" in result["output"]["fields"]
     assert result["output"]["default_output"]["mode"] == "concise"

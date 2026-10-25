@@ -1,4 +1,4 @@
-"""Subprocess tests of the installed agent command contract."""
+"""CLI contract tests; subprocesses cover behavior that needs process boundaries."""
 
 from __future__ import annotations
 
@@ -14,7 +14,8 @@ from pathlib import Path
 
 import pymupdf
 import pytest
-from test_library import _create_snapshot
+from helpers import invoke_in_process
+from test_library import _add_repeated_fallback_pages, _create_snapshot
 
 import goodnotes_cli.cache as cache_module
 
@@ -245,20 +246,165 @@ def _restore_tree_writable(root: Path) -> None:
 
 
 def test_schema_needs_no_library(tmp_path: Path) -> None:
-    data = successful(invoke(["schema"], tmp_path))
+    data = successful(invoke_in_process(["schema"], tmp_path))
     assert data["page_numbers"] == "one-based"
     assert data["limits"]["read_pages"] == 20
 
 
 def test_schema_explains_field_projection_without_loading_notes(tmp_path: Path) -> None:
-    reading = successful(invoke(["schema", "read"], tmp_path))
+    reading = successful(invoke_in_process(["schema", "read"], tmp_path))
     assert reading["output"]["projection"] == "pages[]"
     assert "parts" in reading["output"]["fields"]
     assert "page_id" in reading["output"]["fields"]
-    pages = successful(invoke(["schema", "pages"], tmp_path))
+    pages = successful(invoke_in_process(["schema", "pages"], tmp_path))
     assert "number" in pages["output"]["fields"]
     assert "recognition" in pages["output"]["optional_fields"]
     assert not (tmp_path / "state").exists()
+
+
+def test_doctor_schema_documents_access_only_projection(tmp_path: Path) -> None:
+    data = successful(invoke_in_process(["schema", "doctor"], tmp_path))
+    output = data["output"]
+    assert "active_pages" in output["fields"]
+    assert "status" in output["optional_fields"]
+    assert "status" not in output["variants"]["default"]["fields"]
+    assert "status" in output["variants"]["access_only"]["fields"]
+    assert "active_pages" not in output["variants"]["access_only"]["fields"]
+
+
+def test_doctor_access_only_fields_are_preflighted_and_projected(tmp_path: Path) -> None:
+    invalid = invoke_in_process(["--fields", "status", "doctor"], tmp_path)
+    assert invalid.returncode == 1
+    assert "Unknown output fields: status" in json.loads(invalid.stderr)["error"]["message"]
+    assert not (tmp_path / "state").exists()
+
+    invalid_variant = invoke_in_process(
+        ["--fields", "active_pages", "doctor", "--access-only"], tmp_path
+    )
+    assert invalid_variant.returncode == 1
+    assert (
+        "Unknown output fields: active_pages"
+        in json.loads(invalid_variant.stderr)["error"]["message"]
+    )
+    assert not (tmp_path / "state").exists()
+
+    result = successful(
+        invoke_in_process(["--fields", "status,checks", "doctor", "--access-only"], tmp_path)
+    )
+    assert result["status"] == "issues"
+    assert isinstance(result["checks"], list)
+    assert not (tmp_path / "state").exists()
+
+
+def test_cli_module_import_does_not_load_pymupdf(tmp_path: Path) -> None:
+    command = [
+        sys.executable,
+        "-c",
+        "import sys; import goodnotes_cli.cli; assert 'pymupdf' not in sys.modules",
+    ]
+    result = subprocess.run(
+        command,
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_main_fallback_preserves_structured_error_details(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from goodnotes_cli import cli
+
+    def fail(*args: object, **kwargs: object) -> None:
+        raise CacheAccessError(
+            "cache_invalid",
+            "Malformed selected cache.",
+            operation="read_test_snapshot",
+            path="/synthetic/cache",
+        )
+
+    from goodnotes_cli.errors import CacheAccessError
+
+    monkeypatch.setattr(cli, "app", fail)
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main()
+
+    assert exit_info.value.code == 1
+    error = json.loads(capsys.readouterr().err)["error"]
+    assert error["code"] == "cache_invalid"
+    assert error["details"]["operation"] == "read_test_snapshot"
+    assert error["details"]["path"] == "/synthetic/cache"
+
+
+def test_main_keeps_broken_pipe_exit_code(monkeypatch: pytest.MonkeyPatch) -> None:
+    from goodnotes_cli import cli
+
+    def fail(*args: object, **kwargs: object) -> None:
+        raise BrokenPipeError
+
+    monkeypatch.setattr(cli, "app", fail)
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main()
+    assert exit_info.value.code == 130
+
+
+def test_command_broken_pipe_reaches_process_exit_handling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from goodnotes_cli import cli
+
+    def fail(*args: object, **kwargs: object) -> None:
+        raise BrokenPipeError
+
+    monkeypatch.setattr(cli, "emit", fail)
+    monkeypatch.setattr(sys, "argv", ["goodnotes", "schema"])
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main()
+    assert exit_info.value.code == 130
+
+
+def test_repository_query_sqlite_failure_is_structured_as_cache_error(
+    library_copy: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from goodnotes_cli.library import Library
+
+    def fail(*args: object, **kwargs: object) -> None:
+        raise sqlite3.OperationalError("synthetic query failure")
+
+    monkeypatch.setattr(Library, "list_items", fail)
+    result = invoke_in_process(["ls"], tmp_path, sandbox=library_copy)
+
+    assert result.returncode == 1
+    error = json.loads(result.stderr)["error"]
+    assert error["code"] == "cache_invalid"
+    assert error["details"]["operation"] == "query_snapshot_library"
+    assert error["details"]["path"] == str(library_copy)
+    assert error["details"]["remedy"]
+
+
+def test_document_sqlite_failure_is_not_classified_as_cache_access(
+    library_copy: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from goodnotes_cli import documents
+
+    def fail(*args: object, **kwargs: object) -> None:
+        raise sqlite3.OperationalError("synthetic document failure")
+
+    monkeypatch.setattr(documents, "export_pdf", fail)
+    result = invoke_in_process(
+        ["export", "doc-hostile", "--output", str(tmp_path / "output.pdf")],
+        tmp_path,
+        sandbox=library_copy,
+    )
+
+    assert result.returncode == 1
+    error = json.loads(result.stderr)["error"]
+    assert error["code"] == "operation_failed"
+    assert "details" not in error
 
 
 def test_field_errors_show_the_projection_level_and_valid_keys(
@@ -590,7 +736,7 @@ def test_schema_covers_every_registered_command(tmp_path: Path) -> None:
 
     from goodnotes_cli.cli import app
 
-    data = successful(invoke(["schema"], tmp_path))
+    data = successful(invoke_in_process(["schema"], tmp_path))
     group = get_command(app)
     assert isinstance(group, TyperGroup)
     assert set(data["commands"]) == set(group.commands)
@@ -620,29 +766,29 @@ def test_schema_covers_every_registered_command(tmp_path: Path) -> None:
     ],
 )
 def test_targeted_schema_and_help_need_no_library(command_name: str, tmp_path: Path) -> None:
-    data = successful(invoke(["schema", command_name], tmp_path))
+    data = successful(invoke_in_process(["schema", command_name], tmp_path))
     assert data["command"] == command_name
     assert any("--help" in p["flags"] for p in data["options"])
     assert any(p.get("envvar") == "GOODNOTES_DATA_DIR" for p in data["global_options"])
-    help_result = invoke([command_name, "--help"], tmp_path)
+    help_result = invoke_in_process([command_name, "--help"], tmp_path)
     assert help_result.returncode == 0
     assert "Example:" in help_result.stdout
     assert not (tmp_path / "state").exists()
 
 
 def test_targeted_schema_describes_actual_bounds_and_parameter_kinds(tmp_path: Path) -> None:
-    read = successful(invoke(["schema", "read"], tmp_path))
+    read = successful(invoke_in_process(["schema", "read"], tmp_path))
     budget = next(p for p in read["options"] if p["name"] == "max_chars")
     assert (budget["default"], budget["min"], budget["max"]) == (12000, 1, 1000000)
     assert read["arguments"][0]["name"] == "notebook"
-    listing = successful(invoke(["schema", "ls"], tmp_path))
+    listing = successful(invoke_in_process(["schema", "ls"], tmp_path))
     assert listing["arguments"] == []
     folder = next(p for p in listing["options"] if p["name"] == "folder")
     assert folder["flags"] == ["--folder"]
     assert folder["default"] == "/"
-    capture = successful(invoke(["schema", "snapshot"], tmp_path))
+    capture = successful(invoke_in_process(["schema", "snapshot"], tmp_path))
     assert [p["name"] for p in capture["arguments"]] == ["library", "destination"]
-    sync = successful(invoke(["schema", "sync"], tmp_path))
+    sync = successful(invoke_in_process(["schema", "sync"], tmp_path))
     force = next(p for p in sync["options"] if p["name"] == "force")
     assert force["flags"] == ["--force", "--no-force"]
 
@@ -786,6 +932,33 @@ def test_read_reports_budget_and_preserves_handwriting(library_copy: Path, tmp_p
         )
     )
     assert any("|" in part["text"] for part in raw["pages"][0]["parts"])
+
+
+def test_read_reuses_one_pdf_document_across_selected_pages(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sandbox = _create_snapshot(tmp_path / "snapshot", with_fts=False)
+    _add_repeated_fallback_pages(sandbox, 3)
+    actual_open = pymupdf.open
+    opened: list[pymupdf.Document] = []
+
+    def record_pdf_open(path: str | Path) -> pymupdf.Document:
+        document = actual_open(path)
+        opened.append(document)
+        return document
+
+    monkeypatch.setattr(pymupdf, "open", record_pdf_open)
+    result = successful(
+        invoke_in_process(
+            ["read", "doc-hostile", "--pages", "4-6", "--source", "pdf"],
+            tmp_path,
+            sandbox=sandbox.root,
+        )
+    )
+
+    assert len(result["pages"]) == 3
+    assert len(opened) == 1
+    assert opened[0].is_closed
 
 
 @pytest.mark.parametrize("expression", ["0", "1-30", "2-1", "1,1", "1,,2"])

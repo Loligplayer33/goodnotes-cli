@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import dataclass, is_dataclass
 from dataclasses import fields as dataclass_fields
 from pathlib import Path
 from typing import Any
@@ -30,6 +30,7 @@ class _ProjectionSpec:
     row_key: str | None = None
     optional_fields: tuple[str, ...] = ()
     conditional_fields: tuple[tuple[str, str], ...] = ()
+    field_variants: tuple[tuple[str, tuple[str, ...]], ...] = ()
     example: str | None = None
 
 
@@ -140,6 +141,49 @@ _PROJECTIONS: dict[str, _ProjectionSpec] = {
         ),
         optional_fields=("captured_at",),
     ),
+    "doctor": _ProjectionSpec(
+        (
+            "active_folders",
+            "active_notebooks",
+            "active_pages",
+            "deleted_folders",
+            "deleted_notebooks",
+            "visible_folders",
+            "visible_notebooks",
+            "orphaned_items",
+            "broken_links",
+            "deleted_link_rows",
+            "links_to_deleted_items",
+            "duplicate_parent_items",
+            "cycle_folders",
+            "pages_without_index_metadata",
+            "index_metadata_without_active_pages",
+            "search_index_available",
+            "search_content_tables",
+            "warnings",
+            "storage",
+            "native_runtime",
+        ),
+        field_variants=(
+            (
+                "access_only",
+                (
+                    "scope",
+                    "cache_dir",
+                    "sandbox",
+                    "library",
+                    "scratch_dir",
+                    "output_dir",
+                    "status",
+                    "checks",
+                    "errors",
+                    "warnings",
+                    "native_runtime",
+                ),
+            ),
+        ),
+        example="goodnotes --fields active_pages,warnings doctor",
+    ),
 }
 
 _BRIEF_COMMANDS = frozenset(
@@ -179,10 +223,26 @@ def output_contract(command_name: str) -> dict[str, Any] | None:
                 for field, option in spec.conditional_fields
             }
         )
+        for option, variant_fields in spec.field_variants:
+            result.setdefault("optional_fields", {}).update(
+                {
+                    field: f"Requires --{option.replace('_', '-')}"
+                    for field in variant_fields
+                    if field not in spec.fields
+                }
+            )
         if not result["optional_fields"]:
             del result["optional_fields"]
         if spec.example is not None:
             result["example"] = spec.example
+        if spec.field_variants:
+            result["variants"] = {
+                "default": {"fields": list(spec.fields)},
+                **{
+                    option: {"fields": list(variant_fields)}
+                    for option, variant_fields in spec.field_variants
+                },
+            }
         _describe_default(result, command_name)
         return result
 
@@ -288,7 +348,12 @@ def validate_projection(raw_fields: str | None, projection: Projection) -> list[
         return None
     spec = _PROJECTIONS.get(projection.command_name)
     if spec is not None:
-        available = set(spec.fields) | set(spec.optional_fields)
+        variants = dict(spec.field_variants)
+        selected_variant = next(
+            (variants[option] for option in projection.enabled_options if option in variants),
+            spec.fields,
+        )
+        available = set(selected_variant) | set(spec.optional_fields)
         available.update(
             field
             for field, option in spec.conditional_fields
@@ -315,7 +380,10 @@ def _unknown_fields(fields: list[str], available: Iterable[str], level: str) -> 
 
 def serializable(value: Any) -> Any:
     if is_dataclass(value) and not isinstance(value, type):
-        return serializable(asdict(value))
+        return {
+            field.name: serializable(getattr(value, field.name))
+            for field in dataclass_fields(value)
+        }
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, dict):
@@ -520,9 +588,19 @@ def bound_page_text(pages: list[dict[str, Any]], max_chars: int) -> bool:
 
 def snippet_hits(hits: Any, query: str) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = serializable(hits)
+    folded_query = query.casefold()
     for hit in rows:
         original = hit["text"]
-        start = max(0, original.casefold().find(query.casefold()) - 100)
+        folded_offset = original.casefold().find(folded_query)
+        start = 0
+        if folded_offset > 0:
+            folded_position = 0
+            for original_position, character in enumerate(original):
+                folded_length = len(character.casefold())
+                if folded_position <= folded_offset < folded_position + folded_length:
+                    start = max(0, original_position - 100)
+                    break
+                folded_position += folded_length
         hit["text"] = original[start : start + 320]
         hit["snippet"] = start > 0 or start + 320 < len(original)
     return rows

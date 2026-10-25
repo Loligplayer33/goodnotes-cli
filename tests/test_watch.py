@@ -8,6 +8,7 @@ from test_cache import make_library
 
 import goodnotes_cli.watch as watch_module
 from goodnotes_cli.errors import CacheAccessError, GoodnotesError
+from goodnotes_cli.snapshot import _InventoryChanged
 
 
 class Clock:
@@ -120,6 +121,286 @@ def test_watch_debounces_a_burst_and_refreshes_serially(monkeypatch: pytest.Monk
     assert events[-1]["iteration"] == 5
 
 
+def test_watch_sleeps_only_for_the_remaining_debounce_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timer = clock(monkeypatch)
+    signatures = iter(["a", "b", "b"])
+    calls: list[float] = []
+
+    def refresh(source: Path, destination: Path) -> dict[str, object]:
+        calls.append(timer.now)
+        return result(str(len(calls)))
+
+    monkeypatch.setattr(watch_module, "_input_signature", lambda source: next(signatures))
+    monkeypatch.setattr(watch_module, "refresh_cache", refresh)
+    events = list(
+        watch_module.watch_library(
+            Path("source"), Path("cache"), interval=10, debounce=1, iterations=3
+        )
+    )
+
+    assert calls == [0, 11]
+    assert timer.sleeps == [10, 1]
+    assert [event["event"] for event in events] == ["ready", "updated"]
+
+
+def test_unstable_inventory_resumes_coalescing_without_an_error_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timer = clock(monkeypatch)
+    observations: list[str | _InventoryChanged] = [
+        "a",
+        _InventoryChanged("Generated inventory changed mid-scan"),
+        "b",
+        "b",
+    ]
+    refreshes: list[float] = []
+
+    def signature(source: Path) -> str:
+        observation = observations.pop(0)
+        if isinstance(observation, _InventoryChanged):
+            raise observation
+        return observation
+
+    def refresh(source: Path, destination: Path) -> dict[str, object]:
+        refreshes.append(timer.now)
+        return result(str(len(refreshes)))
+
+    monkeypatch.setattr(watch_module, "_input_signature", signature)
+    monkeypatch.setattr(watch_module, "refresh_cache", refresh)
+    events = list(
+        watch_module.watch_library(
+            Path("source"), Path("cache"), interval=0.05, debounce=0, iterations=4
+        )
+    )
+
+    assert refreshes == [0, 0.1]
+    assert [event["event"] for event in events] == ["ready", "updated"]
+
+
+def test_unstable_inventory_restarts_the_positive_debounce_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timer = clock(monkeypatch)
+    observations: list[str | _InventoryChanged] = [
+        "a",
+        _InventoryChanged("Generated inventory changed mid-scan"),
+        "b",
+        "b",
+        "b",
+    ]
+    refreshes: list[float] = []
+
+    def signature(source: Path) -> str:
+        observation = observations.pop(0)
+        if isinstance(observation, _InventoryChanged):
+            raise observation
+        return observation
+
+    def refresh(source: Path, destination: Path) -> dict[str, object]:
+        refreshes.append(timer.now)
+        return result(str(len(refreshes)))
+
+    monkeypatch.setattr(watch_module, "_input_signature", signature)
+    monkeypatch.setattr(watch_module, "refresh_cache", refresh)
+    events = list(
+        watch_module.watch_library(
+            Path("source"), Path("cache"), interval=1, debounce=2, iterations=5
+        )
+    )
+
+    assert refreshes == [0, 4]
+    assert timer.sleeps == [1, 1, 1, 1]
+    assert [event["event"] for event in events] == ["ready", "updated"]
+
+
+def test_unstable_inventory_does_not_reset_maximum_coalescing_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timer = clock(monkeypatch)
+    observations: list[str | _InventoryChanged] = [
+        "a",
+        _InventoryChanged("Generated inventory changed mid-scan"),
+        *list("bcdefghijk"),
+    ]
+    refreshes: list[float] = []
+
+    def signature(source: Path) -> str:
+        observation = observations.pop(0)
+        if isinstance(observation, _InventoryChanged):
+            raise observation
+        return observation
+
+    def refresh(source: Path, destination: Path) -> dict[str, object]:
+        refreshes.append(timer.now)
+        return result(str(len(refreshes)))
+
+    monkeypatch.setattr(watch_module, "_input_signature", signature)
+    monkeypatch.setattr(watch_module, "refresh_cache", refresh)
+    events = list(
+        watch_module.watch_library(
+            Path("source"), Path("cache"), interval=1, debounce=2, iterations=12
+        )
+    )
+
+    assert refreshes == [0, 11]
+    assert [event["event"] for event in events] == ["ready", "updated"]
+    assert events[-1]["iteration"] == 12
+
+
+def test_repeated_unstable_inventories_attempt_capture_at_maximum_delay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timer = clock(monkeypatch)
+    observations: list[str | _InventoryChanged] = [
+        "a",
+        *[_InventoryChanged("Generated inventory changed mid-scan") for _ in range(11)],
+    ]
+    refreshes: list[float] = []
+
+    def signature(source: Path) -> str:
+        observation = observations.pop(0)
+        if isinstance(observation, _InventoryChanged):
+            raise observation
+        return observation
+
+    def refresh(source: Path, destination: Path) -> dict[str, object]:
+        refreshes.append(timer.now)
+        return result(str(len(refreshes)))
+
+    monkeypatch.setattr(watch_module, "_input_signature", signature)
+    monkeypatch.setattr(watch_module, "refresh_cache", refresh)
+    events = list(
+        watch_module.watch_library(
+            Path("source"), Path("cache"), interval=1, debounce=2, iterations=12
+        )
+    )
+
+    assert refreshes == [0, 11]
+    assert [event["event"] for event in events] == ["ready", "updated"]
+    assert events[-1]["iteration"] == 12
+
+
+def test_unstable_capture_restarts_coalescing_without_failure_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timer = clock(monkeypatch)
+    refreshes: list[float] = []
+
+    def signature(source: Path) -> str:
+        if timer.now == 0:
+            return "a"
+        raise _InventoryChanged("Generated inventory changed mid-scan")
+
+    def refresh(source: Path, destination: Path) -> dict[str, object]:
+        refreshes.append(timer.now)
+        if len(refreshes) == 2:
+            raise _InventoryChanged("Generated source changed during capture")
+        return result(str(len(refreshes)))
+
+    monkeypatch.setattr(watch_module, "_input_signature", signature)
+    monkeypatch.setattr(watch_module, "refresh_cache", refresh)
+    events = list(
+        watch_module.watch_library(
+            Path("source"), Path("cache"), interval=1, debounce=2, iterations=22
+        )
+    )
+
+    assert refreshes == [0, 11, 21]
+    assert [event["event"] for event in events] == ["ready", "updated"]
+
+
+def test_startup_unstable_inventory_waits_for_a_meaningful_capture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    timer = clock(monkeypatch)
+    source = make_library(tmp_path / "source")
+    original_signature = watch_module._input_signature
+    signature_calls = 0
+    refreshes: list[float] = []
+
+    def signature(source: Path) -> str:
+        nonlocal signature_calls
+        observed = original_signature(source)
+        signature_calls += 1
+        if signature_calls < 3:
+            raise _InventoryChanged("Generated initial inventory changed mid-scan")
+        return observed
+
+    def refresh(source: Path, destination: Path) -> dict[str, object]:
+        refreshes.append(timer.now)
+        return result("one")
+
+    monkeypatch.setattr(watch_module, "_input_signature", signature)
+    monkeypatch.setattr(watch_module, "refresh_cache", refresh)
+    events = list(
+        watch_module.watch_library(source, Path("cache"), interval=1, debounce=2, iterations=3)
+    )
+
+    assert refreshes == [2]
+    assert [event["event"] for event in events] == ["ready"]
+
+
+@pytest.mark.parametrize("iterations", [None, 1])
+def test_missing_library_root_is_first_watch_error_without_sleep(
+    iterations: int | None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    timer = clock(monkeypatch)
+    missing = tmp_path / "missing-library"
+    watcher = watch_module.watch_library(
+        missing, tmp_path / "cache", interval=1, iterations=iterations
+    )
+
+    event = next(watcher)
+
+    assert event["event"] == "error"
+    error = event["error"]
+    assert isinstance(error, dict)
+    assert error["code"] == "source_unavailable"
+    details = error["details"]
+    assert isinstance(details, dict)
+    assert details["operation"] == "inspect_source_library"
+    assert details["path"] == str(missing)
+    assert timer.sleeps == []
+    watcher.close()
+
+
+def test_unsafe_inventory_failure_still_emits_error_and_backs_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timer = clock(monkeypatch)
+    observations: list[str | GoodnotesError] = [
+        "a",
+        GoodnotesError("Symlinks are not allowed in snapshot inputs: generated-link"),
+        "b",
+    ]
+
+    def signature(source: Path) -> str:
+        observation = observations.pop(0)
+        if isinstance(observation, GoodnotesError):
+            raise observation
+        return observation
+
+    calls: list[float] = []
+
+    def refresh(source: Path, destination: Path) -> dict[str, object]:
+        calls.append(timer.now)
+        return result(str(len(calls)))
+
+    monkeypatch.setattr(watch_module, "_input_signature", signature)
+    monkeypatch.setattr(watch_module, "refresh_cache", refresh)
+    events = list(
+        watch_module.watch_library(
+            Path("source"), Path("cache"), interval=0.05, debounce=0, iterations=3
+        )
+    )
+
+    assert [event["event"] for event in events] == ["ready", "error", "recovered"]
+    assert timer.sleeps == [0.05, 1]
+    assert calls == [0, 1.05]
+
+
 def test_continuous_changes_have_a_bounded_coalescing_delay(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -195,6 +476,31 @@ def test_refresh_error_backs_off_and_emits_recovery(monkeypatch: pytest.MonkeyPa
     assert error["code"] == "cache_permission_denied"
     assert error["details"]["operation"] == "prepare_cache_directory"
     assert events[1]["retry_in_seconds"] == 1
+
+
+def test_watch_redebounces_a_new_edit_after_refresh_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timer = clock(monkeypatch)
+    signatures = iter(["a", "b", "b", "b", "c", "c", "c"])
+    refresh_times: list[float] = []
+
+    def refresh(source: Path, destination: Path) -> dict[str, object]:
+        refresh_times.append(timer.now)
+        if len(refresh_times) == 2:
+            raise GoodnotesError("Generated transient capture failure")
+        return result(str(len(refresh_times)))
+
+    monkeypatch.setattr(watch_module, "_input_signature", lambda source: next(signatures))
+    monkeypatch.setattr(watch_module, "refresh_cache", refresh)
+    events = list(
+        watch_module.watch_library(
+            Path("source"), Path("cache"), interval=1, debounce=2, iterations=7
+        )
+    )
+
+    assert refresh_times == [0, 3, 6]
+    assert [event["event"] for event in events] == ["ready", "error", "recovered"]
 
 
 def test_failed_inventory_retries_with_capped_backoff(monkeypatch: pytest.MonkeyPatch) -> None:

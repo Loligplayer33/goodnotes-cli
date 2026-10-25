@@ -48,6 +48,39 @@ class _Cursor:
         return struct.unpack("<I", self.take(4))[0]
 
 
+_FIXED_FORMATS = {
+    "c": "b",
+    "j": "h",
+    "v": "H",
+    "i": "i",
+    "u": "I",
+    "I": "q",
+    "U": "Q",
+    "f": "d",
+}
+
+
+def _decode_fixed_array(
+    children: tuple[_FormatNode, ...], count: int, cursor: _Cursor
+) -> list[TplValue] | None:
+    """Use ``struct.iter_unpack`` for arrays of fixed-width scalar records."""
+    if len(children) == 1 and isinstance(children[0], str) and children[0] in _FIXED_FORMATS:
+        formats = _FIXED_FORMATS[children[0]]
+        raw = cursor.take(count * struct.calcsize("<" + formats))
+        return [row[0] for row in struct.iter_unpack("<" + formats, raw)]
+    if len(children) == 1 and isinstance(children[0], tuple) and children[0][0] == "S":
+        fields = children[0][1]
+        if fields and all(isinstance(child, str) and child in _FIXED_FORMATS for child in fields):
+            formats = "".join(_FIXED_FORMATS[child] for child in fields)
+            raw = cursor.take(count * struct.calcsize("<" + formats))
+            return [row for row in struct.iter_unpack("<" + formats, raw)]
+    if children and all(isinstance(child, str) and child in _FIXED_FORMATS for child in children):
+        formats = "".join(_FIXED_FORMATS[child] for child in children)
+        raw = cursor.take(count * struct.calcsize("<" + formats))
+        return [row for row in struct.iter_unpack("<" + formats, raw)]
+    return None
+
+
 def _parse_format(format_string: str) -> tuple[_FormatNode, ...]:
     position = 0
 
@@ -87,19 +120,20 @@ def _decode_value(node: _FormatNode, cursor: _Cursor) -> TplValue:
         count = cursor.u32()
         if count > 1_000_000 or count > len(cursor.data) - cursor.position or not children:
             raise TplDecodeError("TPL array count exceeds remaining bytes or budget")
+        fixed_values = _decode_fixed_array(children, count, cursor)
+        if fixed_values is not None:
+            return fixed_values
         if len(children) == 1:
             return [_decode_value(children[0], cursor) for _ in range(count)]
         return [tuple(_decode_value(child, cursor) for child in children) for _ in range(count)]
-    sizes = {"c": 1, "j": 2, "v": 2, "i": 4, "u": 4, "I": 8, "U": 8, "f": 8}
     if node == "s":
         size = cursor.u32()
         raw = cursor.take(max(size - 1, 0))
         return raw.decode("utf-8", errors="replace")
     if node == "B":
         return cursor.take(cursor.u32())
-    raw = cursor.take(sizes[node])
-    formats = {"c": "b", "j": "h", "v": "H", "i": "i", "u": "I", "I": "q", "U": "Q", "f": "d"}
-    return struct.unpack("<" + formats[node], raw)[0]
+    raw = cursor.take(struct.calcsize("<" + _FIXED_FORMATS[node]))
+    return struct.unpack("<" + _FIXED_FORMATS[node], raw)[0]
 
 
 def decode_tpl(data: bytes) -> TplImage:

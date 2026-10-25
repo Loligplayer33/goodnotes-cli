@@ -9,15 +9,18 @@ import os
 import stat
 import tempfile
 import uuid
-from collections.abc import Callable
+from collections import OrderedDict
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path, PurePath
-from typing import Protocol
+from typing import Literal, Protocol
 
 import pymupdf as fitz
 
 from .errors import FilesystemAccessError, GoodnotesError
 from .models import Page
-from .safety import _require_not_production, open_database
+from .safety import _require_not_production, open_database, resolve_confined_file, stat_key
 
 
 class SandboxProtocol(Protocol):
@@ -50,6 +53,128 @@ _MIN_DPI = 72
 _MAX_DPI = 600
 _MAX_PAGE_POINTS = 14_400.0
 _MAX_RENDER_PIXELS = 50_000_000
+_MAX_OPEN_PDF_SOURCES = 8
+
+
+class _PdfDocumentCache:
+    """Keep a bounded set of stable source documents open for one document operation."""
+
+    def __init__(self, capacity: int = _MAX_OPEN_PDF_SOURCES) -> None:
+        self._capacity = capacity
+        self._documents: OrderedDict[
+            tuple[int, int], tuple[Path, fitz.Document, tuple[int, int, int, int, int, int]]
+        ] = OrderedDict()
+        self._path_signatures: dict[Path, tuple[int, int, int, int, int, int]] = {}
+
+    def __enter__(self) -> _PdfDocumentCache:
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> Literal[False]:
+        try:
+            self.close()
+        except BaseException:
+            if exc_type is None:
+                raise
+        return False
+
+    def open(self, path: Path) -> fitz.Document:
+        source_path = Path(path)
+        signature = _pdf_source_signature(source_path)
+        previous_signature = self._path_signatures.get(source_path)
+        if previous_signature is not None and previous_signature != signature:
+            raise GoodnotesError("A page background changed during the rendering operation.")
+        self._path_signatures[source_path] = signature
+        identity = signature[0], signature[1]
+        cached = self._documents.get(identity)
+        if cached is not None:
+            if cached[2] != signature:
+                raise GoodnotesError("A page background changed during the rendering operation.")
+            self._documents.move_to_end(identity)
+            return cached[1]
+
+        source_doc = fitz.open(source_path)
+        try:
+            if _pdf_source_signature(source_path) != signature:
+                raise GoodnotesError("A page background changed while it was being opened.")
+            self._documents[identity] = source_path, source_doc, signature
+            while len(self._documents) > self._capacity:
+                _, (_, evicted, _) = self._documents.popitem(last=False)
+                evicted.close()
+        except BaseException:
+            source_doc.close()
+            raise
+        return source_doc
+
+    def close(self) -> None:
+        documents = [entry[1] for entry in self._documents.values()]
+        self._documents.clear()
+        first_error: BaseException | None = None
+        for document in documents:
+            try:
+                document.close()
+            except BaseException as exc:
+                first_error = first_error or exc
+        if first_error is not None:
+            raise first_error
+
+
+@dataclass
+class _RegisteredPdf:
+    document: fitz.Document
+    entry: dict[str, object]
+    path: Path
+    signature: tuple[int, int, int, int, int, int]
+
+    def ensure_unchanged(self) -> None:
+        try:
+            current = _file_signature(self.path.lstat())
+        except OSError as exc:
+            raise GoodnotesError(
+                "The registered annotated PDF became unavailable during this operation."
+            ) from exc
+        if current != self.signature:
+            raise GoodnotesError(
+                "The registered annotated PDF changed during this operation. "
+                "Register it again before use."
+            )
+
+    def close(self) -> None:
+        self.document.close()
+
+
+def _pdf_source_signature(path: Path) -> tuple[int, int, int, int, int, int]:
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode):
+        raise GoodnotesError("A page background is no longer a regular file.")
+    return stat_key(info)
+
+
+def _pdf_final_use_flags(paths: list[Path], capacity: int = _MAX_OPEN_PDF_SOURCES) -> list[bool]:
+    """Mark each cached PDF handle's last insertion before reuse ends or eviction."""
+    cache: OrderedDict[tuple[int, int], int] = OrderedDict()
+    handles: list[int] = []
+    last_use: dict[int, int] = {}
+    signatures: dict[tuple[int, int], tuple[int, int, int, int, int, int]] = {}
+    next_handle = 0
+    for index, path in enumerate(paths):
+        signature = _pdf_source_signature(path)
+        identity = signature[0], signature[1]
+        previous = signatures.get(identity)
+        if previous is not None and previous != signature:
+            raise GoodnotesError("A page background changed during the rendering operation.")
+        signatures[identity] = signature
+        handle = cache.get(identity)
+        if handle is None:
+            if len(cache) >= capacity:
+                cache.popitem(last=False)
+            handle = next_handle
+            next_handle += 1
+            cache[identity] = handle
+        else:
+            cache.move_to_end(identity)
+        handles.append(handle)
+        last_use[handle] = index
+    return [last_use[handle] == index for index, handle in enumerate(handles)]
 
 
 def export_pdf(
@@ -74,18 +199,44 @@ def export_pdf(
 
     result_doc = fitz.open()
     native_annotations: list[dict[str, object]] = []
+    registered_pdf: _RegisteredPdf | None = None
     try:
         if layer == "background":
-            for page in ordered:
-                source_path = _resolve_attachment_path(sandbox, page)
-                _append_background_page(result_doc, page, source_path)
+            source_paths = [_resolve_attachment_path(sandbox, page) for page in ordered]
+            final_uses = _pdf_final_use_flags(source_paths)
+            with _PdfDocumentCache() as pdf_cache:
+                for page, source_path, final in zip(ordered, source_paths, final_uses, strict=True):
+                    source_doc = pdf_cache.open(source_path)
+                    _append_background_page(
+                        result_doc,
+                        page,
+                        source_path,
+                        source_doc=source_doc,
+                        final=final,
+                    )
             includes_handwriting = False
             annotation_status = "not-included"
             warnings = [_BACKGROUND_WARNING]
             source = "per-page-background-attachments"
         elif layer == "native":
-            for page in ordered:
-                native_annotations.append(_append_native_page(result_doc, sandbox, page))
+            source_paths = [_resolve_attachment_path(sandbox, page) for page in ordered]
+            final_uses = _pdf_final_use_flags(source_paths)
+            with _native_record_reader(sandbox) as record_reader:
+                with _PdfDocumentCache() as pdf_cache:
+                    for page, source_path, final in zip(
+                        ordered, source_paths, final_uses, strict=True
+                    ):
+                        native_annotations.append(
+                            _append_native_page(
+                                result_doc,
+                                sandbox,
+                                page,
+                                pdf_cache=pdf_cache,
+                                record_reader=record_reader,
+                                source_path=source_path,
+                                final=final,
+                            )
+                        )
             includes_handwriting = any(
                 bool(entry.get("rendered_strokes")) for entry in native_annotations
             )
@@ -97,21 +248,24 @@ def export_pdf(
             )
             source = "copied-native-records-and-backgrounds"
         else:
-            source_doc, entry = _open_registered_pdf(sandbox, ordered[0].document_id)
+            registered_pdf = _open_registered_pdf(sandbox, ordered[0].document_id)
             try:
-                _check_registered_page_count(sandbox, ordered[0].document_id, entry)
-                registered_pages = _registered_page_count(entry)
-                for page in ordered:
+                _check_registered_page_count(sandbox, ordered[0].document_id, registered_pdf.entry)
+                registered_pages = _registered_page_count(registered_pdf.entry)
+                for index, page in enumerate(ordered):
+                    registered_pdf.ensure_unchanged()
                     source_page = page.number - 1
                     _check_annotated_page_number(page, registered_pages)
                     result_doc.insert_pdf(
-                        source_doc,
+                        registered_pdf.document,
                         from_page=source_page,
                         to_page=source_page,
                         annots=True,
+                        final=index == len(ordered) - 1,
                     )
+                    registered_pdf.ensure_unchanged()
             finally:
-                source_doc.close()
+                registered_pdf.close()
             includes_handwriting = None
             annotation_status = "user-provided-unverified"
             warnings = [_ANNOTATED_WARNING]
@@ -120,10 +274,14 @@ def export_pdf(
         if result_doc.page_count != len(ordered):
             raise GoodnotesError("The PDF export did not contain the requested pages.")
 
+        if registered_pdf is not None:
+            registered_pdf.ensure_unchanged()
         _publish_new_file(
             output_path,
             lambda temporary: result_doc.save(temporary, garbage=4, deflate=True),
         )
+        if registered_pdf is not None:
+            registered_pdf.ensure_unchanged()
     except GoodnotesError:
         raise
     except Exception as exc:
@@ -157,21 +315,108 @@ def render_page(
     dpi: int = 150,
 ) -> dict[str, object]:
     """Render one page to PNG at a bounded resolution."""
+    return render_pages(sandbox, [page], [destination], layer=layer, dpi=dpi)[0]
+
+
+def render_pages(
+    sandbox: SandboxProtocol,
+    pages: list[Page],
+    destinations: list[Path],
+    *,
+    layer: str = "background",
+    dpi: int = 150,
+) -> list[dict[str, object]]:
+    """Render pages in one operation, sharing bounded source and native resources.
+
+    Results preserve the input order and use the same shape as :func:`render_page`. The
+    registered PDF is verified once per notebook, and one disposable native-store session is
+    used for every page when ``layer="native"``.
+    """
     _check_layer(layer)
     _check_dpi(dpi)
-    output_path = sandbox.ensure_output(Path(destination))
-    if output_path.suffix.casefold() != ".png":
-        raise GoodnotesError("Page renders must use a .png destination.")
+    if not pages or len(pages) != len(destinations):
+        raise GoodnotesError("Provide one PNG destination for every page to render.")
 
+    output_paths = [sandbox.ensure_output(Path(destination)) for destination in destinations]
+    if any(path.suffix.casefold() != ".png" for path in output_paths):
+        raise GoodnotesError("Page renders must use a .png destination.")
+    if len({path.resolve(strict=False) for path in output_paths}) != len(output_paths):
+        raise GoodnotesError("Page render destinations must be distinct.")
+
+    if layer == "native":
+        with _native_record_reader(sandbox) as record_reader:
+            return _render_pages_with_resources(
+                sandbox, pages, output_paths, layer=layer, dpi=dpi, record_reader=record_reader
+            )
+    return _render_pages_with_resources(
+        sandbox, pages, output_paths, layer=layer, dpi=dpi, record_reader=None
+    )
+
+
+def _render_pages_with_resources(
+    sandbox: SandboxProtocol,
+    pages: list[Page],
+    output_paths: list[Path],
+    *,
+    layer: str,
+    dpi: int,
+    record_reader: Callable[[str], list[tuple[bytes, bytes]]] | None,
+) -> list[dict[str, object]]:
+    rendered: list[dict[str, object]] = []
+    registered: dict[str, _RegisteredPdf] = {}
+    with _PdfDocumentCache() as pdf_cache:
+        try:
+            for page, output_path in zip(pages, output_paths, strict=True):
+                rendered.append(
+                    _render_page_with_resources(
+                        sandbox,
+                        page,
+                        output_path,
+                        layer=layer,
+                        dpi=dpi,
+                        pdf_cache=pdf_cache,
+                        registered=registered,
+                        record_reader=record_reader,
+                    )
+                )
+            for registered_pdf in registered.values():
+                registered_pdf.ensure_unchanged()
+        finally:
+            _close_registered_pdfs(registered)
+    return rendered
+
+
+def _render_page_with_resources(
+    sandbox: SandboxProtocol,
+    page: Page,
+    output_path: Path,
+    *,
+    layer: str,
+    dpi: int,
+    pdf_cache: _PdfDocumentCache,
+    registered: dict[str, _RegisteredPdf],
+    record_reader: Callable[[str], list[tuple[bytes, bytes]]] | None,
+) -> dict[str, object]:
     native_annotations: dict[str, object] | None = None
     if layer in {"background", "native"}:
         render_doc = fitz.open()
         try:
             if layer == "native":
-                native_annotations = _append_native_page(render_doc, sandbox, page)
+                native_annotations = _append_native_page(
+                    render_doc,
+                    sandbox,
+                    page,
+                    pdf_cache=pdf_cache,
+                    record_reader=record_reader,
+                )
             else:
                 source_path = _resolve_attachment_path(sandbox, page)
-                _append_background_page(render_doc, page, source_path)
+                _append_background_page(
+                    render_doc,
+                    page,
+                    source_path,
+                    source_doc=pdf_cache.open(source_path),
+                )
             source_page = render_doc.load_page(0)
             _check_render_size(source_page.rect, dpi)
             _publish_new_file(
@@ -196,22 +441,29 @@ def render_page(
             warnings = [_BACKGROUND_WARNING]
         source_page_number = page.pdf_page or 1
     else:
-        source_doc, entry = _open_registered_pdf(sandbox, page.document_id)
+        registered_pdf = registered.get(page.document_id)
+        if registered_pdf is None:
+            registered_pdf = _open_registered_pdf(sandbox, page.document_id)
+            try:
+                _check_registered_page_count(sandbox, page.document_id, registered_pdf.entry)
+            except BaseException:
+                registered_pdf.close()
+                raise
+            registered[page.document_id] = registered_pdf
         try:
-            _check_registered_page_count(sandbox, page.document_id, entry)
-            _check_annotated_page_number(page, _registered_page_count(entry))
-            source_page = source_doc.load_page(page.number - 1)
+            registered_pdf.ensure_unchanged()
+            _check_annotated_page_number(page, _registered_page_count(registered_pdf.entry))
+            source_page = registered_pdf.document.load_page(page.number - 1)
             _check_render_size(source_page.rect, dpi)
             _publish_new_file(
                 output_path,
                 lambda temporary: source_page.get_pixmap(dpi=dpi, alpha=False).save(temporary),
             )
+            registered_pdf.ensure_unchanged()
         except GoodnotesError:
             raise
         except Exception as exc:
             raise GoodnotesError(f"Could not render annotated page {page.number}: {exc}") from exc
-        finally:
-            source_doc.close()
         includes_handwriting = None
         annotation_status = "user-provided-unverified"
         source = "registered-user-exported-pdf"
@@ -271,15 +523,26 @@ def register_annotated_pdf(
         raise GoodnotesError("The annotated PDF path must point to a regular file.")
 
     try:
+        digest, source_stat = _sha256_stable(source_path)
+    except GoodnotesError as exc:
+        raise GoodnotesError(f"Could not verify the annotated PDF: {exc}") from exc
+
+    try:
         source_doc = fitz.open(source_path)
     except Exception as exc:
         raise GoodnotesError(f"Could not open the annotated PDF: {exc}") from exc
     try:
+        if _file_signature(source_stat) != _file_signature(source_path.lstat()):
+            raise GoodnotesError("The annotated PDF changed before its page count was checked.")
         if not source_doc.is_pdf:
             raise GoodnotesError("The registered annotated source must be a PDF file.")
         if source_doc.needs_pass:
             raise GoodnotesError("Password-protected PDFs cannot be registered.")
         actual_pdf_pages = source_doc.page_count
+        if _file_signature(source_stat) != _file_signature(source_path.lstat()):
+            raise GoodnotesError("The annotated PDF changed while its page count was checked.")
+    except OSError as exc:
+        raise GoodnotesError("Could not verify the annotated PDF path after opening it.") from exc
     finally:
         source_doc.close()
 
@@ -289,10 +552,6 @@ def register_annotated_pdf(
             f"{expected_pages}. The PDF was not registered."
         )
 
-    try:
-        digest, source_stat = _sha256_stable(source_path)
-    except GoodnotesError as exc:
-        raise GoodnotesError(f"Could not verify the annotated PDF: {exc}") from exc
     entry: dict[str, object] = {
         "version": _REGISTRY_VERSION,
         "document_id": document_id,
@@ -369,14 +628,48 @@ def _native_warnings(metadata: dict[str, object]) -> list[str]:
     return [str(value) for value in warnings] if isinstance(warnings, list) else []
 
 
+@contextmanager
+def _native_record_reader(
+    sandbox: SandboxProtocol,
+) -> Iterator[Callable[[str], list[tuple[bytes, bytes]]]]:
+    from .native import NativeStoreSession
+
+    with NativeStoreSession(sandbox) as session:
+        yield session.read_page_records
+
+
+def _close_registered_pdfs(
+    registered: dict[str, _RegisteredPdf],
+) -> None:
+    documents = list(registered.values())
+    registered.clear()
+    first_error: BaseException | None = None
+    for registered_pdf in documents:
+        try:
+            registered_pdf.close()
+        except BaseException as exc:
+            first_error = first_error or exc
+    if first_error is not None:
+        raise first_error
+
+
 def _append_native_page(
-    document: fitz.Document, sandbox: SandboxProtocol, page: Page
+    document: fitz.Document,
+    sandbox: SandboxProtocol,
+    page: Page,
+    *,
+    pdf_cache: _PdfDocumentCache,
+    record_reader: Callable[[str], list[tuple[bytes, bytes]]] | None,
+    source_path: Path | None = None,
+    final: bool = True,
 ) -> dict[str, object]:
     """Compose a copied native overlay with its verified background mapping."""
     from .annotations import render_native_overlay
 
-    source_path = _resolve_attachment_path(sandbox, page)
-    index = _append_background_page(document, page, source_path)
+    source_path = source_path or _resolve_attachment_path(sandbox, page)
+    index = _append_background_page(
+        document, page, source_path, source_doc=pdf_cache.open(source_path), final=final
+    )
     target = document[index]
     if target.rotation or target.cropbox != target.mediabox:
         raise GoodnotesError(
@@ -387,6 +680,7 @@ def _append_native_page(
         page,
         width_points=target.rect.width,
         height_points=target.rect.height,
+        record_reader=record_reader,
     )
     if overlay.svg and overlay.metadata.get("rendered_strokes"):
         with fitz.open(stream=overlay.svg, filetype="svg") as vector:
@@ -410,32 +704,30 @@ def _resolve_attachment_path(sandbox: SandboxProtocol, page: Page) -> Path:
 
     attachment_root = Path(sandbox.attachments_dir).resolve()
     raw = Path(raw_path).expanduser()
-    candidates: list[Path] = []
     if raw.is_absolute():
-        candidates.append(raw)
+        resolved = resolve_confined_file(attachment_root, raw)
+        if resolved is not None:
+            return resolved
     else:
-        parts = PurePath(raw).parts
+        original_parts = PurePath(raw).parts
+        parts = original_parts
         if ".." in parts:
             raise GoodnotesError("The page attachment path escapes the sandbox attachments folder.")
         if parts and parts[0].casefold() == "attachments":
             parts = parts[1:]
         if not parts:
             raise GoodnotesError("The page attachment path is empty.")
-        candidates.append(attachment_root.joinpath(*parts))
-        candidates.append(Path(sandbox.library_dir).joinpath(*PurePath(raw).parts))
-
-    for candidate in candidates:
-        try:
-            resolved = candidate.resolve(strict=True)
-        except FileNotFoundError:
-            continue
-        if not resolved.is_relative_to(attachment_root):
-            raise GoodnotesError(
-                "The page attachment resolves outside the sandbox attachments folder."
-            )
-        if not resolved.is_file():
-            continue
-        return resolved
+        for root, relative_parts in (
+            (attachment_root, parts),
+            (Path(sandbox.library_dir), original_parts),
+        ):
+            resolved = resolve_confined_file(root, Path(*relative_parts))
+            if resolved is not None:
+                if not resolved.is_relative_to(attachment_root):
+                    raise GoodnotesError(
+                        "The page attachment resolves outside the sandbox attachments folder."
+                    )
+                return resolved
     raise GoodnotesError(
         f"The background attachment for page {page.number} is missing from the sandbox copy."
     )
@@ -465,10 +757,18 @@ def _attachment_page_index(page: Page, page_count: int) -> int:
     return page.pdf_page - 1
 
 
-def _append_background_page(document: fitz.Document, page: Page, source_path: Path) -> int:
-    source_doc: fitz.Document | None = None
+def _append_background_page(
+    document: fitz.Document,
+    page: Page,
+    source_path: Path,
+    *,
+    source_doc: fitz.Document | None = None,
+    final: bool = True,
+) -> int:
+    owns_source_doc = source_doc is None
     try:
-        source_doc = fitz.open(source_path)
+        if source_doc is None:
+            source_doc = fitz.open(source_path)
         if source_doc.needs_pass:
             raise GoodnotesError(
                 f"The background attachment for page {page.number} is password protected."
@@ -484,6 +784,7 @@ def _append_background_page(document: fitz.Document, page: Page, source_path: Pa
                 from_page=source_index,
                 to_page=source_index,
                 annots=False,
+                final=final,
             )
             output_page = document.load_page(document.page_count - 1)
             rotation = (previous_rotation + _page_rotation(page)) % 360
@@ -501,7 +802,7 @@ def _append_background_page(document: fitz.Document, page: Page, source_path: Pa
             f"Could not read the background for page {page.number}: {exc}"
         ) from exc
     finally:
-        if source_doc is not None:
+        if owns_source_doc and source_doc is not None:
             source_doc.close()
 
 
@@ -681,9 +982,7 @@ def _write_registry(path: Path, record: dict[str, object]) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def _open_registered_pdf(
-    sandbox: SandboxProtocol, document_id: str
-) -> tuple[fitz.Document, dict[str, object]]:
+def _open_registered_pdf(sandbox: SandboxProtocol, document_id: str) -> _RegisteredPdf:
     _validate_document_id(document_id)
     registry_path = _registry_path(sandbox, document_id)
     entry = _read_registry(registry_path, document_id)
@@ -708,14 +1007,16 @@ def _open_registered_pdf(
         raise GoodnotesError("The registered annotated PDF path changed. Register it again.")
     _require_not_production(source_path, purpose="an annotated-PDF input")
     try:
-        stat = source_path.stat()
+        initial_stat = source_path.stat()
     except OSError as exc:
         raise GoodnotesError(
             "The registered annotated PDF is unavailable at its saved path. Register it again."
         ) from exc
     if not source_path.is_file():
         raise GoodnotesError("The registered annotated PDF is no longer a regular file.")
-    if stat.st_size != entry.get("size_bytes") or stat.st_mtime_ns != entry.get("mtime_ns"):
+    if initial_stat.st_size != entry.get("size_bytes") or initial_stat.st_mtime_ns != entry.get(
+        "mtime_ns"
+    ):
         raise GoodnotesError("The registered annotated PDF changed. Register it again before use.")
 
     expected_digest = entry.get("sha256")
@@ -723,6 +1024,8 @@ def _open_registered_pdf(
         digest, stable_stat = _sha256_stable(source_path)
     except GoodnotesError as exc:
         raise GoodnotesError(f"Could not verify the registered annotated PDF: {exc}") from exc
+    if _file_signature(initial_stat) != _file_signature(stable_stat):
+        raise GoodnotesError("The registered annotated PDF changed while it was being read.")
     if stable_stat.st_size != entry.get("size_bytes") or stable_stat.st_mtime_ns != entry.get(
         "mtime_ns"
     ):
@@ -736,13 +1039,26 @@ def _open_registered_pdf(
         source_doc = fitz.open(source_path)
     except Exception as exc:
         raise GoodnotesError(f"Could not open the registered annotated PDF: {exc}") from exc
-    if not source_doc.is_pdf or source_doc.needs_pass:
+    try:
+        if _file_signature(source_path.lstat()) != _file_signature(stable_stat):
+            raise GoodnotesError("The registered annotated PDF changed after its integrity check.")
+        if not source_doc.is_pdf or source_doc.needs_pass:
+            raise GoodnotesError("The registered annotated source is no longer a readable PDF.")
+        if source_doc.page_count != entry.get("page_count"):
+            raise GoodnotesError(
+                "The registered annotated PDF page count changed. Register it again."
+            )
+        if _file_signature(source_path.lstat()) != _file_signature(stable_stat):
+            raise GoodnotesError("The registered annotated PDF changed while it was opened.")
+    except OSError as exc:
         source_doc.close()
-        raise GoodnotesError("The registered annotated source is no longer a readable PDF.")
-    if source_doc.page_count != entry.get("page_count"):
+        raise GoodnotesError(
+            "Could not verify the registered annotated PDF path after opening it."
+        ) from exc
+    except BaseException:
         source_doc.close()
-        raise GoodnotesError("The registered annotated PDF page count changed. Register it again.")
-    return source_doc, entry
+        raise
+    return _RegisteredPdf(source_doc, entry, source_path, _file_signature(stable_stat))
 
 
 def _check_registered_page_count(
@@ -766,7 +1082,7 @@ def _registered_page_count(entry: dict[str, object]) -> int:
 
 def _sha256_stable(path: Path) -> tuple[str, os.stat_result]:
     """Hash a regular file and reject changes during the read."""
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
     except OSError as exc:

@@ -26,10 +26,13 @@ from .errors import (
 from .safety import (
     SNAPSHOT_MARKER,
     Sandbox,
-    _overlaps,
     _require_not_production,
+    path_contains,
+    paths_overlap,
+    safe_remove_tree,
+    stat_key,
 )
-from .snapshot import create_snapshot
+from .snapshot import _InventoryChanged, create_snapshot
 
 if TYPE_CHECKING:
     from .config import Settings
@@ -46,14 +49,7 @@ _NATIVE_STORES = ("notes_main.db",)
 
 
 def _stat_key(info: os.stat_result) -> tuple[int, int, int, int, int, int]:
-    return (
-        info.st_dev,
-        info.st_ino,
-        info.st_mode,
-        info.st_size,
-        info.st_mtime_ns,
-        info.st_ctime_ns,
-    )
+    return stat_key(info)
 
 
 def _lstat(path: Path) -> os.stat_result:
@@ -72,13 +68,52 @@ def _require_directory(path: Path, *, purpose: str) -> None:
         raise GoodnotesError(f"{purpose} is not a directory: {path}")
 
 
+def _source_lstat(path: Path) -> os.stat_result:
+    try:
+        return _lstat(path)
+    except GoodnotesError as exc:
+        if isinstance(_os_cause(exc), FileNotFoundError):
+            raise _InventoryChanged(
+                f"Source path disappeared while it was inspected: {path}"
+            ) from exc
+        raise
+
+
+def _source_root_info(path: Path) -> os.stat_result:
+    """Inspect the selected Library root before child inventory begins.
+
+    A missing root is an invalid source selection, unlike a child disappearing
+    after a valid root has been discovered, which remains a transient inventory
+    race through ``_source_lstat``.
+    """
+
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise FilesystemAccessError.from_exception(
+            exc,
+            operation="inspect_source_library",
+            path=path,
+            kind="source",
+        ) from exc
+    if stat.S_ISLNK(info.st_mode):
+        raise GoodnotesError("The source Library directory must not be a symlink.")
+    return info
+
+
+def _require_source_directory(path: Path, *, purpose: str) -> None:
+    info = _source_lstat(path)
+    if not stat.S_ISDIR(info.st_mode):
+        raise GoodnotesError(f"{purpose} is not a directory: {path}")
+
+
 def _prepare_state(data_dir: Path, source: Path | None = None) -> tuple[Path, Path]:
     requested = Path(data_dir).expanduser()
     if requested.is_symlink():
         raise GoodnotesError("The CLI cache directory must not be a symlink.")
     state = requested.resolve(strict=False)
     _require_not_production(state, purpose="CLI cache storage")
-    if source is not None and _overlaps(state, source):
+    if source is not None and paths_overlap(state, source):
         raise GoodnotesError("The CLI cache and source Library must not overlap.")
 
     try:
@@ -95,7 +130,7 @@ def _prepare_state(data_dir: Path, source: Path | None = None) -> tuple[Path, Pa
         raise GoodnotesError("The CLI cache directory changed while it was being prepared.")
     _require_directory(state, purpose="CLI cache directory")
     _require_not_production(state, purpose="CLI cache storage")
-    if source is not None and _overlaps(state, source):
+    if source is not None and paths_overlap(state, source):
         raise GoodnotesError("The CLI cache and source Library must not overlap.")
     try:
         state.chmod(0o700)
@@ -289,8 +324,15 @@ def _validate_cache_marker(state: Path, *, create: bool) -> bool:
 
 
 def _active_path(data: dict[str, Any]) -> str | None:
-    value = data.get("absolutePath", data.get("snapshot"))
-    return value if isinstance(value, str) else None
+    snapshot = data.get("snapshot")
+    absolute_path = data.get("absolutePath")
+    if snapshot is not None:
+        if not isinstance(snapshot, str):
+            return None
+        if absolute_path is not None and absolute_path != snapshot:
+            raise GoodnotesError("The active snapshot paths disagree.")
+        return snapshot
+    return absolute_path if isinstance(absolute_path, str) else None
 
 
 def _read_pointer(
@@ -319,7 +361,12 @@ def _read_pointer(
     if raw_path is None:
         raise GoodnotesError("The active library pointer is invalid.")
     root = Path(raw_path).expanduser()
-    if not root.is_absolute() or root.parent != snapshots or not _GENERATION.fullmatch(root.name):
+    if (
+        not root.is_absolute()
+        or root.parent != snapshots
+        or not path_contains(snapshots, root)
+        or not _GENERATION.fullmatch(root.name)
+    ):
         raise GoodnotesError("The active library pointer must name a generated cache snapshot.")
     if root.is_symlink():
         raise GoodnotesError("The active cache snapshot must not be a symlink.")
@@ -357,23 +404,23 @@ def _active_cache_signature(
 def _input_signature(source: Path, *, include_root: bool = False) -> str:
     """Fingerprint the complete copied input inventory using metadata only."""
 
-    if source.is_symlink():
-        raise GoodnotesError("The source Library directory must not be a symlink.")
-    _require_directory(source, purpose="Source Library path")
+    source_info = _source_root_info(source)
+    if not stat.S_ISDIR(source_info.st_mode):
+        raise GoodnotesError(f"Source Library path is not a directory: {source}")
     database_dir = source / "Databases"
     attachments_dir = source / "Attachments"
-    _require_directory(database_dir, purpose="Source database path")
-    _require_directory(attachments_dir, purpose="Source attachments path")
+    _require_source_directory(database_dir, purpose="Source database path")
+    _require_source_directory(attachments_dir, purpose="Source attachments path")
 
     entries: list[tuple[str, tuple[int, int, int, int, int, int]]] = []
     paths_to_recheck: list[tuple[Path, tuple[int, int, int, int, int, int]]] = []
     if include_root:
-        root_key = _stat_key(_lstat(source))
+        root_key = _stat_key(source_info)
         entries.append((".", root_key))
         paths_to_recheck.append((source, root_key))
 
     def add(path: Path, relative: Path, *, directory: bool) -> os.stat_result:
-        info = _lstat(path)
+        info = _source_lstat(path)
         expected_type = stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)
         if not expected_type:
             kind = "directory" if directory else "regular file"
@@ -383,40 +430,53 @@ def _input_signature(source: Path, *, include_root: bool = False) -> str:
         paths_to_recheck.append((path, key))
         return info
 
-    add(database_dir, Path("Databases"), directory=True)
+    database_dir_before = add(database_dir, Path("Databases"), directory=True)
     add(attachments_dir, Path("Attachments"), directory=True)
 
     try:
-        database_children = sorted(os.scandir(database_dir), key=lambda entry: entry.name)
+        with os.scandir(database_dir) as iterator:
+            database_children = sorted(iterator, key=lambda entry: entry.name)
+    except FileNotFoundError as exc:
+        raise _InventoryChanged(
+            f"Source database directory disappeared while it was inspected: {database_dir}"
+        ) from exc
     except OSError as exc:
         raise GoodnotesError(
             f"Could not inspect source database directory: {database_dir}"
         ) from exc
     names = {entry.name for entry in database_children}
+    malformed_entries: list[str] = []
     for database_name in _DATABASES:
         database_path = database_dir / database_name
         if database_name in names:
             add(database_path, Path("Databases") / database_name, directory=False)
         sidecars = sorted(name for name in names if name.startswith(database_name + "-"))
         if sidecars and database_name not in names:
-            raise GoodnotesError(f"SQLite sidecars exist without their database: {database_path}")
+            malformed_entries.append(
+                f"SQLite sidecars exist without their database: {database_path}"
+            )
         for sidecar_name in sidecars:
             if not any(sidecar_name == database_name + suffix for suffix in _DATABASE_SIDECARS):
-                raise GoodnotesError(f"Unsupported SQLite sidecar: {database_dir / sidecar_name}")
+                malformed_entries.append(
+                    f"Unsupported SQLite sidecar: {database_dir / sidecar_name}"
+                )
+                continue
             add(
                 database_dir / sidecar_name,
                 Path("Databases") / sidecar_name,
                 directory=False,
             )
-    if "projection.sqlite" not in names:
-        raise GoodnotesError(
-            f"Required projection database is missing: {database_dir / 'projection.sqlite'}"
-        )
+    missing_projection = "projection.sqlite" not in names
 
     def scan(directory: Path, relative: Path) -> None:
         before = add(directory, relative, directory=True)
         try:
-            children = sorted(os.scandir(directory), key=lambda entry: entry.name)
+            with os.scandir(directory) as iterator:
+                children = sorted(iterator, key=lambda entry: entry.name)
+        except FileNotFoundError as exc:
+            raise _InventoryChanged(
+                f"Source directory disappeared while it was inspected: {directory}"
+            ) from exc
         except OSError as exc:
             raise GoodnotesError(
                 f"Could not inspect source attachment directory: {directory}"
@@ -424,7 +484,7 @@ def _input_signature(source: Path, *, include_root: bool = False) -> str:
         for child in children:
             child_path = directory / child.name
             child_relative = relative / child.name
-            info = _lstat(child_path)
+            info = _source_lstat(child_path)
             if stat.S_ISDIR(info.st_mode):
                 key = _stat_key(info)
                 entries.append((child_relative.as_posix(), key))
@@ -436,17 +496,40 @@ def _input_signature(source: Path, *, include_root: bool = False) -> str:
                 paths_to_recheck.append((child_path, key))
             else:
                 raise GoodnotesError(f"Unsupported snapshot input type: {child_path}")
-        after = _lstat(directory)
+        after = _source_lstat(directory)
         if _stat_key(before) != _stat_key(after):
-            raise GoodnotesError(f"Source directory changed while it was inspected: {directory}")
+            raise _InventoryChanged(f"Source directory changed while it was inspected: {directory}")
 
     scan(attachments_dir, Path("Attachments"))
     for name in _NATIVE_STORES:
         if name in names:
             scan(database_dir / name, Path("Databases") / name)
+    database_dir_after = _source_lstat(database_dir)
+    try:
+        with os.scandir(database_dir) as iterator:
+            names_after = {entry.name for entry in iterator}
+    except FileNotFoundError as exc:
+        raise _InventoryChanged(
+            f"Source database directory disappeared while it was fingerprinted: {database_dir}"
+        ) from exc
+    except OSError as exc:
+        raise GoodnotesError(
+            f"Could not inspect source database directory: {database_dir}"
+        ) from exc
+    if _stat_key(database_dir_before) != _stat_key(database_dir_after) or names != names_after:
+        raise _InventoryChanged(
+            f"Source database directory changed while it was inspected: {database_dir}"
+        )
+    if malformed_entries:
+        raise GoodnotesError(malformed_entries[0])
+    if missing_projection:
+        raise GoodnotesError(
+            f"Required projection database is missing: {database_dir / 'projection.sqlite'}"
+        )
+
     for path, expected_key in paths_to_recheck:
-        if _stat_key(_lstat(path)) != expected_key:
-            raise GoodnotesError(f"Snapshot input changed while it was fingerprinted: {path}")
+        if _stat_key(_source_lstat(path)) != expected_key:
+            raise _InventoryChanged(f"Snapshot input changed while it was fingerprinted: {path}")
     entries.sort(key=lambda entry: entry[0])
     encoded = json.dumps(entries, separators=(",", ":"), ensure_ascii=True).encode("ascii")
     return hashlib.sha256(encoded).hexdigest()
@@ -456,25 +539,32 @@ def _timestamp() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
-def _snapshot_captured_at(root: Path) -> str:
+def _snapshot_captured_at(root: Path, marker_data: dict[str, Any] | None = None) -> str:
     marker = root / SNAPSHOT_MARKER
-    try:
-        data = json.loads(marker.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        raise GoodnotesError(f"Could not read snapshot capture time: {marker}") from exc
-    value = data.get("created_at_utc") if isinstance(data, dict) else None
+    if marker_data is None:
+        try:
+            marker_data = json.loads(marker.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise GoodnotesError(f"Could not read snapshot capture time: {marker}") from exc
+    value = marker_data.get("created_at_utc")
     if not isinstance(value, str):
         raise GoodnotesError(f"Snapshot marker has no capture time: {marker}")
     return value
 
 
-def _snapshot_capture_stats(root: Path, *, unchanged: bool = False) -> dict[str, Any]:
+def _snapshot_capture_stats(
+    root: Path,
+    *,
+    unchanged: bool = False,
+    marker_data: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     marker = root / SNAPSHOT_MARKER
-    try:
-        data = json.loads(marker.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        raise GoodnotesError(f"Could not read snapshot capture statistics: {marker}") from exc
-    stats = data.get("capture_stats", {}) if isinstance(data, dict) else {}
+    if marker_data is None:
+        try:
+            marker_data = json.loads(marker.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise GoodnotesError(f"Could not read snapshot capture statistics: {marker}") from exc
+    stats = marker_data.get("capture_stats", {})
     result = dict(stats) if isinstance(stats, dict) else {}
     if unchanged:
         result["scope"] = "unchanged"
@@ -550,41 +640,9 @@ def _write_json_atomic(state: Path, name: str, data: dict[str, Any]) -> None:
 
 
 def _safe_remove_tree(path: Path) -> None:
-    """Remove a CLI-owned tree without traversing symbolic links or special files."""
+    """Remove a CLI-owned tree through the shared no-follow cleanup routine."""
 
-    if path.is_symlink():
-        raise GoodnotesError(f"Refusing to remove a symlinked cache directory: {path}")
-    try:
-        root_info = path.lstat()
-    except FileNotFoundError:
-        return
-    except OSError as exc:
-        raise GoodnotesError(f"Could not inspect cache directory: {path}") from exc
-    if not stat.S_ISDIR(root_info.st_mode):
-        raise GoodnotesError(f"Refusing to remove a non-directory cache path: {path}")
-
-    _assert_safe_tree(path)
-
-    def make_writable_and_remove(directory: Path) -> None:
-        try:
-            children = list(os.scandir(directory))
-        except OSError as exc:
-            raise GoodnotesError(f"Could not inspect generated snapshot: {directory}") from exc
-        for child in children:
-            child_path = directory / child.name
-            info = _lstat(child_path)
-            if stat.S_ISDIR(info.st_mode):
-                child_path.chmod(0o700)
-                make_writable_and_remove(child_path)
-                child_path.rmdir()
-            elif stat.S_ISREG(info.st_mode):
-                child_path.unlink()
-            else:
-                raise GoodnotesError(f"Refusing to remove a special cache file: {child_path}")
-
-    path.chmod(0o700)
-    make_writable_and_remove(path)
-    path.rmdir()
+    safe_remove_tree(path)
 
 
 def _assert_safe_tree(path: Path) -> None:
@@ -830,7 +888,15 @@ def refresh_cache(
 
         # Refreshes serialize on .sync.lock. The shared view lock protects pointer resolution
         # while allowing existing readers to continue during the source capture.
-        active_cache_signature = None if force else _active_cache_signature(active)
+        can_check_active_cache = (
+            not force
+            and active is not None
+            and active[2] is not None
+            and active[0].get("source_path") == str(source)
+            and active[0].get("source_signature") == source_signature
+            and active[0].get("cache_signature") is not None
+        )
+        active_cache_signature = _active_cache_signature(active) if can_check_active_cache else None
 
         if (
             not force
@@ -871,7 +937,11 @@ def refresh_cache(
                         checked_at=checked_at,
                         captured_at=captured_at if isinstance(captured_at, str) else None,
                         warnings=cleanup_warnings,
-                        capture_stats=_snapshot_capture_stats(root, unchanged=True),
+                        capture_stats=_snapshot_capture_stats(
+                            root,
+                            unchanged=True,
+                            marker_data=active[2].marker_data,
+                        ),
                     )
 
         checked_at = _timestamp()
@@ -902,9 +972,13 @@ def refresh_cache(
             os.replace(staging, destination)
             sandbox = Sandbox.load(destination)
             cache_signature = _input_signature(sandbox.library_dir, include_root=True)
-            captured_at = _snapshot_captured_at(destination)
-            signature_after = _source_input_signature(source)
-            source_changed_during_refresh = signature_after != source_signature
+            captured_at = _snapshot_captured_at(destination, sandbox.marker_data)
+            try:
+                signature_after = _source_input_signature(source)
+            except _InventoryChanged:
+                source_changed_during_refresh = True
+            else:
+                source_changed_during_refresh = signature_after != source_signature
             saved_signature = None if source_changed_during_refresh else source_signature
             pointer_data: dict[str, Any] = {
                 "absolutePath": str(destination),
@@ -962,7 +1036,7 @@ def refresh_cache(
             captured_at=captured_at,
             warnings=cleanup_warnings,
             source_changed_during_refresh=source_changed_during_refresh,
-            capture_stats=_snapshot_capture_stats(sandbox.root),
+            capture_stats=_snapshot_capture_stats(sandbox.root, marker_data=sandbox.marker_data),
         )
 
 

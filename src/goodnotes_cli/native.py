@@ -17,10 +17,10 @@ import tempfile
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from .errors import GoodnotesError
-from .safety import Sandbox, _require_not_production
+from .safety import Sandbox, _require_not_production, path_contains, stat_key
 from .snapshot import _clone_file_from_fd
 
 _MAX_VALUE = 16 * 1024 * 1024
@@ -195,17 +195,6 @@ def runtime_status() -> dict[str, object]:
     }
 
 
-def _signature(info: os.stat_result) -> tuple[int, int, int, int, int, int]:
-    return (
-        info.st_dev,
-        info.st_ino,
-        info.st_mode,
-        info.st_size,
-        info.st_mtime_ns,
-        info.st_ctime_ns,
-    )
-
-
 def _inventory(path: Path) -> dict[str, tuple[int, int, int, int, int, int]]:
     if path.is_symlink() or not path.is_dir():
         raise NativeError(
@@ -224,7 +213,7 @@ def _inventory(path: Path) -> dict[str, tuple[int, int, int, int, int, int]]:
                 operation="inspect_native_store",
                 path=child,
             )
-        entries[child.name] = _signature(info)
+        entries[child.name] = stat_key(info)
     if not entries or "CURRENT" not in entries:
         raise NativeError(
             "native_data_unavailable",
@@ -238,14 +227,14 @@ def _inventory(path: Path) -> dict[str, tuple[int, int, int, int, int, int]]:
 def _read_small_regular(path: Path, expected: tuple[int, ...], limit: int) -> bytes:
     fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
     try:
-        if _signature(os.fstat(fd)) != expected or expected[3] > limit:
+        if stat_key(os.fstat(fd)) != expected or expected[3] > limit:
             raise ValueError("Native metadata changed or exceeds its read budget")
         with os.fdopen(os.dup(fd), "rb") as stream:
             data = stream.read(limit + 1)
         if (
             len(data) != expected[3]
-            or _signature(os.fstat(fd)) != expected
-            or _signature(path.lstat()) != expected
+            or stat_key(os.fstat(fd)) != expected
+            or stat_key(path.lstat()) != expected
         ):
             raise ValueError("Native metadata changed while reading")
         return data
@@ -270,7 +259,21 @@ def _validate_options(source: Path, entries: Mapping[str, tuple[int, ...]]) -> N
             )
         # Only inspect compatibility. Never pass copied options to RocksDB.
         raw_options = _read_small_regular(source / name, signature, 4 * 1024 * 1024)
-        for line in raw_options.decode("utf-8", errors="strict").splitlines():
+        try:
+            options_text = raw_options.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as exc:
+            raise NativeError(
+                "native_data_unavailable",
+                "Native options are not valid UTF-8.",
+                operation="inspect_native_options",
+                path=source / name,
+                context={
+                    "encoding": exc.encoding,
+                    "encoding_start": exc.start,
+                    "encoding_end": exc.end,
+                },
+            ) from exc
+        for line in options_text.splitlines():
             key, separator, value = line.strip().partition("=")
             key, value = key.strip(), value.strip()
             if separator and (
@@ -289,7 +292,9 @@ def _validate_options(source: Path, entries: Mapping[str, tuple[int, ...]]) -> N
 
 
 @contextmanager
-def _scratch_store(source: Path, snapshot_root: Path) -> Iterator[Path]:
+def _scratch_store(
+    source: Path, snapshot_root: Path, scratch_dir: Path | str | None = None
+) -> Iterator[Path]:
     before = _inventory(source)
     current = _read_small_regular(source / "CURRENT", before["CURRENT"], 4096)
     if (
@@ -303,14 +308,16 @@ def _scratch_store(source: Path, snapshot_root: Path) -> Iterator[Path]:
             path=source,
         )
     _validate_options(source, before)
-    configured = os.environ.get("GOODNOTES_SCRATCH_DIR")
-    scratch_parent = Path(configured).expanduser() if configured else Path(tempfile.gettempdir())
+    configured = scratch_dir if scratch_dir is not None else os.environ.get("GOODNOTES_SCRATCH_DIR")
+    scratch_parent = (
+        Path(configured).expanduser() if configured is not None else Path(tempfile.gettempdir())
+    )
     try:
         if scratch_parent.is_symlink():
             raise OSError("The scratch directory must not be a symlink")
         scratch_parent = scratch_parent.resolve(strict=True)
         _require_not_production(scratch_parent, purpose="native scratch")
-        if scratch_parent == snapshot_root or scratch_parent.is_relative_to(snapshot_root):
+        if path_contains(snapshot_root, scratch_parent):
             raise OSError("The scratch directory must stay outside the snapshot")
         temporary = tempfile.TemporaryDirectory(prefix="goodnotes-native-", dir=scratch_parent)
     except OSError as exc:
@@ -325,13 +332,16 @@ def _scratch_store(source: Path, snapshot_root: Path) -> Iterator[Path]:
         target.mkdir(mode=0o700)
         copy_budget = _MAX_COPY_FALLBACK
         for name, expected in before.items():
+            # Validate the copied options above, but never copy them into engine scratch.
+            if name.startswith("OPTIONS-"):
+                continue
             fd = os.open(
                 source / name,
                 os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
             )
             try:
                 info = os.fstat(fd)
-                if _signature(info) != expected:
+                if stat_key(info) != expected:
                     raise NativeError(
                         "native_data_unavailable",
                         "The snapshot native store changed during capture.",
@@ -373,7 +383,7 @@ def _scratch_store(source: Path, snapshot_root: Path) -> Iterator[Path]:
                 if (
                     (cloned.st_dev, cloned.st_ino) == (info.st_dev, info.st_ino)
                     or cloned.st_size != info.st_size
-                    or _signature(os.fstat(fd)) != expected
+                    or stat_key(os.fstat(fd)) != expected
                 ):
                     raise NativeError(
                         "native_data_unavailable",
@@ -390,8 +400,6 @@ def _scratch_store(source: Path, snapshot_root: Path) -> Iterator[Path]:
                 operation="clone_native_store",
                 path=source,
             )
-        for options in target.glob("OPTIONS-*"):
-            options.unlink()
         yield target
     finally:
         temporary.cleanup()
@@ -404,54 +412,120 @@ def _scratch_store(source: Path, snapshot_root: Path) -> Iterator[Path]:
             )
 
 
-def read_page_records(sandbox: SnapshotProtocol, root_uuid: str) -> list[tuple[bytes, bytes]]:
-    """Return bounded raw records. The engine only opens a disposable scratch copy."""
-    validated = Sandbox.load(sandbox.root)
-    if Path(sandbox.library_dir).resolve() != validated.library_dir:
-        raise NativeError(
-            "native_data_unavailable",
-            "The native library does not match its snapshot.",
-            operation="resolve_native_snapshot",
-            path=sandbox.library_dir,
-        )
-    source = validated.library_dir / "Databases" / "notes_main.db"
-    runtime = NativeRuntime()
-    with _scratch_store(source, validated.root) as scratch:
-        options = runtime.options_create()
-        db = read_options = iterator = None
+class NativeStoreSession:
+    """Own one validated disposable native-store copy and engine for an operation."""
+
+    def __init__(self, sandbox: SnapshotProtocol, *, scratch_dir: Path | str | None = None) -> None:
+        self._sandbox = sandbox
+        self._scratch_dir = scratch_dir
+        self._scratch_context: Any = None
+        self._runtime: Any = None
+        self._scratch: Path | None = None
+        self._options: Any = None
+        self._db: Any = None
+        self._read_options: Any = None
+        self._iterator: Any = None
+        self._entered = False
+        self._active = False
+
+    def __enter__(self) -> NativeStoreSession:
+        if self._entered:
+            raise RuntimeError("A NativeStoreSession can only be entered once.")
+        self._entered = True
         try:
-            runtime.options_set_create_if_missing(options, 0)
-            runtime.options_set_paranoid_checks(options, 1)
-            runtime.options_set_max_open_files(options, 64)
-            runtime.options_set_db_log_dir(options, os.fsencode(scratch.parent))
-            runtime.options_set_wal_dir(options, os.fsencode(scratch))
+            validated = Sandbox.load(self._sandbox.root)
+            if Path(self._sandbox.library_dir).resolve() != validated.library_dir:
+                raise NativeError(
+                    "native_data_unavailable",
+                    "The native library does not match its snapshot.",
+                    operation="resolve_native_snapshot",
+                    path=self._sandbox.library_dir,
+                )
+            source = validated.library_dir / "Databases" / "notes_main.db"
+            self._scratch_context = _scratch_store(
+                source, validated.root, scratch_dir=self._scratch_dir
+            )
+            self._scratch = self._scratch_context.__enter__()
+            self._runtime = NativeRuntime()
+
+            runtime = self._runtime
+            self._options = runtime.options_create()
+            if not self._options:
+                raise NativeError(
+                    "native_data_unavailable",
+                    "RocksDB could not create read-only options.",
+                    operation="read_native_copy",
+                    path=source,
+                )
+            runtime.options_set_create_if_missing(self._options, 0)
+            runtime.options_set_paranoid_checks(self._options, 1)
+            runtime.options_set_max_open_files(self._options, 64)
+            runtime.options_set_db_log_dir(self._options, os.fsencode(self._scratch.parent))
+            runtime.options_set_wal_dir(self._options, os.fsencode(self._scratch))
+
             error = C.c_void_p()
-            db = runtime.open_for_read_only(options, os.fsencode(scratch), 0, C.byref(error))
+            self._db = runtime.open_for_read_only(
+                self._options, os.fsencode(self._scratch), 0, C.byref(error)
+            )
             runtime.check(error)
-            if not db:
+            if not self._db:
                 raise NativeError(
                     "native_data_unavailable",
                     "Native read-only open returned no database.",
                     operation="read_native_copy",
                     path=source,
                 )
-            read_options = runtime.readoptions_create()
-            runtime.readoptions_set_fill_cache(read_options, 0)
-            runtime.readoptions_set_verify_checksums(read_options, 1)
-            iterator = runtime.create_iterator(db, read_options)
+
+            self._read_options = runtime.readoptions_create()
+            if not self._read_options:
+                raise NativeError(
+                    "native_data_unavailable",
+                    "RocksDB could not create read options.",
+                    operation="read_native_copy",
+                    path=source,
+                )
+            runtime.readoptions_set_fill_cache(self._read_options, 0)
+            runtime.readoptions_set_verify_checksums(self._read_options, 1)
+            self._iterator = runtime.create_iterator(self._db, self._read_options)
+            if not self._iterator:
+                raise NativeError(
+                    "native_data_unavailable",
+                    "RocksDB could not create a native record iterator.",
+                    operation="read_native_copy",
+                    path=source,
+                )
+            self._active = True
+            return self
+        except BaseException as exc:
+            self._release_runtime(suppress_errors=True)
+            scratch_context, self._scratch_context = self._scratch_context, None
+            if scratch_context is not None:
+                try:
+                    scratch_context.__exit__(type(exc), exc, exc.__traceback__)
+                except BaseException as cleanup_exc:
+                    raise cleanup_exc from exc
+            raise
+
+    def read_page_records(self, root_uuid: str) -> list[tuple[bytes, bytes]]:
+        """Return one page's bounded raw records from this session's engine."""
+        if not self._active or self._runtime is None or self._iterator is None:
+            raise RuntimeError("NativeStoreSession must be active to read page records.")
+        runtime = self._runtime
+        source = self._sandbox.library_dir / "Databases" / "notes_main.db"
+        try:
             prefix = root_uuid.encode("ascii") + b"."
-            runtime.iter_seek(iterator, prefix, len(prefix))
+            runtime.iter_seek(self._iterator, prefix, len(prefix))
             records: list[tuple[bytes, bytes]] = []
             total = 0
-            while runtime.iter_valid(iterator):
+            while runtime.iter_valid(self._iterator):
                 key_size, value_size = C.c_size_t(), C.c_size_t()
-                key_ptr = runtime.iter_key(iterator, C.byref(key_size))
+                key_ptr = runtime.iter_key(self._iterator, C.byref(key_size))
                 if key_size.value > 65_536:
                     raise ValueError("Native key exceeds the extraction budget")
                 key = C.string_at(key_ptr, key_size.value)
                 if not key.startswith(prefix):
                     break
-                value_ptr = runtime.iter_value(iterator, C.byref(value_size))
+                value_ptr = runtime.iter_value(self._iterator, C.byref(value_size))
                 total += key_size.value + value_size.value
                 if (
                     value_size.value > _MAX_VALUE
@@ -460,20 +534,58 @@ def read_page_records(sandbox: SnapshotProtocol, root_uuid: str) -> list[tuple[b
                 ):
                     raise ValueError("Native page exceeds the extraction budget")
                 records.append((key, C.string_at(value_ptr, value_size.value)))
-                runtime.iter_next(iterator)
+                runtime.iter_next(self._iterator)
             error = C.c_void_p()
-            runtime.iter_get_error(iterator, C.byref(error))
+            runtime.iter_get_error(self._iterator, C.byref(error))
             runtime.check(error)
             return records
         except (OSError, ValueError) as exc:
             raise NativeError(
                 "native_data_unavailable", str(exc), operation="read_native_copy", path=source
             ) from exc
-        finally:
-            if iterator:
-                runtime.iter_destroy(iterator)
-            if read_options:
-                runtime.readoptions_destroy(read_options)
-            if db:
-                runtime.close(db)
-            runtime.options_destroy(options)
+
+    def _release_runtime(self, *, suppress_errors: bool = False) -> None:
+        runtime = self._runtime
+        if runtime is None:
+            return
+        resources = (
+            ("iter_destroy", self._iterator),
+            ("readoptions_destroy", self._read_options),
+            ("close", self._db),
+            ("options_destroy", self._options),
+        )
+        self._iterator = self._read_options = self._db = self._options = None
+        failure: BaseException | None = None
+        for name, resource in resources:
+            if resource:
+                try:
+                    getattr(runtime, name)(resource)
+                except BaseException as exc:
+                    if failure is None:
+                        failure = exc
+        if failure is not None and not suppress_errors:
+            raise failure
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> Literal[False]:
+        self._active = False
+        cleanup_error: BaseException | None = None
+        try:
+            self._release_runtime()
+        except BaseException as cleanup_exc:
+            cleanup_error = cleanup_exc
+        scratch_context, self._scratch_context = self._scratch_context, None
+        if scratch_context is not None:
+            try:
+                scratch_context.__exit__(exc_type, exc, traceback)
+            except BaseException as scratch_exc:
+                if cleanup_error is None:
+                    cleanup_error = scratch_exc
+        if cleanup_error is not None:
+            raise cleanup_error
+        return False
+
+
+def read_page_records(sandbox: SnapshotProtocol, root_uuid: str) -> list[tuple[bytes, bytes]]:
+    """Compatibility helper that reads one page using an operation-scoped session."""
+    with NativeStoreSession(sandbox) as session:
+        return session.read_page_records(root_uuid)

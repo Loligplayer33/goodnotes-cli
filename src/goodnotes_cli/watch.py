@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import math
 import time
-from collections.abc import Iterator
+from collections.abc import Generator
 from pathlib import Path
 
 from .cache import _input_signature, refresh_cache
 from .errors import FilesystemAccessError, GoodnotesError, _permission_denied
+from .snapshot import _InventoryChanged
 
 
 def _validate_options(interval: float, debounce: float, iterations: int | None) -> None:
@@ -59,7 +60,7 @@ def watch_library(
     interval: float = 2,
     debounce: float = 1,
     iterations: int | None = None,
-) -> Iterator[dict[str, object]]:
+) -> Generator[dict[str, object], None, None]:
     """Refresh immediately, then coalesce source metadata changes before refreshing.
 
     Each iteration is one source inventory check. Unchanged checks produce no event
@@ -79,6 +80,8 @@ def watch_library(
     candidate: str | None = None
     candidate_since = 0.0
     first_change = 0.0
+    inventory_unsettled = False
+    last_inventory_change: _InventoryChanged | None = None
     max_coalescing = max(10.0, debounce * 5)
     failures = 0
     emitted_ready = False
@@ -93,15 +96,41 @@ def watch_library(
         try:
             # Remember the inventory BEFORE refresh. Taking it afterwards could
             # swallow an edit that arrived after the captured view was selected.
-            signature = _source_signature(source)
+            signature: str | None
             now = time.monotonic()
-            should_refresh = baseline is None or failures > 0
-            if not should_refresh:
-                if signature == baseline:
+            try:
+                signature = _source_signature(source)
+            except _InventoryChanged as exc:
+                # One inventory pass can race a normal filesystem update. Treat
+                # this as an unknown candidate, not as a failed refresh: retain
+                # the original max-coalescing deadline and restart the quiet
+                # window when a stable changed signature is observed. Permission,
+                # malformed-state, and unsafe-entry errors take the regular
+                # error/backoff path below.
+                if not inventory_unsettled and (baseline is None or candidate is None):
+                    first_change = now
+                last_inventory_change = exc
+                signature = None
+                candidate = None
+                inventory_unsettled = True
+                # Do not let continuous metadata races defer a snapshot forever.
+                # The capture path has its own consistency checks and will still
+                # reject a source that cannot produce a validated read view.
+                should_refresh = now - first_change >= max_coalescing
+            else:
+                should_refresh = baseline is None
+                if baseline is not None and signature == baseline:
                     candidate = None
-                else:
+                    first_change = 0.0
+                    inventory_unsettled = False
+                    # A failed refresh or an initial cache error should be retried
+                    # after backoff even if the source inventory has settled.
+                    should_refresh = failures > 0
+                elif baseline is not None:
                     if candidate is None:
-                        first_change = now
+                        if not inventory_unsettled:
+                            first_change = now
+                        inventory_unsettled = False
                     if candidate != signature:
                         candidate = signature
                         candidate_since = now
@@ -109,15 +138,37 @@ def watch_library(
                         now - candidate_since >= debounce or now - first_change >= max_coalescing
                     )
             if not should_refresh:
+                if candidate is None or inventory_unsettled:
+                    delay = interval
+                else:
+                    remaining_debounce = max(0.0, candidate_since + debounce - now)
+                    remaining_max = max(0.0, first_change + max_coalescing - now)
+                    delay = min(interval, remaining_debounce, remaining_max)
+                continue
+
+            try:
+                result = refresh_cache(source, destination)
+            except _InventoryChanged as exc:
+                # A capture that races the source is also unsettled metadata,
+                # not a permission, corruption, or unsafe-entry failure. Start a
+                # new bounded window so max-coalescing retries cannot spin.
+                first_change = time.monotonic()
+                candidate = None
+                inventory_unsettled = True
+                last_inventory_change = exc
                 delay = interval
                 continue
 
-            result = refresh_cache(source, destination)
             recovered = failures > 0
             failures = 0
             delay = interval
-            baseline = None if result.get("source_changed_during_refresh") is True else signature
+            if result.get("source_changed_during_refresh") is True:
+                baseline = None
+            elif signature is not None:
+                baseline = signature
             candidate = None
+            inventory_unsettled = False
+            last_inventory_change = None
             snapshot = result.get("snapshot_id")
             if recovered:
                 event = "recovered"
@@ -137,3 +188,14 @@ def watch_library(
             # the caller deliberately selected a longer polling interval.
             delay = max(interval, min(30.0, 2.0 ** min(failures - 1, 5)))
             yield _error_event(exc, iteration, delay)
+
+    if (
+        iterations is not None
+        and not emitted_ready
+        and failures == 0
+        and last_inventory_change is not None
+    ):
+        # Keep transient startup races quiet while the watch can still recover.
+        # If its requested bound ends without one validated view, report that
+        # concrete terminal condition so supervisors do not treat no work as success.
+        yield _error_event(last_inventory_change, iteration, interval)

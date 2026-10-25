@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 from collections.abc import Iterator
 from contextlib import closing
@@ -170,6 +171,200 @@ def test_incremental_snapshot_hashes_only_changed_source_files_and_reuses_verifi
     assert copied_sst.read_bytes() == old_sst.read_bytes()
     assert copied_sst.stat().st_ino != old_sst.stat().st_ino
     assert copied_sst.stat().st_ino != (native / "000004.sst").stat().st_ino
+
+
+def test_changed_sqlite_family_reuses_unchanged_source_member_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = make_library(tmp_path / "source")
+    database = source / "Databases" / "projection.sqlite"
+    writer = sqlite3.connect(database)
+    writer.execute("PRAGMA journal_mode=WAL")
+    writer.execute("PRAGMA wal_autocheckpoint=0")
+    writer.execute("UPDATE item SET name='first WAL state'")
+    writer.commit()
+    first = create_snapshot(source, tmp_path / "first")
+    main_key = snapshot_module._stat_key(database.lstat())
+    assert database.read_bytes() != (first / "Library/Databases/projection.sqlite").read_bytes()
+
+    writer.execute("UPDATE item SET name='second WAL state'")
+    writer.commit()
+    assert snapshot_module._stat_key(database.lstat()) == main_key
+    original_hash = snapshot_module._hash_file
+    hashed: list[Path] = []
+
+    def record_hash(path: Path) -> tuple[tuple[int, int, int, int, int, int], int, str]:
+        hashed.append(path)
+        return original_hash(path)
+
+    monkeypatch.setattr(snapshot_module, "_hash_file", record_hash)
+    second = create_snapshot(source, tmp_path / "second", previous_snapshot=first)
+    stats = marker_data(second)["capture_stats"]
+
+    assert database not in hashed
+    assert any(second / "Library" in path.parents for path in hashed)
+    assert stats["source_bytes_hashed"] < stats["source_captured_bytes"]
+    with open_database(second / "Library/Databases/projection.sqlite") as reader:
+        assert reader.execute("SELECT name FROM item").fetchone()[0] == "second WAL state"
+    writer.close()
+
+
+def test_same_size_edit_with_restored_mtime_rehashes_changed_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = make_library(tmp_path / "source")
+    attachment = source / "Attachments/page.pdf"
+    first = create_snapshot(source, tmp_path / "first")
+    previous_key = snapshot_module._stat_key(attachment.lstat())
+    original_hash = snapshot_module._hash_file
+    hashed: list[Path] = []
+
+    def record_hash(path: Path) -> tuple[tuple[int, int, int, int, int, int], int, str]:
+        hashed.append(path)
+        return original_hash(path)
+
+    attachment.write_bytes(b"x" * previous_key[3])
+    current = attachment.stat()
+    os.utime(attachment, ns=(current.st_atime_ns, previous_key[4]))
+    assert attachment.stat().st_mtime_ns == previous_key[4]
+    assert snapshot_module._stat_key(attachment.lstat()) != previous_key
+    monkeypatch.setattr(snapshot_module, "_hash_file", record_hash)
+
+    create_snapshot(source, tmp_path / "second", previous_snapshot=first)
+
+    assert attachment in hashed
+
+
+def test_wrong_prior_original_source_digest_fails_destination_verification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = make_library(tmp_path / "source")
+    first = create_snapshot(source, tmp_path / "first")
+    data = marker_data(first)
+    original_record = next(
+        record
+        for record in data["source_inventory"]
+        if record["path"] == "Databases/projection.sqlite"
+    )
+    original_record["sha256"] = "f" * 64
+    marker = first / "goodnotes-snapshot.json"
+    marker.chmod(0o644)
+    marker.write_text(json.dumps(data), encoding="utf-8")
+    marker.chmod(0o444)
+    (source / "Databases/projection.sqlite-journal").touch()
+
+    def independent_copy(source_fd: int, destination: Path) -> bool:
+        with os.fdopen(os.dup(source_fd), "rb") as source_stream:
+            with destination.open("xb") as destination_stream:
+                for chunk in iter(lambda: source_stream.read(1024 * 1024), b""):
+                    destination_stream.write(chunk)
+        return True
+
+    monkeypatch.setattr(snapshot_module, "_clone_file_from_fd", independent_copy)
+    destination = tmp_path / "second"
+    with pytest.raises(GoodnotesError, match="Snapshot file verification failed"):
+        create_snapshot(source, destination, previous_snapshot=first)
+
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize(
+    "invalidity",
+    ["missing", "unsupported", "digest-mismatch", "changed-family", "cache-stat-damage"],
+)
+def test_projection_integrity_attestation_requires_all_fingerprints(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, invalidity: str
+) -> None:
+    source = make_library(tmp_path / "source")
+    first = create_snapshot(source, tmp_path / "first")
+    if invalidity in {"missing", "unsupported", "digest-mismatch"}:
+        data = marker_data(first)
+        if invalidity == "missing":
+            data.pop("projection_validation")
+        elif invalidity == "unsupported":
+            data["projection_validation"]["validation_id"] = "future-validation"
+        else:
+            data["projection_validation"]["sha256"] = "0" * 64
+        marker = first / "goodnotes-snapshot.json"
+        marker.chmod(0o644)
+        marker.write_text(json.dumps(data), encoding="utf-8")
+        marker.chmod(0o444)
+    elif invalidity == "changed-family":
+        (source / "Databases/projection.sqlite-journal").touch()
+    else:
+        cached = first / "Library/Databases/projection.sqlite"
+        before = cached.stat()
+        contents = cached.read_bytes()
+        cached.chmod(0o644)
+        cached.write_bytes(contents)
+        os.utime(cached, ns=(before.st_atime_ns, before.st_mtime_ns))
+        cached.chmod(0o444)
+        assert snapshot_module._stat_key(cached.lstat()) != tuple(
+            next(
+                record["cache_stat_key"]
+                for record in marker_data(first)["files"]
+                if record["path"] == "Library/Databases/projection.sqlite"
+            )
+        )
+
+    validations: list[Path] = []
+    original_validate = snapshot_module._validate_projection_database
+
+    def record_validation(path: Path) -> None:
+        validations.append(path)
+        original_validate(path)
+
+    monkeypatch.setattr(snapshot_module, "_validate_projection_database", record_validation)
+    second = create_snapshot(source, tmp_path / "second", previous_snapshot=first)
+
+    assert validations == [second / "Library/Databases/projection.sqlite"]
+
+
+def test_unchanged_projection_reuses_prior_integrity_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = make_library(tmp_path / "source")
+    first = create_snapshot(source, tmp_path / "first")
+    (source / "Attachments/page.pdf").write_bytes(b"changed attachment only")
+    validations: list[Path] = []
+    original_validate = snapshot_module._validate_projection_database
+
+    def record_validation(path: Path) -> None:
+        validations.append(path)
+        original_validate(path)
+
+    monkeypatch.setattr(snapshot_module, "_validate_projection_database", record_validation)
+    second = create_snapshot(source, tmp_path / "second", previous_snapshot=first)
+
+    assert validations == []
+    assert marker_data(second)["projection_validation"]["validation_id"] == (
+        snapshot_module._PROJECTION_VALIDATION_ID
+    )
+    assert marker_data(second)["capture_stats"]["source_captured_files"] == 1
+
+
+def test_tampered_previous_projection_forces_copy_and_integrity_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = make_library(tmp_path / "source")
+    first = create_snapshot(source, tmp_path / "first")
+    previous_db = first / "Library/Databases/projection.sqlite"
+    previous_db.chmod(0o644)
+    previous_db.write_bytes(b"tampered previous projection")
+    previous_db.chmod(0o444)
+    validations: list[Path] = []
+    original_validate = snapshot_module._validate_projection_database
+
+    def record_validation(path: Path) -> None:
+        validations.append(path)
+        original_validate(path)
+
+    monkeypatch.setattr(snapshot_module, "_validate_projection_database", record_validation)
+    second = create_snapshot(source, tmp_path / "second", previous_snapshot=first)
+
+    assert validations == [second / "Library/Databases/projection.sqlite"]
+    with open_database(second / "Library/Databases/projection.sqlite") as reader:
+        assert reader.execute("SELECT name FROM item").fetchone()[0] == "first"
 
 
 def test_incremental_byte_copy_fallback_checks_reused_digest_and_counts_bytes(
@@ -614,7 +809,50 @@ def test_copied_wal_with_rollback_journal_keeps_backup_path(
     snapshot = create_snapshot(source_library, tmp_path / "snapshot")
     with open_database(snapshot / "Library/Databases/projection.sqlite") as connection:
         assert connection.execute("SELECT name FROM item").fetchone()[0] == "first"
+        assert connection.execute("PRAGMA main.journal_mode").fetchone()[0] == "delete"
     assert hash_tree(source_library) == source_before
+
+
+def test_genuine_hot_rollback_journal_recovers_only_the_staging_copy(
+    tmp_path: Path,
+) -> None:
+    source_library = make_library(tmp_path / "source")
+    database = source_library / "Databases/projection.sqlite"
+    writer_code = (
+        "import os, sqlite3, sys; "
+        "connection = sqlite3.connect(sys.argv[1]); "
+        "connection.execute('BEGIN EXCLUSIVE'); "
+        "connection.execute(\"UPDATE item SET name='uncommitted'\"); "
+        "os._exit(0)"
+    )
+    subprocess.run([sys.executable, "-c", writer_code, str(database)], check=True)
+    journal = Path(f"{database}-journal")
+    assert journal.is_file() and journal.stat().st_size > 0
+    source_before = hash_tree(source_library)
+
+    snapshot = create_snapshot(source_library, tmp_path / "snapshot")
+    copied_database = snapshot / "Library/Databases/projection.sqlite"
+
+    with open_database(copied_database) as reader:
+        assert reader.execute("SELECT name FROM item").fetchone()[0] == "first"
+        assert reader.execute("PRAGMA main.journal_mode").fetchone()[0] == "delete"
+    assert not Path(f"{copied_database}-journal").exists()
+    assert hash_tree(source_library) == source_before
+
+
+def test_copied_rollback_recovery_does_not_fall_back_after_database_corruption(
+    tmp_path: Path,
+) -> None:
+    source_library = make_library(tmp_path / "source")
+    database = source_library / "Databases/projection.sqlite"
+    database.write_bytes(b"generated corrupt database bytes")
+    Path(f"{database}-journal").write_bytes(b"generated nonempty journal bytes")
+    destination = tmp_path / "snapshot"
+
+    with pytest.raises(GoodnotesError, match="Could not recover copied SQLite rollback journal"):
+        create_snapshot(source_library, destination)
+
+    assert not destination.exists()
 
 
 @pytest.mark.parametrize("stray_wal", [b"", b"not a valid WAL"])
