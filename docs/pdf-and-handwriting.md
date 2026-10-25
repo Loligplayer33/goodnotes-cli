@@ -1,10 +1,11 @@
 # PDFs and handwriting
 
-The CLI offers three image layers. `background` uses the page's stored PDF or image. Experimental `native` reconstructs supported pen and highlight records from the copied Goodnotes store. `annotated` uses a PDF that you exported from Goodnotes and registered with the CLI. None of these layers runs OCR on images.
+The CLI offers three image layers. `background` uses the page's stored PDF or image. `native` reconstructs supported annotations from the copied Goodnotes store, with partial coverage and fidelity warnings. `annotated` uses a PDF that you exported from Goodnotes and registered with the CLI. None of these layers runs OCR on images.
 
 ## Native ink without manual PDF exports
 
-Install a compatible RocksDB shared library once. On macOS with Homebrew:
+Install the Python project environment from the repository root with `uv sync`. Native rendering also needs a
+compatible RocksDB shared library, installed separately from the Python dependencies. On macOS with Homebrew:
 
 ```sh
 brew install rocksdb
@@ -29,9 +30,11 @@ uv run goodnotes export "Notebook name" --pages 3 --layer native --output /tmp/p
 
 These commands do not require a manually exported PDF. Sync includes the native `notes_main.db` store when available. A copy made before native capture was added needs a new sync. Watch sees edits after Goodnotes has written them on this Mac; it cannot establish whether the latest iPad edit has arrived. Check the returned `snapshot`, `captured_at`, and warnings before judging a new note.
 
-Native results report `annotation_status: "native-reconstructed-approximate"` and a `native_annotations` object. Its `coverage` is `supported-pen-records` or `partial`, with rendered, erased, deleted, and unsupported object counts and reasons. `includes_handwriting: true` means supported strokes were rendered. It does not establish complete page reconstruction. `full_fidelity_verified` remains `false`.
+Native results report `annotation_status: "native-reconstructed-approximate"` and a `native_annotations` object. Its `coverage` is `supported-pen-records`, `supported-native-records`, or `partial`, with rendered, erased, deleted, and unsupported object counts and reasons. `rendered_strokes` includes supported pen marks and filled paths. `includes_handwriting: true` means at least one of those was rendered; native images do not count as handwriting. The concise response includes the separate `rendered_paths` and `rendered_images` counts, so an agent can identify image-only pages. A zero `unsupported_objects` count does not prove completeness; opaque fields and unverified drawing order can still produce partial coverage. `--verbose` adds the full native metadata. `full_fidelity_verified` remains `false`.
 
-Supported reconstruction covers the observed legacy TPL pen and highlighter format, RGBA colours, and supported lasso translations. Shapes, images, text boxes, pencil behaviour, complex erasure, ambiguous object versions, and drawing order across multiple actors are not fully supported. Unknown active objects produce partial-coverage warnings. No supported objects, missing native records, and unsupported page geometry fail explicitly; an absent native root is unknown annotation availability, not evidence of a blank page. The projection-to-native page mapping is experimental. Rotations, nonmatching coordinate scales, and unsupported PDF crop geometry are rejected.
+Supported reconstruction covers observed legacy TPL pen and highlighter records, RGBA colours, supported lasso translations, filled paths, one outlined ellipse form, and one variable-width pencil format. Pencil texture is approximate. Native PNG and JPEG images are loaded only when their copied attachment binding is exact, their stored top and center rectangles match, and the image is unrotated and uncropped. Other shapes and text boxes, complex erasure, ambiguous object versions, and drawing order across multiple actors remain unsupported or uncertain. Unknown active objects and unmodeled fields produce partial-coverage warnings. No supported objects, missing native records, and unsupported page geometry fail explicitly; an absent native root is unknown annotation availability, not evidence of a blank page. The projection-to-native page mapping is experimental. Page/background rotations, nonmatching coordinate scales, image transforms, and unsupported PDF crop geometry are rejected.
+
+Image validation rejects malformed PNG scanlines and incomplete JPEG structures. JPEG scan integrity remains unverified because the decoder can repair damaged data. Native results retain that warning and partial coverage; verbose `image_integrity` counts distinguish `scanlines-checked` from `decoder-unverified` images.
 
 The native engine opens only a disposable private scratch copy of the validated snapshot. It never opens the source store or the completed snapshot store. Scratch defaults to the operating system temporary directory; set `GOODNOTES_SCRATCH_DIR` to an existing private writable directory outside the snapshot when necessary. APFS clones avoid another full byte copy. Without clone support, the reader allows independent copying only for stores up to 64 MiB and rejects larger stores. Native rendering therefore needs cache read access, scratch write access, and output write access. Use `doctor --access-only --scratch-dir PATH --output-dir PATH` to inspect those access boundaries without changing them.
 

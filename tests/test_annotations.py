@@ -13,7 +13,15 @@ from goodnotes_cli import annotations as annotation_module
 from goodnotes_cli._vendor.compression import CompressionError, decode_apple_lz4
 from goodnotes_cli._vendor.tpl import TplDecodeError, decode_tpl
 from goodnotes_cli._vendor.wire import DecodeError, decode_message
-from goodnotes_cli.annotations import decode_ink, decode_native_records, render_native_overlay
+from goodnotes_cli.annotations import (
+    Ink,
+    NativeImage,
+    NativePath,
+    decode_ink,
+    decode_native_objects,
+    decode_native_records,
+    render_native_overlay,
+)
 from goodnotes_cli.models import Page
 from goodnotes_cli.native import NativeError
 
@@ -21,7 +29,11 @@ PAGE_ID = "00000000-0000-0000-0000-000000000100"
 ROOT_ID = "00000000-0000-0000-0000-000000000101"
 STORAGE_ID = "00000000-0000-0000-0000-000000000200"
 LOGICAL_ID = "00000000-0000-0000-0000-000000000300"
+RESOURCE_ID = "00000000-0000-0000-0000-000000000400"
+ATTACHMENT_ID = "00000000-0000-0000-0000-000000000401"
 FORMAT = "vuA(v)A(S(uu))A(S(uuuu))"
+VARIABLE_BRUSH_FORMAT = "vuA(v)A(S(uuuuu))A(S(uuuuuuuuuuu))A(S(uu))A(v)A(S(uu))A(S(uuuu))A(u)"
+NATIVE_PATH_FORMAT = "vA(v)A(u)A(u)A(v)A(v)A(u)A(u)A(u)A(u)A(v)"
 
 
 class _FixtureSnapshot:
@@ -71,6 +83,145 @@ def tpl(
         values += b"".join(struct.pack("<d", value) for value in dash)
     contents = format_string.encode() + b"\0" + values
     return b"tpl\0" + struct.pack("<I", len(contents) + 8) + contents
+
+
+def float_bits(value: float) -> int:
+    return struct.unpack("<I", struct.pack("<f", value))[0]
+
+
+def variable_brush_tpl(
+    *,
+    samples: list[tuple[float, ...]],
+    start: tuple[float, ...] = (1.0, 1.0, 0.0, -1.0, 1.0),
+    width: float = 2.0,
+    flags: list[int] | None = None,
+    version: int = 1,
+) -> bytes:
+    flags = [0, *([1] * len(samples))] if flags is None else flags
+    values = struct.pack("<HII", version, float_bits(width), len(flags))
+    values += b"".join(struct.pack("<H", value) for value in flags)
+    values += struct.pack("<I", 1) + struct.pack("<5I", *(float_bits(v) for v in start))
+    values += struct.pack("<I", len(samples))
+    values += b"".join(
+        struct.pack("<11I", *(float_bits(value) for value in sample)) for sample in samples
+    )
+    values += struct.pack("<I", 0)  # A(S(uu))
+    values += struct.pack("<I", 0)  # A(v)
+    values += struct.pack("<I", 0)  # A(S(uu))
+    values += struct.pack("<I", 0)  # A(S(uuuu))
+    values += struct.pack("<I", 0)  # A(u)
+    contents = VARIABLE_BRUSH_FORMAT.encode() + b"\0" + values
+    return b"tpl\0" + struct.pack("<I", len(contents) + 8) + contents
+
+
+def native_path_tpl(
+    *,
+    command_groups: list[list[tuple[int, tuple[float, ...]]]],
+    ellipse: bool = False,
+    flags: list[int] | None = None,
+    version: int = 2,
+    arc_directions: list[int] | None = None,
+) -> bytes:
+    subpath_count = len(command_groups)
+    flags = (
+        ([4, *([5] * subpath_count)] if ellipse else [0, *([1] * subpath_count)])
+        if flags is None
+        else flags
+    )
+    codes: list[int] = []
+    moves: list[float] = []
+    cubics: list[float] = []
+    arcs: list[float] = []
+    arc_count = 0
+    for group in command_groups:
+        for code, values in group:
+            codes.append(code)
+            if code == 0:
+                moves.extend(values)
+            elif code == 2:
+                cubics.extend(values)
+            elif code in {3, 6}:
+                arcs.extend(values)
+                arc_count += 1
+    directions = [1] * arc_count if arc_directions is None else arc_directions
+    sample_metadata = [10.0, 11.0, 1.0, 0.0] if ellipse else [10.0, 11.0, 1.0]
+    segment_metadata = [0.0] * ((9 if ellipse else 6) * subpath_count)
+
+    def array_u(values: list[int]) -> bytes:
+        return struct.pack("<I", len(values)) + b"".join(struct.pack("<I", v) for v in values)
+
+    def array_v(values: list[int]) -> bytes:
+        return struct.pack("<I", len(values)) + b"".join(struct.pack("<H", v) for v in values)
+
+    values = struct.pack("<H", version)
+    values += array_v(flags)
+    values += array_u([float_bits(value) for value in sample_metadata])
+    values += array_u([float_bits(value) for value in segment_metadata])
+    values += array_v([len(group) for group in command_groups])
+    values += array_v(codes)
+    values += array_u([float_bits(value) for value in moves])
+    values += array_u([])
+    values += array_u([float_bits(value) for value in cubics])
+    values += array_u([float_bits(value) for value in arcs])
+    values += array_v(directions)
+    contents = NATIVE_PATH_FORMAT.encode() + b"\0" + values
+    return b"tpl\0" + struct.pack("<I", len(contents) + 8) + contents
+
+
+def rgba_message(
+    red: float = 0.0, green: float = 0.0, blue: float = 0.0, alpha: float = 1.0
+) -> bytes:
+    return field(1, red) + field(2, green) + field(3, blue) + field(4, alpha)
+
+
+def native_path_body(payload: bytes, *, color: bytes | None = None, metadata: bytes = b"") -> bytes:
+    body = (
+        field(1, LOGICAL_ID.encode())
+        + field(2, framed(payload))
+        + field(3, 1)
+        + field(4, color or rgba_message(0.25, 0.5, 0.75, 1.0))
+        + field(20, metadata)
+        + field(21, 24)
+    )
+    return body
+
+
+def native_image_records(
+    *,
+    logical_id: str = LOGICAL_ID,
+    resource_id: str = RESOURCE_ID,
+    attachment_id: str | None = ATTACHMENT_ID,
+    center_offset: tuple[float, float] = (0.0, 0.0),
+) -> list[tuple[bytes, bytes]]:
+    x, y, width, height = 20.0, 30.0, 40.0, 50.0
+
+    def point_message(first: float, second: float) -> bytes:
+        return field(1, first) + field(2, second)
+
+    def rectangle(origin_x: float, origin_y: float) -> bytes:
+        return field(1, point_message(origin_x, origin_y)) + field(2, point_message(width, height))
+
+    body = (
+        field(1, logical_id.encode())
+        + field(2, rectangle(x, y))
+        + field(3, rectangle(x + width / 2 + center_offset[0], y + height / 2 + center_offset[1]))
+        + field(4, resource_id.encode())
+        + field(5, b"synthetic-ts")
+        + field(6, 1)
+        + field(15, b"synthetic")
+        + field(18, 24)
+    )
+    descriptor = (
+        field(1, logical_id.encode())
+        + field(4, resource_id.encode())
+        + field(6, STORAGE_ID.encode())
+        + (field(7, attachment_id.encode()) if attachment_id else b"")
+        + field(8, 1)
+        + field(9, 1)
+        + field(16, 24)
+    )
+    prefix = f"{ROOT_ID}.normal.{STORAGE_ID}.".encode()
+    return [(prefix + b"descriptor", descriptor), (prefix + b"item", field(1, body))]
 
 
 def framed(data: bytes, *, compressed: bool = True) -> bytes:
@@ -604,3 +755,474 @@ def test_tied_creation_clocks_warn_about_drawing_order() -> None:
     assert any(
         "creation clocks are equal" in warning for warning in cast(list[str], metadata["warnings"])
     )
+
+
+def _decoded_path(payload: bytes, *, ellipse: bool = False) -> NativePath:
+    body = native_path_body(payload, metadata=b"\x0a\x00" if ellipse else b"")
+    objects, metadata = decode_native_objects(native_records(body=body), ROOT_ID)
+    assert metadata["unsupported_objects"] == 0
+    assert len(objects) == 1
+    assert isinstance(objects[0].payload, NativePath)
+    return objects[0].payload
+
+
+def test_native_circular_path_preserves_cubic_controls_arc_and_closed_subpaths() -> None:
+    path = _decoded_path(
+        native_path_tpl(
+            command_groups=[
+                [(0, (12, 10)), (3, (10, 10, 2, 0, math.pi / 2)), (2, (9, 13, 8, 11, 12, 10))],
+                [(0, (30, 40)), (2, (31, 41, 32, 42, 30, 40))],
+            ]
+        )
+    )
+    assert [command.op for command in path.commands] == ["M", "A", "C", "Z", "M", "C", "Z"]
+    assert path.commands[1].values == pytest.approx((2, 2, 0, 1, 0, 10, 12), abs=1e-6)
+    assert path.commands[2].values == (9, 13, 8, 11, 12, 10)
+    assert path.fill_color == "#4080bf"
+    assert path.fill_alpha == 1
+    assert path.stroke_color is None
+
+
+def test_native_elliptical_arc_uses_distinct_radii_and_its_observed_metadata() -> None:
+    path = _decoded_path(
+        native_path_tpl(
+            ellipse=True,
+            command_groups=[
+                [(0, (24, 30)), (6, (20, 30, 4, 2, 0, math.pi / 2, 0))],
+            ],
+        ),
+        ellipse=True,
+    )
+    assert path.commands[1].values == pytest.approx((4, 2, 0, 1, 0, 20, 32), abs=1e-6)
+    assert path.commands[-1].op == "Z"
+
+
+@pytest.mark.parametrize("ellipse", [False, True])
+def test_native_path_metadata_cannot_cross_schema_variants(ellipse: bool) -> None:
+    payload = native_path_tpl(ellipse=ellipse, command_groups=[[(0, (20, 30))]])
+    body = native_path_body(payload, metadata=b"" if ellipse else b"\x0a\x00")
+    objects, metadata = decode_native_objects(native_records(body=body), ROOT_ID)
+    assert objects == []
+    assert metadata["unsupported_objects"] == 1
+
+
+@pytest.mark.parametrize("end_angle", [0.0, math.tau, -math.tau])
+def test_native_full_revolution_is_rejected_instead_of_becoming_an_empty_svg_arc(
+    end_angle: float,
+) -> None:
+    payload = native_path_tpl(
+        command_groups=[
+            [(0, (12, 10)), (3, (10, 10, 2, 0, end_angle))],
+        ]
+    )
+    objects, metadata = decode_native_objects(
+        native_records(body=native_path_body(payload)), ROOT_ID
+    )
+    assert objects == []
+    assert metadata["unsupported_objects"] == 1
+
+
+@pytest.mark.parametrize(
+    "commands",
+    [
+        [(2, (1, 2, 3, 4, 5, 6))],
+        [(0, (1, 2)), (0, (3, 4))],
+        [(0, (1, 2)), (8, ())],
+        [(0, (1, 2)), (2, (3, 4, 5, 6))],
+        [(0, (1, 2)), (3, (1, 2, -1, 0, 1))],
+        [(0, (math.nan, 2))],
+        [(0, (100001, 2))],
+    ],
+)
+def test_malformed_native_path_never_returns_a_partial_prefix(
+    commands: list[tuple[int, tuple[float, ...]]],
+) -> None:
+    payload = native_path_tpl(command_groups=[commands])
+    objects, metadata = decode_native_objects(
+        native_records(body=native_path_body(payload)), ROOT_ID
+    )
+    assert objects == []
+    assert metadata["rendered_objects"] == 0
+    assert metadata["unsupported_objects"] == 1
+
+
+@pytest.mark.parametrize("flags,directions", [([0, 0], [1]), ([0, 1], [0]), ([0, 1], [])])
+def test_native_path_rejects_unknown_visibility_and_arc_direction(
+    flags: list[int],
+    directions: list[int],
+) -> None:
+    payload = native_path_tpl(
+        command_groups=[[(0, (12, 10)), (3, (10, 10, 2, 0, 1))]],
+        flags=flags,
+        arc_directions=directions,
+    )
+    objects, metadata = decode_native_objects(
+        native_records(body=native_path_body(payload)), ROOT_ID
+    )
+    assert objects == []
+    assert metadata["unsupported_objects"] == 1
+
+
+def test_native_path_point_budget_counts_controls_before_returning_any_geometry() -> None:
+    payload = native_path_tpl(
+        command_groups=[
+            [(0, (12, 10)), (3, (10, 10, 2, 0, 1)), (2, (1, 2, 3, 4, 5, 6))],
+        ]
+    )
+    body = decode_message(native_path_body(payload))
+    annotation_module._decode_native_path(body, annotation_module._DecodeBudget(points_left=6))
+    with pytest.raises(NativeError, match="point budget"):
+        annotation_module._decode_native_path(body, annotation_module._DecodeBudget(points_left=5))
+
+
+def _brush_body(payload: bytes, *, extra: bytes = b"") -> bytes:
+    return (
+        field(1, LOGICAL_ID.encode())
+        + field(2, framed(payload))
+        + field(3, 5)
+        + field(4, rgba_message(0.2, 0.4, 0.6, 0.5))
+        + field(21, 25)
+        + extra
+    )
+
+
+def test_variable_brush_preserves_ordered_samples_and_each_diameter() -> None:
+    payload = variable_brush_tpl(samples=[(0, 2, 3, 0, 1, 2, 5, 6, 0, 1, 4)])
+    objects, metadata = decode_native_objects(
+        native_records(
+            type_code=25,
+            body=_brush_body(payload),
+        ),
+        ROOT_ID,
+    )
+    assert metadata["unsupported_objects"] == 0
+    ink = objects[0].payload
+    assert isinstance(ink, Ink)
+    assert ink.points == ((1, 1), (2, 3), (5, 6))
+    assert ink.widths == (2, 2, 4)
+    assert ink.alpha == 0.5
+    assert ink.color == "#336699"
+
+
+@pytest.mark.parametrize(
+    "sample",
+    [
+        (0, math.inf, 3, 0, 1, 2, 5, 6, 0, 1, 4),
+        (0, 2, 3, 0, 1, 0, 5, 6, 0, 1, 4),
+        (0, 2, 3, 0, 1, 2, 5, 6, 0, 1, 101),
+        (0, 2, 3, math.nan, 1, 2, 5, 6, 0, 1, 4),
+    ],
+)
+def test_variable_brush_rejects_invalid_sample_without_returning_a_prefix(
+    sample: tuple[float, ...],
+) -> None:
+    objects, metadata = decode_native_objects(
+        native_records(
+            type_code=25,
+            body=_brush_body(variable_brush_tpl(samples=[sample])),
+        ),
+        ROOT_ID,
+    )
+    assert objects == []
+    assert metadata["unsupported_objects"] == 1
+
+
+def test_variable_brush_visibility_and_aggregate_point_budget_are_enforced() -> None:
+    samples: list[tuple[float, ...]] = [(0, 2, 3, 0, 1, 2, 5, 6, 0, 1, 4)]
+    hidden = variable_brush_tpl(samples=samples, flags=[0, 0])
+    objects, metadata = decode_native_objects(
+        native_records(
+            type_code=25,
+            body=_brush_body(hidden),
+        ),
+        ROOT_ID,
+    )
+    assert objects == []
+    assert metadata["unsupported_reasons"] == {"visibility-uncertain": 1}
+    body = decode_message(_brush_body(variable_brush_tpl(samples=samples)))
+    annotation_module._decode_variable_brush(body, annotation_module._DecodeBudget(points_left=3))
+    with pytest.raises(NativeError, match="point budget"):
+        annotation_module._decode_variable_brush(
+            body, annotation_module._DecodeBudget(points_left=2)
+        )
+
+
+def _ellipse_body(
+    *,
+    angle: float = math.pi / 2,
+    extra_shape: bytes = b"",
+    style: bytes = b"\x10\x01",
+    extra_ink: bool = False,
+    auxiliary_width: float = 2.0,
+) -> bytes:
+    payload = tpl(
+        points=[] if not extra_ink else [(2, 3)],
+        flags=[],
+        format_string=FORMAT + "vA(f)",
+        width=2.0,
+    )
+    start = 8 + len(FORMAT + "vA(f)") + 1
+    raw = bytearray(payload)
+    struct.pack_into("<H", raw, start, 2)
+    struct.pack_into("<H", raw, len(raw) - 6, 1)
+    shape = (
+        field(1, field(1, 30.0) + field(2, 40.0))
+        + field(2, field(1, 8.0) + field(2, 3.0))
+        + field(3, angle)
+        + extra_shape
+    )
+    auxiliary = field(4, shape) + field(5, style) + field(15, auxiliary_width)
+    return (
+        field(1, LOGICAL_ID.encode())
+        + field(2, framed(bytes(raw)))
+        + field(4, rgba_message(0.1, 0.3, 0.5, 0.75))
+        + field(9, auxiliary)
+        + field(21, 24)
+    )
+
+
+def test_outlined_ellipse_rotation_matches_analytic_quadrant_endpoints() -> None:
+    objects, metadata = decode_native_objects(native_records(body=_ellipse_body()), ROOT_ID)
+    assert metadata["unsupported_objects"] == 0
+    path = objects[0].payload
+    assert isinstance(path, NativePath)
+    assert [command.op for command in path.commands] == ["M", "C", "C", "C", "C"]
+    # Quarter turn maps the major radius to the vertical axis.
+    endpoints = [path.commands[0].values] + [command.values[-2:] for command in path.commands[1:]]
+    for actual, expected in zip(
+        endpoints, [(30, 48), (27, 40), (30, 32), (33, 40), (30, 48)], strict=True
+    ):
+        assert actual == pytest.approx(expected, abs=1e-5)
+    assert path.fill_color is None
+    assert path.stroke_color == "#1a4d80"
+    assert path.stroke_width == 2
+    assert path.stroke_alpha == 0.75
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"style": b"\x10\x00"},
+        {"style": b"\x10\x01\x18\x01"},
+        {"extra_shape": field(6, 1)},
+        {"angle": math.nan},
+        {"angle": 10.0},
+        {"extra_ink": True},
+        {"auxiliary_width": 3.0},
+    ],
+)
+def test_outlined_ellipse_unknown_geometry_or_visibility_never_renders_partially(
+    options: dict[str, Any],
+) -> None:
+    objects, metadata = decode_native_objects(
+        native_records(body=_ellipse_body(**options)), ROOT_ID
+    )
+    assert objects == []
+    assert metadata["unsupported_objects"] == 1
+
+
+def test_native_image_binding_and_both_bounds_must_agree() -> None:
+    objects, metadata = decode_native_objects(native_image_records(), ROOT_ID)
+    assert metadata["unsupported_objects"] == 0
+    image = objects[0].payload
+    assert isinstance(image, NativeImage)
+    assert image.attachment_id == ATTACHMENT_ID
+    assert (image.x, image.y, image.width, image.height) == (20, 30, 40, 50)
+    for records in [
+        native_image_records(center_offset=(1, 0)),
+        native_image_records(attachment_id=None),
+    ]:
+        objects, metadata = decode_native_objects(records, ROOT_ID)
+        assert objects == []
+        assert metadata["unsupported_objects"] == 1
+
+
+def test_native_image_direct_resource_and_descriptor_resource_mismatch() -> None:
+    records = native_image_records()
+    descriptor = decode_message(records[0][1])
+    direct_descriptor = b"".join(
+        field(item.number, item.value) for item in descriptor.fields if item.number not in {4, 7}
+    )
+    direct = [(records[0][0], direct_descriptor), records[1]]
+    objects, metadata = decode_native_objects(direct, ROOT_ID)
+    assert metadata["unsupported_objects"] == 0
+    assert isinstance(objects[0].payload, NativeImage)
+    assert objects[0].payload.attachment_id == RESOURCE_ID
+    mismatch_descriptor = b"".join(
+        field(
+            item.number,
+            ATTACHMENT_ID.encode() if item.number == 4 else item.value,
+        )
+        for item in descriptor.fields
+    )
+    objects, metadata = decode_native_objects(
+        [(records[0][0], mismatch_descriptor), records[1]], ROOT_ID
+    )
+    assert objects == []
+    assert metadata["unsupported_reasons"] == {"image-binding-invalid": 1}
+
+
+@pytest.mark.parametrize(
+    "extra_descriptor,extra_body,extra_item",
+    [
+        (field(20, b"unmodeled-transform"), b"", b""),
+        (b"", field(99, 1), b""),
+        (b"", field(6, 2), b""),
+        (b"", b"", field(7, b"unmodeled-envelope")),
+    ],
+)
+def test_native_image_unknown_transform_or_envelope_never_renders(
+    extra_descriptor: bytes,
+    extra_body: bytes,
+    extra_item: bytes,
+) -> None:
+    records = native_image_records()
+    item = decode_message(records[1][1])
+    body = cast(bytes, item.by_number(1)[0].value)
+    malformed = [
+        (records[0][0], records[0][1] + extra_descriptor),
+        (records[1][0], field(1, body + extra_body) + extra_item),
+    ]
+    objects, metadata = decode_native_objects(malformed, ROOT_ID)
+    assert objects == []
+    assert metadata["unsupported_objects"] == 1
+
+
+@pytest.mark.parametrize(
+    "width,height,x",
+    [
+        (0.0, 5.0, 1.0),
+        (-1.0, 5.0, 1.0),
+        (math.inf, 5.0, 1.0),
+        (5.0, math.nan, 1.0),
+        (5.0, 5.0, 99999.0),
+    ],
+)
+def test_native_image_rejects_invalid_rectangle_before_resolving_media(
+    width: float,
+    height: float,
+    x: float,
+) -> None:
+    rectangle = field(1, field(1, x) + field(2, 1.0)) + field(2, field(1, width) + field(2, height))
+    records = native_image_records()
+    original_body = decode_message(cast(bytes, decode_message(records[1][1]).by_number(1)[0].value))
+    body = b"".join(
+        field(item.number, rectangle if item.number == 2 else item.value)
+        for item in original_body.fields
+    )
+    objects, metadata = decode_native_objects(
+        [records[0], (records[1][0], field(1, body))],
+        ROOT_ID,
+    )
+    assert objects == []
+    assert metadata["unsupported_objects"] == 1
+
+
+def test_outlined_ellipse_exact_point_budget_and_fixed32_version_rejection() -> None:
+    body = decode_message(_ellipse_body())
+    annotation_module._decode_native_ellipse(body, annotation_module._DecodeBudget(points_left=13))
+    with pytest.raises(NativeError, match="point budget"):
+        annotation_module._decode_native_ellipse(
+            body, annotation_module._DecodeBudget(points_left=12)
+        )
+    # Integer-valued FIXED32 fields are not interchangeable with VARINT envelope versions.
+    malformed = _ellipse_body() + varint(21 * 8 + 5) + struct.pack("<I", 24)
+    objects, metadata = decode_native_objects(native_records(body=malformed), ROOT_ID)
+    assert objects == []
+    assert metadata["unsupported_objects"] == 1
+
+
+def test_native_descriptor_requires_varint_creation_clock() -> None:
+    records = native_records()
+    descriptor = decode_message(records[0][1])
+    descriptor_payload = b"".join(
+        varint(8 * 8 + 5) + struct.pack("<I", 1)
+        if item.number == 8
+        else field(item.number, item.value)
+        for item in descriptor.fields
+    )
+    objects, metadata = decode_native_objects(
+        [(records[0][0], descriptor_payload), records[1]], ROOT_ID
+    )
+    assert objects == []
+    assert metadata["unsupported_objects"] == 1
+
+
+def test_ink_translation_cannot_move_valid_points_beyond_decoder_bounds() -> None:
+    body = decode_message(field(2, framed(tpl(points=[(99999.0, 10.0)]))) + field(6, field(1, 2.0)))
+    with pytest.raises(ValueError, match="translated ink coordinate"):
+        decode_ink(body)
+
+
+@pytest.mark.parametrize("ellipse", [False, True])
+@pytest.mark.parametrize("preceding", ["move", "cubic", "arc"])
+def test_native_arc_rejects_discontinuous_start_without_inventing_an_svg_center(
+    ellipse: bool,
+    preceding: str,
+) -> None:
+    first = (0, (1000.0, 1000.0))
+    commands: list[tuple[int, tuple[float, ...]]] = [first]
+    if preceding == "cubic":
+        commands.append((2, (900, 900, 950, 950, 1000, 1000)))
+    elif preceding == "arc":
+        commands = [
+            (0, (1002, 1000)),
+            (6, (1000, 1000, 2, 3, 0, math.pi / 2, 0))
+            if ellipse
+            else (3, (1000, 1000, 2, 0, math.pi / 2)),
+        ]
+    commands.append(
+        (6, (10, 10, 2, 3, 0, math.pi / 2, 0)) if ellipse else (3, (10, 10, 2, 0, math.pi / 2))
+    )
+    payload = native_path_tpl(command_groups=[commands], ellipse=ellipse)
+    body = native_path_body(payload, metadata=b"\x0a\x00" if ellipse else b"")
+    objects, metadata = decode_native_objects(native_records(body=body), ROOT_ID)
+    assert objects == []
+    assert metadata["rendered_objects"] == 0
+    assert metadata["unsupported_reasons"] == {"unsupported-native-path": 1}
+
+
+@pytest.mark.parametrize("ellipse", [False, True])
+def test_native_arc_rejects_an_opposite_point_on_the_same_ellipse(ellipse: bool) -> None:
+    commands: list[tuple[int, tuple[float, ...]]] = [
+        (0, (8.0, 10.0)),
+        (6, (10, 10, 2, 3, 0, math.pi / 2, 0)) if ellipse else (3, (10, 10, 2, 0, math.pi / 2)),
+    ]
+    payload = native_path_tpl(command_groups=[commands], ellipse=ellipse)
+    body = native_path_body(payload, metadata=b"\x0a\x00" if ellipse else b"")
+    objects, metadata = decode_native_objects(native_records(body=body), ROOT_ID)
+    assert objects == []
+    assert metadata["unsupported_reasons"] == {"unsupported-native-path": 1}
+
+
+def test_native_arc_preserves_valid_start_at_coordinate_limit() -> None:
+    path = _decoded_path(
+        native_path_tpl(
+            command_groups=[
+                [
+                    (0, (100000.0, 10.0)),
+                    (3, (99998, 10, 2, 0, math.pi / 2)),
+                ]
+            ]
+        )
+    )
+    assert path.commands[0].values == (100000, 10)
+    assert path.commands[1].values == pytest.approx((2, 2, 0, 1, 0, 99998, 12), abs=1e-6)
+
+
+def test_ellipse_arc_retains_small_observed_parametric_angle_discrepancy() -> None:
+    # Float32 path points can lie on the ellipse while its angle marker differs
+    # slightly. This stays within the supported ellipse envelope.
+    path = _decoded_path(
+        native_path_tpl(
+            ellipse=True,
+            command_groups=[
+                [
+                    (0, (10 + 2 * math.cos(0.1), 20 + 30 * math.sin(0.1))),
+                    (6, (10, 20, 2, 30, 0.11, math.pi / 2, 0)),
+                ]
+            ],
+        ),
+        ellipse=True,
+    )
+    assert path.commands[1].values == pytest.approx((2, 30, 0, 1, 0, 10, 50), abs=1e-5)

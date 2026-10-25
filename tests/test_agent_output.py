@@ -51,6 +51,8 @@ def _native_metadata() -> dict[str, Any]:
         "native_objects": 7,
         "rendered_objects": 3,
         "rendered_strokes": 4,
+        "rendered_paths": 1,
+        "rendered_images": 2,
         "erased_objects": 1,
         "deleted_objects": 1,
         "unsupported_objects": 2,
@@ -207,6 +209,9 @@ def test_brief_render_preserves_partial_coverage_and_distinct_warnings(
         if key not in {"warnings", "categories", "descriptor_variants"}
     }
     assert result["includes_handwriting"] is True
+    assert result["native_annotations"]["rendered_strokes"] == 4
+    assert result["native_annotations"]["rendered_paths"] == 1
+    assert result["native_annotations"]["rendered_images"] == 2
     assert "dpi" not in result
 
 

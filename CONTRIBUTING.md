@@ -27,7 +27,7 @@ Keep the implementation within its package boundary:
 | `library` | Read SQLite rows and map folders, notebooks, pages, text, and search results. |
 | `text_index` | Query raw stored-text rows, verified PDF bindings, and index diagnostics using connections owned by `library`. |
 | `documents` | Resolve copied PDF pages, render pages, and export PDFs. |
-| `annotations` and `native` | Decode native objects from disposable copies and report reconstruction coverage. |
+| `annotations`, `native`, `native_assets`, and `native_render` | Decode copied native records, validate copied image bindings and raster inputs, serialize drawing primitives, and report reconstruction coverage. Engines open disposable copies only. |
 | `cache` and `safety` | Validate snapshots, cache transitions, locks, and safe paths. |
 | `snapshot` | Copy, verify, and mark a Library snapshot. |
 | `watch` and `diagnostics` | Poll source metadata for refreshes and report filesystem access without changing permissions. |

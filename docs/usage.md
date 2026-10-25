@@ -10,6 +10,8 @@ On macOS, sync discovers the Goodnotes library and prepares the local read view:
 uv run goodnotes sync
 ```
 
+macOS can ask the terminal or agent application for permission to read Goodnotes data. A pending privacy prompt can leave `sync` waiting without output. Respond to the relevant macOS prompt; the CLI does not grant or change those permissions. Access to the copied cache for later reads is separate.
+
 On Linux, give `sync` a path to an available copy of the `Library` folder:
 
 ```sh
@@ -28,14 +30,14 @@ uv run goodnotes watch --interval 2 --debounce 1
 
 Use `watch --library /path/to/Library` for an explicit source. Watch emits an initial result, then JSON events for updates, errors, and recovery. It stays quiet when unchanged and stops with Ctrl-C. This observes changes that reached the Mac; it cannot verify whether an iPad is fully synced. If watch is not running, refresh with `sync` after edits.
 
-For actual pen annotations, install the optional native runtime described in [PDFs and handwriting](pdf-and-handwriting.md), then render a page or prepare an agent bundle:
+For supported native annotations, install the optional runtime described in [PDFs and handwriting](pdf-and-handwriting.md), then render a page or prepare an agent bundle:
 
 ```sh
 uv run goodnotes render "Notebook name" --page 3 --layer native --output /tmp/notes-page.png
 uv run goodnotes bundle "Notebook name" --pages 3 --output /tmp/notes-context
 ```
 
-Inspect `native_annotations`, warnings, snapshot ID, and capture time before evaluating the image. Native reconstruction is approximate and reports unsupported objects; text recognition remains separate.
+Inspect `native_annotations`, warnings, snapshot ID, and capture time before evaluating the image. The counts distinguish strokes, filled paths, and images; native images do not count as handwriting. Native reconstruction remains approximate even when `unsupported_objects` is zero. Text recognition remains separate.
 
 To make a separate copy at a path you manage, use `snapshot`, then pass that copy with the global `--sandbox` option:
 

@@ -6,6 +6,7 @@ Notable changes to the project are recorded here. Versions follow Semantic Versi
 
 ### Added
 
+- Native rendering of observed filled paths, outlined ellipses, variable-width pencil strokes, and copied PNG/JPEG image attachments, with separate path and image counts.
 - Temporary render and bundle storage with image reuse, shared PNG payloads, a 100 MB cap, one-day idle expiry, and protected returned paths. Explicit `--output` destinations remain persistent.
 - Read-only artifact-directory access hints in `doctor --access-only`.
 - Notebook-scoped search and PDF scans, source-coverage diagnostics, metadata-only handwriting discovery, and selected-page PDF export.
@@ -26,6 +27,7 @@ Notable changes to the project are recorded here. Versions follow Semantic Versi
 
 ### Fixed
 
+- Missing native handwriting and drawing forms now decode with bounded geometry validation. Renderer upgrades and changed copied image attachments invalidate cached page renders.
 - Filesystem overlap checks recognize case and directory-identity aliases. Cleanup does not follow symlinks or change their targets' permissions.
 - Source edits during the final freshness scan preserve a validated view and trigger another refresh; watch coalesces transient inventory changes.
 - Genuine hot rollback journals recover only on independent staging copies. Fallback SQLite output leaves WAL mode before publication.

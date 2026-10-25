@@ -25,7 +25,7 @@ from .safety import _require_not_production, open_database, resolve_confined_fil
 if TYPE_CHECKING:
     from .artifacts import ArtifactCache
 
-_RENDER_CACHE_VERSION = 1
+_RENDER_CACHE_VERSION = 3
 
 
 class SandboxProtocol(Protocol):
@@ -374,6 +374,7 @@ def cached_render_pages(
     """
     from .artifacts import artifact_key
     from .native import native_store_fingerprint
+    from .native_assets import native_attachment_fingerprint
     from .output import serializable
 
     _check_layer(layer)
@@ -381,6 +382,7 @@ def cached_render_pages(
     if not pages:
         raise GoodnotesError("Provide at least one page to render.")
     native_inputs = native_store_fingerprint(sandbox) if layer == "native" else None
+    native_attachments: dict[str, object] = {}
     attachments: dict[str, Path] = {}
     signatures: dict[Path, tuple[int, int, int, int, int, int]] = {}
     registered: dict[str, _RegisteredPdf] = {}
@@ -392,6 +394,9 @@ def cached_render_pages(
                 raise GoodnotesError("A copied page background changed during rendering.")
         if native_inputs is not None and native_store_fingerprint(sandbox) != native_inputs:
             raise GoodnotesError("The copied native store changed during rendering.")
+        for document_id, expected in native_attachments.items():
+            if native_attachment_fingerprint(sandbox, document_id) != expected:
+                raise GoodnotesError("Copied native image attachments changed during rendering.")
         for verified in registered.values():
             verified.ensure_unchanged()
 
@@ -407,6 +412,10 @@ def cached_render_pages(
             )
             native_key = artifact_key(native_inputs) if native_inputs is not None else None
             for page in pages:
+                if layer == "native" and page.document_id not in native_attachments:
+                    native_attachments[page.document_id] = native_attachment_fingerprint(
+                        sandbox, page.document_id
+                    )
                 if layer == "annotated":
                     if page.document_id not in registered:
                         verified = _open_registered_pdf(sandbox, page.document_id)
@@ -435,6 +444,7 @@ def cached_render_pages(
                         "page": serializable(page),
                         "background": background,
                         "native": native_key,
+                        "native_attachments": native_attachments.get(page.document_id),
                         "layer": layer,
                         "dpi": dpi,
                     }
@@ -801,7 +811,9 @@ def _append_native_page(
         height_points=target.rect.height,
         record_reader=record_reader,
     )
-    if overlay.svg and overlay.metadata.get("rendered_strokes"):
+    if overlay.svg and (
+        overlay.metadata.get("rendered_objects") or overlay.metadata.get("rendered_strokes")
+    ):
         with fitz.open(stream=overlay.svg, filetype="svg") as vector:
             with fitz.open(stream=vector.convert_to_pdf(), filetype="pdf") as ink:
                 target.show_pdf_page(target.rect, ink, 0, overlay=True)

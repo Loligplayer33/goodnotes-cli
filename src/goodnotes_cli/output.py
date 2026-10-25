@@ -200,6 +200,8 @@ _BRIEF_NATIVE_FIELDS = (
     "native_objects",
     "rendered_objects",
     "rendered_strokes",
+    "rendered_paths",
+    "rendered_images",
     "erased_objects",
     "deleted_objects",
     "unsupported_objects",
