@@ -7,11 +7,11 @@ import os
 import shutil
 import sqlite3
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import ExitStack, contextmanager
 from functools import wraps
 from pathlib import Path
-from typing import Annotated, Any, cast
+from typing import TYPE_CHECKING, Annotated, Any, TypedDict, cast
 
 import typer
 from typer.core import TyperGroup
@@ -19,9 +19,13 @@ from typer.core import TyperGroup
 from . import __version__
 from .cache import read_view, refresh_cache
 from .config import Settings, default_data_dir, default_library
-from .documents import export_pdf, register_annotated_pdf, render_page
-from .errors import CacheAccessError, GoodnotesError, TextIndexUnavailableError
-from .library import Library
+from .errors import (
+    CacheAccessError,
+    FilesystemAccessError,
+    GoodnotesError,
+    TextIndexUnavailableError,
+)
+from .native import NativeError
 from .output import (
     Projection,
     bound_page_text,
@@ -35,6 +39,12 @@ from .output import (
     window,
 )
 from .snapshot import create_snapshot
+from .watch import watch_library
+
+if TYPE_CHECKING:
+    from .artifacts import ArtifactCache
+    from .library import Library
+    from .models import Page
 
 ItemSelector = Annotated[
     str, typer.Argument(help="Exact UUID, full library path, or unique exact name.")
@@ -63,6 +73,13 @@ class AgentGroup(TyperGroup):
                 details=getattr(exc, "details", None),
             )
             raise SystemExit(1) from None
+
+
+class _BundlePage(TypedDict):
+    page: int
+    image: str
+    render: dict[str, Any]
+    text: dict[str, Any]
 
 
 app = typer.Typer(
@@ -99,6 +116,9 @@ def command(*args: Any, **kwargs: Any) -> Any:
                 validate_projection(cfg.fields, projection)
             try:
                 return function(*fargs, **fkwargs)
+            except BrokenPipeError:
+                # Preserve the process-level broken-pipe contract in main().
+                raise
             except (OSError, sqlite3.Error, ValueError) as exc:
                 raise GoodnotesError(str(exc)) from exc
 
@@ -128,6 +148,10 @@ def configure(
     ] = None,
     text: Annotated[bool, typer.Option("--text", help="Indent JSON for inspection.")] = False,
     json_output: Annotated[bool, typer.Option("--json", help="Compact JSON, the default.")] = False,
+    verbose: Annotated[
+        bool,
+        typer.Option("--verbose", help="Include full metadata and native format diagnostics."),
+    ] = False,
     fields: Annotated[
         str | None,
         typer.Option(
@@ -141,7 +165,14 @@ def configure(
         bool, typer.Option("--version", callback=version, is_eager=True, help="Print the version.")
     ] = False,
 ) -> None:
-    ctx.obj = Settings(sandbox, data_dir, text and not json_output, fields, expect_snapshot)
+    ctx.obj = Settings(
+        sandbox,
+        data_dir,
+        text and not json_output,
+        fields,
+        expect_snapshot,
+        brief=not verbose and fields is None,
+    )
 
 
 def settings(ctx: typer.Context) -> Settings:
@@ -149,12 +180,14 @@ def settings(ctx: typer.Context) -> Settings:
 
 
 @contextmanager
-def repository(ctx: typer.Context) -> Iterator[Library]:
+def repository(ctx: typer.Context) -> Generator[Library, None, None]:
     cfg = settings(ctx)
     with read_view(cfg) as sandbox:
         cfg.snapshot_id = sandbox.root.name
         with ExitStack() as stack:
             try:
+                from .library import Library
+
                 lib = stack.enter_context(Library(sandbox))
             except sqlite3.Error as exc:
                 raise CacheAccessError(
@@ -165,6 +198,23 @@ def repository(ctx: typer.Context) -> Iterator[Library]:
                     cache_dir=cfg.cache_dir,
                 ) from exc
             yield lib
+
+
+def repository_query(
+    ctx: typer.Context, lib: Library, query: Any, *args: Any, **kwargs: Any
+) -> Any:
+    """Run a snapshot query and retain cache details for SQLite read failures."""
+    try:
+        return query(*args, **kwargs)
+    except sqlite3.Error as exc:
+        cfg = settings(ctx)
+        raise CacheAccessError(
+            "cache_invalid",
+            f"Could not query the copied library snapshot: {lib.sandbox.root}",
+            operation="query_snapshot_library",
+            path=lib.sandbox.root,
+            cache_dir=cfg.cache_dir,
+        ) from exc
 
 
 @command()
@@ -185,12 +235,57 @@ def sync(
     """
 
     cfg = settings(ctx)
+    if cfg.sandbox is not None:
+        raise GoodnotesError("sync uses --library as its source; omit the global --sandbox option.")
     emit(
         refresh_cache(
             library or default_library(), cfg.data_dir or default_data_dir(), force=force
         ),
         cfg,
     )
+
+
+@command()
+def watch(
+    ctx: typer.Context,
+    library: Annotated[Path | None, typer.Option(help="Goodnotes Library directory.")] = None,
+    interval: Annotated[
+        float, typer.Option(min=0.05, max=3600, help="Seconds between metadata checks.")
+    ] = 2,
+    debounce: Annotated[
+        float, typer.Option(min=0, max=60, help="Seconds to coalesce edits before capture.")
+    ] = 1,
+    iterations: Annotated[
+        int | None, typer.Option(min=1, help="Stop after this many polling iterations.")
+    ] = None,
+) -> None:
+    """Keep the copied library refreshed while this foreground process runs.
+
+    Emits one JSON object per ready, updated, recovery, or error event. Unchanged
+    checks stay quiet. Ctrl-C stops the watcher. This observes files on the Mac;
+    it cannot establish whether the latest iPad changes have reached this Mac.
+
+    Example: goodnotes watch --library /path/to/Library --interval 2
+    """
+    cfg = settings(ctx)
+    if cfg.sandbox is not None:
+        raise GoodnotesError(
+            "watch uses --library as its source; omit the global --sandbox option."
+        )
+    failed = False
+    for event in watch_library(
+        library or default_library(),
+        cfg.data_dir or default_data_dir(),
+        interval=interval,
+        debounce=debounce,
+        iterations=iterations,
+    ):
+        emit(event, cfg)
+        failed = event.get("event") == "error"
+    if failed:
+        # The error is already present in the JSONL stream. A bounded watcher
+        # must also let process supervisors detect an unrecovered failure.
+        raise SystemExit(1)
 
 
 @command()
@@ -226,7 +321,8 @@ def list_items(
     Example: goodnotes ls --folder "Course" --limit 20
     """
     with repository(ctx) as lib:
-        emit(window(lib.list_items(folder), limit, offset), settings(ctx))
+        items = repository_query(ctx, lib, lib.list_items, folder)
+        emit(window(items, limit, offset), settings(ctx))
 
 
 @command()
@@ -245,7 +341,8 @@ def tree(
     Example: goodnotes tree --folder "Course" --depth 2
     """
     with repository(ctx) as lib:
-        emit(window(lib.tree(folder, max_depth=depth), limit, offset), settings(ctx))
+        items = repository_query(ctx, lib, lib.tree, folder, max_depth=depth)
+        emit(window(items, limit, offset), settings(ctx))
 
 
 @command()
@@ -258,7 +355,7 @@ def info(ctx: typer.Context, notebook: ItemSelector) -> None:
     Example: goodnotes info "Course Notes"
     """
     with repository(ctx) as lib:
-        emit(lib.resolve(notebook), settings(ctx))
+        emit(repository_query(ctx, lib, lib.resolve, notebook), settings(ctx))
 
 
 @command()
@@ -281,10 +378,10 @@ def pages(
     Example: goodnotes pages "Course Notes" --limit 20
     """
     with repository(ctx) as lib:
-        result = window(lib.pages(notebook), limit, offset)
+        result = window(repository_query(ctx, lib, lib.pages, notebook), limit, offset)
         result["pages"] = result.pop("items")
         if with_recognition:
-            recognition = lib.recognition_status(notebook)
+            recognition = repository_query(ctx, lib, lib.recognition_status, notebook)
             result["pages"] = [
                 {**serializable(page), "recognition": serializable(recognition[page.id])}
                 for page in result["pages"]
@@ -315,11 +412,21 @@ def read_text(
     if source not in {"all", "pdf", "handwriting", "textbox"}:
         raise GoodnotesError("--source must be all, pdf, handwriting, or textbox.")
     with repository(ctx) as lib:
-        selected = select_pages(pages or str(page or 1), len(lib.pages(notebook)))
+        all_pages = repository_query(ctx, lib, lib.pages, notebook)
+        selected = select_pages(pages or str(page or 1), len(all_pages))
         results = []
         remaining = max_chars
         for number in selected:
-            data = serializable(lib.read_page(notebook, number, source=source, max_chars=remaining))
+            page_data = repository_query(
+                ctx,
+                lib,
+                lib.read_page,
+                notebook,
+                number,
+                source=source,
+                max_chars=remaining,
+            )
+            data = serializable(page_data)
             remaining -= sum(len(part["text"]) for part in data["parts"])
             results.append(data)
         truncated = bound_page_text(results, max_chars)
@@ -348,7 +455,10 @@ def search(
     selected_folder = _search_folder(folder, notebook)
     with repository(ctx) as lib:
         try:
-            hits = lib.search(
+            hits = repository_query(
+                ctx,
+                lib,
+                lib.search,
                 query,
                 folder=selected_folder,
                 notebook=notebook,
@@ -356,7 +466,14 @@ def search(
                 limit=offset + limit + 1,
             )
         except TextIndexUnavailableError as exc:
-            coverage = lib.search_coverage(folder=selected_folder, notebook=notebook, source=source)
+            coverage = repository_query(
+                ctx,
+                lib,
+                lib.search_coverage,
+                folder=selected_folder,
+                notebook=notebook,
+                source=source,
+            )
             warnings = coverage.pop("warnings", [])
             emit_error(
                 "operation_failed",
@@ -369,7 +486,14 @@ def search(
             )
             raise SystemExit(1) from None
         selected = snippet_hits(hits[offset : offset + limit], query)
-        coverage = lib.search_coverage(folder=selected_folder, notebook=notebook, source=source)
+        coverage = repository_query(
+            ctx,
+            lib,
+            lib.search_coverage,
+            folder=selected_folder,
+            notebook=notebook,
+            source=source,
+        )
         warnings = coverage.pop("warnings")
         emit(
             {
@@ -403,7 +527,10 @@ def scan_pdfs(
     """
     selected_folder = _search_folder(folder, notebook)
     with repository(ctx) as lib:
-        result = lib.scan_pdfs(
+        result = repository_query(
+            ctx,
+            lib,
+            lib.scan_pdfs,
             query,
             folder=selected_folder,
             notebook=notebook,
@@ -426,7 +553,7 @@ def export_notebook(
     ctx: typer.Context,
     notebook: ItemSelector,
     output: Annotated[Path, typer.Option(help="New PDF file to write.")],
-    layer: Annotated[str, typer.Option(help="background or annotated.")] = "background",
+    layer: Annotated[str, typer.Option(help="background, native, or annotated.")] = "background",
     pages: Annotated[
         str | None,
         typer.Option(help="Selected pages in listed order, e.g. 1-3,7. Defaults to all."),
@@ -441,7 +568,9 @@ def export_notebook(
     """
 
     with repository(ctx) as lib:
-        all_pages = lib.pages(notebook)
+        from .documents import export_pdf
+
+        all_pages = repository_query(ctx, lib, lib.pages, notebook)
         selected = (
             select_pages(pages, len(all_pages), maximum=len(all_pages))
             if pages is not None
@@ -457,26 +586,38 @@ def export_notebook(
 def render(
     ctx: typer.Context,
     notebook: ItemSelector,
-    output: Annotated[Path, typer.Option(help="New PNG file to write.")],
+    output: Annotated[
+        Path | None, typer.Option(help="Save a persistent PNG outside the cache.")
+    ] = None,
     page: Annotated[int, typer.Option(min=1)] = 1,
     layer: str = "background",
     dpi: Annotated[int, typer.Option(min=72, max=300)] = 150,
 ) -> None:
-    """Render one page to a new PNG for visual inspection.
+    """Render one page to a temporary cached PNG, or save it with --output.
 
-    --layer accepts background or annotated. Background omits native ink; annotated
-    requires attach-pdf. Page numbers start at 1. Existing outputs are never replaced.
+    --layer native reconstructs supported copied ink and reports coverage. Background
+    omits native ink; annotated requires attach-pdf. Page numbers start at 1.
+    Cached images expire after a day of inactivity and share a 100 MB limit.
+    Returned paths are protected for five minutes. Explicit outputs are never replaced.
 
     Example: goodnotes render "Course Notes" --page 3 --output /tmp/page-3.png
     """
 
     with repository(ctx) as lib:
-        all_pages = lib.pages(notebook)
+        from .documents import cached_render_pages, render_page
+
+        all_pages = repository_query(ctx, lib, lib.pages, notebook)
         number = select_pages(str(page), len(all_pages))[0]
-        emit(
-            render_page(lib.sandbox, all_pages[number - 1], output, layer=layer, dpi=dpi),
-            settings(ctx),
-        )
+        if output is None:
+            from .artifacts import ArtifactCache
+
+            with ArtifactCache(_artifact_directory(settings(ctx)), lib.sandbox.root) as cache:
+                result = cached_render_pages(
+                    lib.sandbox, [all_pages[number - 1]], cache, layer=layer, dpi=dpi
+                )[0]
+        else:
+            result = render_page(lib.sandbox, all_pages[number - 1], output, layer=layer, dpi=dpi)
+        emit(result, settings(ctx))
 
 
 @command("attach-pdf")
@@ -495,11 +636,12 @@ def attach_pdf(
     """
 
     with repository(ctx) as lib:
-        item = lib.resolve(notebook, kind="notebook")
+        from .documents import register_annotated_pdf
+
+        item = repository_query(ctx, lib, lib.resolve, notebook, kind="notebook")
+        page_count = len(repository_query(ctx, lib, lib.pages, notebook))
         emit(
-            register_annotated_pdf(
-                lib.sandbox, item.id, pdf, expected_pages=len(lib.pages(notebook))
-            ),
+            register_annotated_pdf(lib.sandbox, item.id, pdf, expected_pages=page_count),
             settings(ctx),
         )
 
@@ -508,55 +650,81 @@ def attach_pdf(
 def bundle(
     ctx: typer.Context,
     notebook: ItemSelector,
-    output: Annotated[Path, typer.Option(help="New output directory.")],
+    output: Annotated[
+        Path | None, typer.Option(help="Save a persistent bundle outside the cache.")
+    ] = None,
     pages: str = "1",
-    layer: str = "background",
+    layer: str = "native",
     dpi: Annotated[int, typer.Option(min=72, max=300)] = 150,
     max_chars: Annotated[int, typer.Option(min=1, max=1000000)] = 12000,
+    source: Annotated[str, typer.Option(help="pdf, all, handwriting, or textbox text.")] = "pdf",
 ) -> None:
-    """Save page images and source-labeled text.json in a new directory.
+    """Inspect pages using a temporary cached bundle, or save it with --output.
 
     Select up to 10 distinct pages with --pages, e.g. 1-3,7. One character budget
-    covers all text. --layer accepts background or annotated; annotated requires
-    attach-pdf. Text comes from read sources regardless of the image layer.
+    covers all text. Defaults to native ink images and PDF text. Native reconstruction
+    reports coverage; annotated requires attach-pdf. Text keeps its original source labels.
+    --source filters returned text only; the image still uses the selected layer.
+    Returns page evidence directly. Global --verbose includes full metadata.
+    Cached outputs share a 100 MB limit and expire after a day of inactivity.
+    Returned paths are protected for five minutes; explicit outputs remain until removed.
 
     Example: goodnotes bundle "Course Notes" --pages 1-3 --output /tmp/course-pages
     """
 
+    if source not in {"all", "pdf", "handwriting", "textbox"}:
+        raise GoodnotesError("--source must be all, pdf, handwriting, or textbox.")
     cfg = settings(ctx)
     with repository(ctx) as lib:
+        from .documents import render_pages
+
         sandbox = lib.sandbox
-        all_pages = lib.pages(notebook)
+        all_pages = repository_query(ctx, lib, lib.pages, notebook)
         selected = select_pages(pages, len(all_pages), maximum=10)
+        if output is None:
+            from .artifacts import ArtifactCache
+
+            try:
+                with ArtifactCache(_artifact_directory(cfg), sandbox.root) as cache:
+                    response = _cached_bundle(
+                        ctx,
+                        lib,
+                        notebook,
+                        all_pages,
+                        selected,
+                        cache,
+                        layer,
+                        dpi,
+                        max_chars,
+                        source,
+                    )
+            except NativeError as exc:
+                _bundle_native_remedy(exc)
+                raise
+            emit(response, cfg)
+            return
         destination = sandbox.ensure_output(output)
         parent_existed = destination.parent.exists()
         temporary: Path | None = None
         try:
             destination.parent.mkdir(parents=True, exist_ok=True)
             temporary = Path(tempfile.mkdtemp(prefix=".goodnotes-bundle-", dir=destination.parent))
-            manifest = []
-            remaining = max_chars
-            for number in selected:
-                filename = f"page-{number:04d}.png"
-                rendered = render_page(
-                    sandbox, all_pages[number - 1], temporary / filename, layer=layer, dpi=dpi
-                )
-                text = serializable(lib.read_page(notebook, number, max_chars=remaining))
-                remaining -= sum(len(part["text"]) for part in text["parts"])
-                manifest.append(
-                    {
-                        "page": number,
-                        "image": filename,
-                        "render": {**serializable(rendered), "path": str(destination / filename)},
-                        "text": text,
-                    }
-                )
-            truncated = bound_page_text([entry["text"] for entry in manifest], max_chars)
-            (temporary / "text.json").write_text(
-                json.dumps({"pages": manifest, "truncated": truncated}, ensure_ascii=False)
+            filenames = [f"page-{number:04d}.png" for number in selected]
+            rendered_pages = render_pages(
+                sandbox,
+                [all_pages[number - 1] for number in selected],
+                [temporary / filename for filename in filenames],
+                layer=layer,
+                dpi=dpi,
             )
+            manifest, truncated = _bundle_content(
+                ctx, lib, notebook, selected, rendered_pages, max_chars, source
+            )
+            for entry in manifest:
+                entry["render"]["path"] = str(destination / entry["image"])
+            _write_bundle_manifest(temporary, manifest, truncated, cfg, sandbox.captured_at, source)
             publish_bundle(temporary, destination)
-        except BaseException:
+        except BaseException as exc:
             if temporary is not None:
                 shutil.rmtree(temporary, ignore_errors=True)
             if not parent_existed:
@@ -564,17 +732,138 @@ def bundle(
                     destination.parent.rmdir()
                 except OSError:
                     pass
+            if isinstance(exc, NativeError):
+                _bundle_native_remedy(exc)
+            if isinstance(exc, OSError):
+                raise FilesystemAccessError.from_exception(
+                    exc, operation="write_bundle_output", path=destination, kind="output"
+                ) from exc
             raise
-        emit(
-            {
-                "directory": destination,
-                "manifest": destination / "text.json",
-                "pages": selected,
-                "layer": layer,
-                "truncated": truncated,
-            },
-            cfg,
+        emit(_bundle_response(destination, manifest, selected, layer, truncated, source), cfg)
+
+
+def _artifact_directory(cfg: Settings) -> Path:
+    return Path(cfg.cache_dir or cfg.data_dir or default_data_dir()).expanduser() / "artifacts"
+
+
+def _bundle_native_remedy(exc: NativeError) -> None:
+    exc.details["remedy"] = (
+        f"{exc.details['remedy']} For page backgrounds without annotations, "
+        "rerun bundle with --layer background."
+    )
+
+
+def _bundle_content(
+    ctx: typer.Context,
+    lib: Library,
+    notebook: str,
+    selected: list[int],
+    rendered_pages: list[dict[str, object]],
+    max_chars: int,
+    source: str,
+) -> tuple[list[_BundlePage], bool]:
+    manifest: list[_BundlePage] = []
+    remaining = max_chars
+    for number, rendered in zip(selected, rendered_pages, strict=True):
+        page_data = repository_query(
+            ctx, lib, lib.read_page, notebook, number, source=source, max_chars=remaining
         )
+        text = serializable(page_data)
+        remaining -= sum(len(part["text"]) for part in text["parts"])
+        manifest.append(
+            {
+                "page": number,
+                "image": f"page-{number:04d}.png",
+                "render": dict(rendered),
+                "text": text,
+            }
+        )
+    return manifest, bound_page_text([entry["text"] for entry in manifest], max_chars)
+
+
+def _write_bundle_manifest(
+    temporary: Path,
+    manifest: list[_BundlePage],
+    truncated: bool,
+    cfg: Settings,
+    captured_at: str | None,
+    source: str,
+) -> None:
+    content = {
+        "snapshot": cfg.snapshot_id,
+        "captured_at": captured_at,
+        "pages": manifest,
+        "truncated": truncated,
+        "text_source": source,
+    }
+    (temporary / "text.json").write_text(json.dumps(content, ensure_ascii=False))
+
+
+def _bundle_response(
+    destination: Path,
+    manifest: list[_BundlePage],
+    selected: list[int],
+    layer: str,
+    truncated: bool,
+    source: str,
+) -> dict[str, Any]:
+    return {
+        "directory": str(destination),
+        "manifest": str(destination / "text.json"),
+        "pages": selected,
+        "layer": layer,
+        "truncated": truncated,
+        "captured_at": next(iter(manifest))["render"].get("captured_at"),
+        "text_source": source,
+        "page_evidence": [
+            {**entry, "image": str(destination / entry["image"])} for entry in manifest
+        ],
+    }
+
+
+def _cached_bundle(
+    ctx: typer.Context,
+    lib: Library,
+    notebook: str,
+    all_pages: list[Page],
+    selected: list[int],
+    cache: ArtifactCache,
+    layer: str,
+    dpi: int,
+    max_chars: int,
+    source: str,
+) -> dict[str, Any]:
+    from .artifacts import artifact_key
+    from .documents import cached_render_pages
+
+    cfg = settings(ctx)
+    rendered = cached_render_pages(
+        lib.sandbox, [all_pages[number - 1] for number in selected], cache, layer=layer, dpi=dpi
+    )
+    # Text always comes from this request's pinned read view, including on image hits.
+    manifest, truncated = _bundle_content(ctx, lib, notebook, selected, rendered, max_chars, source)
+    key = artifact_key(
+        {
+            "bundle": 1,
+            "snapshot": cfg.snapshot_id,
+            "captured_at": lib.sandbox.captured_at,
+            "pages": manifest,
+            "source": source,
+        }
+    )
+    destination = cache.destination(key)
+    for entry in manifest:
+        entry["render"]["path"] = str(destination / entry["image"])
+    response = _bundle_response(destination, manifest, selected, layer, truncated, source)
+    response["temporary"] = True
+    if cache.lookup(key) is not None:
+        return response
+    with cache.staging() as temporary:
+        for entry, image in zip(manifest, rendered, strict=True):
+            os.link(Path(str(image["path"])), temporary / entry["image"], follow_symlinks=False)
+        _write_bundle_manifest(temporary, manifest, truncated, cfg, lib.sandbox.captured_at, source)
+        cache.publish(key, temporary, {"kind": "bundle"})
+    return response
 
 
 def publish_bundle(temporary: Path, destination: Path) -> None:
@@ -601,7 +890,22 @@ def publish_bundle(temporary: Path, destination: Path) -> None:
 
 
 @command()
-def doctor(ctx: typer.Context) -> None:
+def doctor(
+    ctx: typer.Context,
+    access_only: Annotated[
+        bool,
+        typer.Option(help="Check filesystem access without opening databases or writing files."),
+    ] = False,
+    library: Annotated[
+        Path | None, typer.Option(help="Optional source Library to check with --access-only.")
+    ] = None,
+    scratch_dir: Annotated[
+        Path | None, typer.Option(help="Native scratch directory to check with --access-only.")
+    ] = None,
+    output_dir: Annotated[
+        Path | None, typer.Option(help="Output directory to check with --access-only.")
+    ] = None,
+) -> None:
     """Report local library counts, missing metadata, and text-source warnings.
 
     storage contains cache_dir, snapshot_path, and captured_at; unknown values are null.
@@ -609,14 +913,34 @@ def doctor(ctx: typer.Context) -> None:
 
     Example: goodnotes doctor
     """
+    cfg = settings(ctx)
+    if access_only:
+        from .diagnostics import inspect_environment
+        from .native import runtime_status
+
+        result = inspect_environment(
+            cfg.data_dir or default_data_dir(),
+            library,
+            sandbox=cfg.sandbox,
+            scratch_dir=scratch_dir,
+            output_dir=output_dir,
+        )
+        result["native_runtime"] = runtime_status()
+        emit(result, cfg)
+        return
+    if any(value is not None for value in (library, scratch_dir, output_dir)):
+        raise GoodnotesError("--library, --scratch-dir, and --output-dir require --access-only.")
     with repository(ctx) as lib:
         cfg = settings(ctx)
-        result = lib.stats()
+        result = repository_query(ctx, lib, lib.stats)
         result["storage"] = {
             "cache_dir": cfg.cache_dir,
             "snapshot_path": lib.sandbox.root,
             "captured_at": lib.sandbox.captured_at,
         }
+        from .native import runtime_status
+
+        result["native_runtime"] = runtime_status()
         emit(result, cfg)
 
 
@@ -671,6 +995,7 @@ def schema(
             "page_numbers": "one-based",
             "commands": {
                 "sync": "[--library PATH --force]",
+                "watch": "[--library PATH --interval SECONDS --debounce SECONDS --iterations N]",
                 "snapshot": "LIBRARY DESTINATION",
                 "ls": "[--folder FOLDER --limit N --offset N]",
                 "tree": "[--folder FOLDER --depth N --limit N --offset N]",
@@ -688,11 +1013,16 @@ def schema(
                     "QUERY [--folder FOLDER | --notebook NOTEBOOK] "
                     "[--page-limit N --page-offset N --limit N]"
                 ),
-                "export": "NOTEBOOK --output FILE [--pages 1-3,7 --layer background|annotated]",
-                "render": "NOTEBOOK --output PNG [--page N --layer LAYER --dpi N]",
-                "bundle": "NOTEBOOK --output DIR [--pages 1-3 --layer LAYER --dpi N --max-chars N]",
+                "export": (
+                    "NOTEBOOK --output FILE [--pages 1-3,7 --layer background|native|annotated]"
+                ),
+                "render": "NOTEBOOK [--output PNG --page N --layer LAYER --dpi N]",
+                "bundle": (
+                    "NOTEBOOK [--output DIR --pages 1-3 --layer LAYER --dpi N "
+                    "--max-chars N --source SOURCE]"
+                ),
                 "attach-pdf": "NOTEBOOK PDF",
-                "doctor": "",
+                "doctor": "[--access-only --library PATH --scratch-dir PATH --output-dir PATH]",
                 "schema": "[COMMAND]",
             },
             "limits": {
@@ -709,6 +1039,7 @@ def schema(
             ),
             "global_options": [
                 "--fields FIELDS",
+                "--verbose",
                 "--data-dir PATH",
                 "--sandbox PATH",
                 "--json",
@@ -722,11 +1053,20 @@ def schema(
                 "schema COMMAND includes output field hints for row-based responses.",
                 "Notebook selectors accept an exact UUID, full path, or unique exact name.",
                 "Follow next_offset or next_page_offset; pin snapshot with --expect-snapshot.",
+                "For recent edits, sync once per request and pin its snapshot_id across reads.",
                 "Check source labels, coverage, warnings, and truncated when interpreting results.",
                 "--text indents JSON; --fields selects row fields or top-level keys.",
+                "Output keeps essential evidence by default; --verbose includes full metadata.",
+                "--fields selects from full rows or responses, overriding concise defaults.",
+                "bundle returns page evidence with native images and PDF text by default.",
                 "Source files are read-only; some commands write local copies or exports.",
             ],
-            "annotations": "Native ink rendering unavailable. Annotated layers require attach-pdf.",
+            "annotations": (
+                "--layer native reconstructs supported copied pen/highlighter records with "
+                "coverage diagnostics. It requires a compatible RocksDB runtime and writable "
+                "scratch storage. Full visual fidelity is unverified. --layer annotated uses "
+                "a PDF registered with attach-pdf."
+            ),
             "exit_codes": {
                 "0": "success",
                 "1": "operation failed",
@@ -763,12 +1103,18 @@ def parameter_contract(parameter: Any) -> dict[str, Any]:
 def main() -> None:
 
     try:
-        app(standalone_mode=False)
+        exit_code = app(standalone_mode=False)
+        if isinstance(exit_code, int):
+            raise SystemExit(exit_code)
     except typer.TyperException as exc:
         emit_error("invalid_arguments", exc.format_message())
         raise SystemExit(2) from None
     except GoodnotesError as exc:
-        emit_error(getattr(exc, "code", "operation_failed"), str(exc))
+        emit_error(
+            getattr(exc, "code", "operation_failed"),
+            str(exc),
+            details=getattr(exc, "details", None),
+        )
         raise SystemExit(1) from None
     except (BrokenPipeError, KeyboardInterrupt):
         raise SystemExit(130) from None

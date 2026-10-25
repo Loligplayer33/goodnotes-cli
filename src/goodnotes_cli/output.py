@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import dataclass, is_dataclass
 from dataclasses import fields as dataclass_fields
 from pathlib import Path
 from typing import Any
@@ -30,6 +30,7 @@ class _ProjectionSpec:
     row_key: str | None = None
     optional_fields: tuple[str, ...] = ()
     conditional_fields: tuple[tuple[str, str], ...] = ()
+    field_variants: tuple[tuple[str, tuple[str, ...]], ...] = ()
     example: str | None = None
 
 
@@ -75,7 +76,22 @@ _PROJECTIONS: dict[str, _ProjectionSpec] = {
     ),
     "sync": _ProjectionSpec(
         ("status", "snapshot", "snapshot_id", "checked_at", "source_changed_during_refresh"),
-        optional_fields=("captured_at", "warnings"),
+        optional_fields=("captured_at", "warnings", "capture_stats"),
+    ),
+    "watch": _ProjectionSpec(
+        ("event", "iteration"),
+        optional_fields=(
+            "status",
+            "snapshot",
+            "snapshot_id",
+            "checked_at",
+            "captured_at",
+            "source_changed_during_refresh",
+            "warnings",
+            "capture_stats",
+            "error",
+            "retry_in_seconds",
+        ),
     ),
     "snapshot": _ProjectionSpec(("snapshot", "status")),
     "export": _ProjectionSpec(
@@ -90,7 +106,8 @@ _PROJECTIONS: dict[str, _ProjectionSpec] = {
             "annotation_status",
             "warnings",
             "snapshot",
-        )
+        ),
+        optional_fields=("native_annotations", "captured_at"),
     ),
     "render": _ProjectionSpec(
         (
@@ -105,13 +122,89 @@ _PROJECTIONS: dict[str, _ProjectionSpec] = {
             "annotation_status",
             "warnings",
             "snapshot",
-        )
+        ),
+        optional_fields=("native_annotations", "captured_at", "temporary"),
     ),
     "attach-pdf": _ProjectionSpec(
         ("document_id", "path", "pages", "registered", "warnings", "snapshot")
     ),
-    "bundle": _ProjectionSpec(("directory", "manifest", "pages", "layer", "truncated", "snapshot")),
+    "bundle": _ProjectionSpec(
+        (
+            "directory",
+            "manifest",
+            "pages",
+            "layer",
+            "text_source",
+            "page_evidence",
+            "truncated",
+            "snapshot",
+        ),
+        optional_fields=("captured_at", "temporary"),
+    ),
+    "doctor": _ProjectionSpec(
+        (
+            "active_folders",
+            "active_notebooks",
+            "active_pages",
+            "deleted_folders",
+            "deleted_notebooks",
+            "visible_folders",
+            "visible_notebooks",
+            "orphaned_items",
+            "broken_links",
+            "deleted_link_rows",
+            "links_to_deleted_items",
+            "duplicate_parent_items",
+            "cycle_folders",
+            "pages_without_index_metadata",
+            "index_metadata_without_active_pages",
+            "search_index_available",
+            "search_content_tables",
+            "warnings",
+            "storage",
+            "native_runtime",
+        ),
+        field_variants=(
+            (
+                "access_only",
+                (
+                    "scope",
+                    "cache_dir",
+                    "sandbox",
+                    "library",
+                    "scratch_dir",
+                    "output_dir",
+                    "artifact_dir",
+                    "status",
+                    "checks",
+                    "errors",
+                    "warnings",
+                    "native_runtime",
+                ),
+            ),
+        ),
+        example="goodnotes --fields active_pages,warnings doctor",
+    ),
 }
+
+_BRIEF_COMMANDS = frozenset(
+    {"sync", "watch", "ls", "tree", "info", "pages", "read", "render", "export", "bundle"}
+)
+_BRIEF_ITEM_FIELDS = ("id", "name", "kind", "path", "page_count")
+_BRIEF_NATIVE_FIELDS = (
+    "page",
+    "page_id",
+    "coverage",
+    "full_fidelity_verified",
+    "page_mapping",
+    "native_objects",
+    "rendered_objects",
+    "rendered_strokes",
+    "erased_objects",
+    "deleted_objects",
+    "unsupported_objects",
+    "unsupported_reasons",
+)
 
 
 def output_contract(command_name: str) -> dict[str, Any] | None:
@@ -125,8 +218,33 @@ def output_contract(command_name: str) -> dict[str, Any] | None:
             result["optional_fields"] = {
                 field: "May be absent from a successful response." for field in spec.optional_fields
             }
+        result.setdefault("optional_fields", {}).update(
+            {
+                field: f"Requires --{option.replace('_', '-')}"
+                for field, option in spec.conditional_fields
+            }
+        )
+        for option, variant_fields in spec.field_variants:
+            result.setdefault("optional_fields", {}).update(
+                {
+                    field: f"Requires --{option.replace('_', '-')}"
+                    for field in variant_fields
+                    if field not in spec.fields
+                }
+            )
+        if not result["optional_fields"]:
+            del result["optional_fields"]
         if spec.example is not None:
             result["example"] = spec.example
+        if spec.field_variants:
+            result["variants"] = {
+                "default": {"fields": list(spec.fields)},
+                **{
+                    option: {"fields": list(variant_fields)}
+                    for option, variant_fields in spec.field_variants
+                },
+            }
+        _describe_default(result, command_name)
         return result
 
     row_result: dict[str, Any] = {
@@ -141,7 +259,87 @@ def output_contract(command_name: str) -> dict[str, Any] | None:
         }
     if spec.example is not None:
         row_result["example"] = spec.example
+    _describe_default(row_result, command_name)
     return row_result
+
+
+def _describe_default(contract: dict[str, Any], command_name: str) -> None:
+    if command_name not in _BRIEF_COMMANDS:
+        return
+    profile: dict[str, Any] = {
+        "mode": "concise",
+        "full_metadata_option": "--verbose",
+        "field_selection": "--fields selects from the full contract and overrides concise output.",
+    }
+    if command_name in {"sync", "watch"}:
+        profile["omitted_fields"] = ["snapshot", "capture_stats"]
+        profile["metadata"] = "All other fields, including warnings and errors, are retained."
+    elif command_name in {"ls", "tree", "info"}:
+        profile["projection"] = "response" if command_name == "info" else "items[]"
+        profile["fields"] = list(_BRIEF_ITEM_FIELDS)
+        if command_name == "info":
+            profile["optional_metadata"] = ["snapshot", "warnings", "captured_at"]
+        else:
+            profile["metadata"] = "Sibling metadata is retained."
+    elif command_name in {"pages", "read"}:
+        profile["projection"] = "pages[]"
+        profile["fields"] = (
+            ["id", "number", "annotation_count", "recognition"]
+            if command_name == "pages"
+            else ["page_id", "page", "parts", "warnings", "truncated"]
+        )
+        profile["shared_metadata"] = {
+            "document_id": "Moved to the response when all rows share it; otherwise kept per row."
+        }
+        profile["metadata"] = "Sibling metadata and complete text-part source labels are retained."
+        if command_name == "pages":
+            profile["optional_fields"] = {"recognition": "Requires --with-recognition"}
+    elif command_name in {"render", "export"}:
+        profile["omitted_fields"] = ["dpi"]
+        profile["native_annotations"] = {
+            "shape": "object" if command_name == "render" else "array",
+            "fields": list(_BRIEF_NATIVE_FIELDS),
+            "warnings": (
+                "All distinct warnings are retained at response level. "
+                "Export also keeps warnings per native page."
+            ),
+        }
+        profile["metadata"] = "All other response fields are retained."
+    elif command_name == "bundle":
+        profile["omitted_fields"] = ["directory"]
+        profile["page_evidence"] = {
+            "projection": "page_evidence[]",
+            "fields": [
+                "page",
+                "page_id",
+                "image",
+                "image_source",
+                "annotation_status",
+                "includes_handwriting",
+                "native_annotations",
+                "parts",
+                "truncated",
+                "warnings",
+            ],
+            "native_annotations": {
+                "fields": [
+                    field for field in _BRIEF_NATIVE_FIELDS if field not in {"page", "page_id"}
+                ],
+                "availability": "Present only for native rendering.",
+            },
+            "shared_metadata": {
+                "document_id": (
+                    "Moved to the response when all pages share it; otherwise kept per page."
+                )
+            },
+            "image": "Absolute path to the published PNG.",
+            "parts": "Unchanged source-labelled text parts.",
+            "warnings": "All distinct render, native, and text warnings retained once per page.",
+        }
+        profile["metadata"] = (
+            "Other response fields are retained. Full diagnostics remain in the saved text.json."
+        )
+    contract["default_output"] = profile
 
 
 def validate_projection(raw_fields: str | None, projection: Projection) -> list[str] | None:
@@ -151,7 +349,12 @@ def validate_projection(raw_fields: str | None, projection: Projection) -> list[
         return None
     spec = _PROJECTIONS.get(projection.command_name)
     if spec is not None:
-        available = set(spec.fields) | set(spec.optional_fields)
+        variants = dict(spec.field_variants)
+        selected_variant = next(
+            (variants[option] for option in projection.enabled_options if option in variants),
+            spec.fields,
+        )
+        available = set(selected_variant) | set(spec.optional_fields)
         available.update(
             field
             for field, option in spec.conditional_fields
@@ -178,7 +381,10 @@ def _unknown_fields(fields: list[str], available: Iterable[str], level: str) -> 
 
 def serializable(value: Any) -> Any:
     if is_dataclass(value) and not isinstance(value, type):
-        return serializable(asdict(value))
+        return {
+            field.name: serializable(getattr(value, field.name))
+            for field in dataclass_fields(value)
+        }
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, dict):
@@ -186,6 +392,109 @@ def serializable(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [serializable(item) for item in value]
     return value
+
+
+def _pick(value: dict[str, Any], fields: Iterable[str]) -> dict[str, Any]:
+    """Keep present fields, including explicit unknown/null values."""
+    return {field: value[field] for field in fields if field in value}
+
+
+def _warnings(*values: Any) -> list[Any]:
+    result: list[Any] = []
+    for value in values:
+        if isinstance(value, list):
+            for warning in value:
+                if warning not in result:
+                    result.append(warning)
+    return result
+
+
+def _hoist_document(rows: list[dict[str, Any]], result: dict[str, Any]) -> None:
+    if not rows or any("document_id" not in row for row in rows):
+        return
+    document_id = rows[0]["document_id"]
+    if all(row["document_id"] == document_id for row in rows):
+        result["document_id"] = document_id
+        for row in rows:
+            del row["document_id"]
+
+
+def _brief_render(value: dict[str, Any]) -> dict[str, Any]:
+    result = {key: item for key, item in value.items() if key != "dpi"}
+    native = value.get("native_annotations")
+    if isinstance(native, dict):
+        result["native_annotations"] = _pick(native, _BRIEF_NATIVE_FIELDS)
+        result["warnings"] = _warnings(value.get("warnings"), native.get("warnings"))
+    elif isinstance(native, list):
+        # Export warnings remain attached to each page as well as the overall result.
+        result["native_annotations"] = [
+            {**_pick(entry, _BRIEF_NATIVE_FIELDS), "warnings": _warnings(entry.get("warnings"))}
+            if isinstance(entry, dict)
+            else entry
+            for entry in native
+        ]
+        result["warnings"] = _warnings(
+            value.get("warnings"),
+            *[entry.get("warnings") for entry in native if isinstance(entry, dict)],
+        )
+    return result
+
+
+def _brief_evidence(entry: dict[str, Any]) -> dict[str, Any]:
+    render = entry["render"]
+    text = entry["text"]
+    result = {
+        "page": entry["page"],
+        **_pick(text, ("document_id", "page_id", "parts", "truncated")),
+        "image": entry["image"],
+        **{
+            ("image_source" if key == "source" else key): value
+            for key, value in _pick(
+                render, ("source", "annotation_status", "includes_handwriting")
+            ).items()
+        },
+    }
+    native = render.get("native_annotations")
+    if isinstance(native, dict):
+        result["native_annotations"] = _pick(
+            native, (field for field in _BRIEF_NATIVE_FIELDS if field not in {"page", "page_id"})
+        )
+    result["warnings"] = _warnings(
+        render.get("warnings"),
+        native.get("warnings") if isinstance(native, dict) else None,
+        text.get("warnings"),
+    )
+    return result
+
+
+def brief_result(value: dict[str, Any], command_name: str) -> dict[str, Any]:
+    """Apply the concise profile without changing unknown command responses."""
+    if command_name not in _BRIEF_COMMANDS:
+        return value
+    result = dict(value)
+    if command_name in {"sync", "watch"}:
+        for field in ("snapshot", "capture_stats"):
+            result.pop(field, None)
+    elif command_name in {"ls", "tree"}:
+        result["items"] = [_pick(row, _BRIEF_ITEM_FIELDS) for row in value["items"]]
+    elif command_name == "info":
+        result = _pick(value, (*_BRIEF_ITEM_FIELDS, "snapshot", "warnings", "captured_at"))
+    elif command_name in {"pages", "read"}:
+        fields = (
+            ("id", "document_id", "number", "annotation_count", "recognition")
+            if command_name == "pages"
+            else ("document_id", "page_id", "page", "parts", "warnings", "truncated")
+        )
+        result["pages"] = [_pick(row, fields) for row in value["pages"]]
+        _hoist_document(result["pages"], result)
+    elif command_name in {"render", "export"}:
+        result = _brief_render(value)
+    elif command_name == "bundle":
+        result.pop("directory", None)
+        if "page_evidence" in value:
+            result["page_evidence"] = [_brief_evidence(row) for row in value["page_evidence"]]
+            _hoist_document(result["page_evidence"], result)
+    return result
 
 
 def emit(value: Any, settings: Settings) -> None:
@@ -219,6 +528,8 @@ def emit(value: Any, settings: Settings) -> None:
                 result = {field: result[field] for field in fields if field in result}
     if settings.snapshot_id is not None and isinstance(result, dict):
         result["snapshot"] = settings.snapshot_id
+    if settings.brief and fields is None and projection is not None and isinstance(result, dict):
+        result = brief_result(result, projection.command_name)
     typer.echo(
         json.dumps(
             result,
@@ -278,9 +589,19 @@ def bound_page_text(pages: list[dict[str, Any]], max_chars: int) -> bool:
 
 def snippet_hits(hits: Any, query: str) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = serializable(hits)
+    folded_query = query.casefold()
     for hit in rows:
         original = hit["text"]
-        start = max(0, original.casefold().find(query.casefold()) - 100)
+        folded_offset = original.casefold().find(folded_query)
+        start = 0
+        if folded_offset > 0:
+            folded_position = 0
+            for original_position, character in enumerate(original):
+                folded_length = len(character.casefold())
+                if folded_position <= folded_offset < folded_position + folded_length:
+                    start = max(0, original_position - 100)
+                    break
+                folded_position += folded_length
         hit["text"] = original[start : start + 320]
         hit["snippet"] = start > 0 or start + 320 < len(original)
     return rows

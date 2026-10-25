@@ -8,10 +8,11 @@ Live library discovery is for macOS. On Linux, point `sync --library` at an avai
 
 | Task | Support | Limit |
 | --- | --- | --- |
-| Browse notebooks and pages | Yes | Reads the last synced copy. Run `sync` again after Goodnotes changes the library. |
-| Search and read text | Yes | `search` checks the stored text index. `read` returns PDF text, stored handwriting recognition candidates, and typed text. Use `scan-pdfs` explicitly for copied PDF backgrounds. The CLI does not OCR images or reconstruct ink. |
+| Browse notebooks and pages | Yes | Reads the last synced copy. Run `watch` to refresh it automatically as files change on the Mac. |
+| Search and read text | Yes | `search` checks the stored text index. `read` returns PDF text, stored handwriting recognition candidates, and typed text. Use `scan-pdfs` explicitly for copied PDF backgrounds. The CLI does not OCR images. |
 | View and export page backgrounds | Yes | Uses each page's PDF or image background. Native Goodnotes ink is not included. |
-| View and export annotations | With a supplied PDF | You must export and register a PDF from Goodnotes. The CLI cannot verify that it includes annotations or that its page order matches. |
+| View and export native ink | Experimental | `--layer native` reconstructs supported pen and highlight objects from the copied native store. Check its coverage and warnings; complete Goodnotes rendering is not established. Requires a compatible RocksDB runtime. |
+| Use a Goodnotes-exported PDF | Yes | Register it with `attach-pdf` for `--layer annotated`. The CLI cannot verify annotation inclusion or page order. |
 | Edit Goodnotes notebooks | No | The CLI does not write to the Goodnotes library. |
 
 ## Commands
@@ -21,6 +22,7 @@ The complete option reference is in [Command reference](docs/commands.md). Each 
 | Group | Command | Purpose |
 | --- | --- | --- |
 | Setup | [`sync`](docs/commands.md#sync) | Create or refresh the managed copy. |
+| Setup | [`watch`](docs/commands.md#watch) | Keep the managed copy refreshed while the process runs. |
 | Setup | [`snapshot`](docs/commands.md#snapshot) | Save a separate copy of a Library folder. |
 | Setup | [`doctor`](docs/commands.md#doctor) | Check the current copy and available text sources. |
 | Setup | [`schema`](docs/commands.md#schema) | Print the machine-readable command contract without loading notes. |
@@ -74,9 +76,21 @@ You need macOS or Linux, Python 3.11 or newer, and [`uv`](https://docs.astral.sh
 
 After sync, browse and read commands need only read access to the cache. An agent can use that copy without access to the live Goodnotes library. `doctor` reports its location and capture time. See [restricted agent setup](docs/usage.md#read-access-for-an-agent) for permissions and custom cache locations.
 
+For recent notes, have the agent sync once at the start of each request. Once [native rendering is set up](docs/pdf-and-handwriting.md#native-ink-without-manual-pdf-exports), one bundle provides actual pen annotations and slide text:
+
+```sh
+uv run goodnotes bundle "Notebook name" --pages 3
+```
+
+`render` and `bundle` use a temporary artifact cache by default. Repeated requests reuse matching page renders; identical PNGs share storage. The cache retains up to 100 MB and expires entries after one day since their last CLI request. Cleanup runs on the next artifact operation and protects returned paths for five minutes. Add `--output` to save a persistent image or bundle instead. Explicitly saved files are never automatically removed.
+
+`uv run goodnotes watch` is optional for continuous refresh or for an agent with cache-only access. Both routes observe files already present on this Mac and cannot tell whether an iPad edit has arrived. Refreshes reuse verified unchanged files, and the managed cache retains one published generation after readers finish. Native rendering also needs writable temporary scratch. Managed visual requests need write access to the artifact directory; a reader with a read-only cache can provide `--output` in a writable location.
+
+Bundle holds one read view throughout. If later commands must match it, pin its returned `snapshot` with global `--expect-snapshot ID`.
+
 ## Working with results
 
-Commands return compact JSON by default. Put `--text` before the command to indent the JSON. Public page numbers start at 1. Search stays in the stored index; use `scan-pdfs` as a separate PDF-background check when needed.
+Commands return concise compact JSON, retaining warnings and interpretation limits. Global `--verbose` includes full metadata. `bundle` defaults to native annotated images and PDF text, returning page evidence directly while keeping full render diagnostics in its manifest. Use `--source all` for every stored text source, or `--layer background` for clean page images. Put `--text` before the command to indent JSON. Public page numbers start at 1. Search stays in the stored index; use `scan-pdfs` separately when needed.
 
 Common tasks:
 

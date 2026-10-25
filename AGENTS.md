@@ -6,7 +6,7 @@ Keep changes within the existing package boundaries. Use the code, configuration
 
 - Use generated fixtures for tests and examples. Manual checks may use only a pre-existing private copy outside the repository. Keep notebook names, IDs, paths, email addresses, and note text out of tracked files, logs, and generated repository output.
 - Never run the default `sync` against a live Goodnotes Library during development. A production capture requires an explicit user request and the file-copy-only workflow in [Architecture](docs/architecture.md). Do not control Goodnotes or open a source SQLite database.
-- Treat the source Library, source databases, and completed snapshots as immutable. SQLite reads must target a validated copy in read-only mode.
+- Treat the source Library, source databases, and completed snapshots as immutable. Readers open validated copies in read-only mode. During capture, SQLite may write only to independently copied, unpublished staging files to consolidate their sidecars; see [Architecture](docs/architecture.md).
 - Use the project virtual environment with `uv run`; never install project dependencies globally.
 
 ## Contracts and reviews

@@ -1,37 +1,49 @@
 # Agent guide
 
-Run `uv run goodnotes` from the repository root. Start with `uv run goodnotes schema [COMMAND]` for the machine-readable contract or `uv run goodnotes COMMAND --help` for readable options. Put global options such as `--sandbox`, `--fields`, and `--expect-snapshot` before the command. See the [command reference](commands.md) for every option and bound.
+Use the installed `goodnotes` executable, or `uv run goodnotes` from the repository. Global options go before the command. Consult `schema COMMAND` or `COMMAND --help` for unfamiliar options; skip discovery calls when the notebook path and page are known.
 
-## Read an initialized cache
+## Inspect a recent page
 
-Setup runs `sync` with read access to the source and write access to the cache. Browsing, searching, and reading then need only cache read access, including the existing `.view.lock`. Use the installed `goodnotes` executable directly if your runner cannot update the project environment. Keep the same `--data-dir` or `GOODNOTES_DATA_DIR` selection as setup. `doctor.storage` gives the resolved cache directory, snapshot path, and capture time. Cache permission failures return `cache_permission_denied`; missing setup or lock files return `cache_not_initialized`; malformed cache state returns `cache_invalid`. Follow `error.details` for the path, operation, and remedy. Do not bypass locking, create replacement locks, or silently choose another cache. A missing-lock repair requires stopping other CLI processes before a process with write access runs `sync`.
+1. Refresh once at the start of the request, using the configured source and cache:
 
-## Find pages and stored recognition text
+   ```sh
+   goodnotes --data-dir /path/to/cli-cache sync --library /path/to/Library
+   ```
 
-Use `info`, `ls`, or `tree` to find a notebook. Use `pages` for its current one-based page numbers. Select notebooks by exact UUID, full path, or unique exact name; use the full path or UUID when a name is ambiguous.
+2. Request the page evidence:
 
-`pages --with-recognition` adds per-page metadata without returning candidate text. `recognition.availability` distinguishes `stored-text`, `no-stored-text`, and `unavailable`; `recognition.index_state` distinguishes `pending`, `not-pending`, and `unknown`. Counts describe stored recognition rows and characters, not ink strokes or transcription accuracy. The page `annotation_count` comes from `projection.notes_items`; it is not an ink-stroke or recognition count.
+   ```sh
+   goodnotes --data-dir /path/to/cli-cache bundle "Course/Lectures/Notebook name" --pages 3
+   ```
 
-Read candidate text with `read --source handwriting`. Preserve the source label, raw delimiters, and warnings. Quote only exact raw substrings; label edited wording as an interpretation rather than a verbatim quote or visual transcription. A pending-index warning can appear even when no stored candidate text is returned. `not-pending` does not verify recognition accuracy or freshness. `pdf` text may come from the index or a mapped PDF background in the copy. `textbox` is typed text stored on the page.
+3. Read the inline source-labeled text and coverage, then open the absolute `image` path in `page_evidence`. No separate manifest-read call is needed. The full diagnostic manifest is at `manifest` for investigation.
 
-## Search and check coverage
+Without `--output`, renders and bundles return `temporary: true`. Matching requests reuse page images, and bundle text always comes from the current pinned read view. The separate `artifacts/` directory under the selected data directory is capped at 100,000,000 logical bytes, counting shared PNGs only once. Entries expire after one day since their last CLI use; cleanup happens on the next artifact operation. Returned paths are protected for five minutes, then may be evicted for capacity before the day ends. Open them promptly. If a path has expired, repeat the command; this produces evidence for the currently selected view, not a historical version. Add `--output` only when a persistent copy is needed. Explicit outputs remain caller-owned and require a new destination each time.
 
-Use `search --notebook NOTEBOOK` for one notebook or `search --folder FOLDER` for a subtree. These options are mutually exclusive. If both are omitted, the scope is `/`. Search checks stored text-index rows only. Read `coverage_detail`, `warnings`, and source labels before interpreting an empty result. The reported counts and page-metadata diagnostics describe stored rows in the resolved scope; they do not prove that every page was indexed. Completeness remains `unknown`, including when metadata appears complete. `next_steps` suggests follow-up commands; search does not start a PDF scan automatically.
+Bundle defaults to PDF text plus a native annotated image, and returns the evidence directly. This avoids redundant OCR candidates. Use `--source all` for all stored text sources, including recognition and typed text. The source filter affects text only. `--layer background` explicitly requests a clean page without native ink; missing native support never causes a silent fallback.
 
-When a result may be in a copied PDF background, run `scan-pdfs` separately with the same notebook or folder scope. It does not search handwriting, the stored index, or a PDF registered with `attach-pdf`. `next_page_offset` counts scanned pages, not hits. Continue with the same query, scope, and snapshot. `scan_complete` means the scoped page sequence is exhausted. `coverage_complete` is true only when the current scan starts at offset 0, reaches the end, and has no extraction gaps. Check `stop_reason` and warnings for a hit limit, page limit, missing background, missing PDF mapping, unreadable PDF text, or truncated extraction. Even complete PDF-background coverage says nothing about handwriting.
+A known path and page can go directly to `read`, `render`, or `bundle`; skip `info` and `pages`. If the location is unknown, use `ls --folder FOLDER --limit 20` in the smallest known folder and follow pagination. Selectors accept an exact UUID, full library path, or unique exact name. Ambiguous names require a full path or UUID.
 
-## Keep results comparable
+One bundle holds a single read view, so this workflow needs no snapshot-ID argument. For additional reads or pagination that must match, pass the returned `snapshot` before later commands as `--expect-snapshot ID`. On `stale_snapshot`, restart the sequence. Do not sync again between matching reads. Document and page UUIDs come from Goodnotes and remain stable across ordinary CLI refreshes. A changed capture gets a new snapshot generation ID; unchanged sync keeps it. Reuse known notebook selectors across requests.
 
-For a paginated sequence, read the `snapshot` ID from its cache-backed result and pass it before every later command as `--expect-snapshot ID`. Follow `next_offset` with `--offset`, or `next_page_offset` with `--page-offset` for `scan-pdfs`. If the CLI returns `stale_snapshot`, restart the sequence against the new view. Do not combine results from different snapshot IDs. The `snapshot` value from `sync` or the standalone `snapshot` command is a path; use `snapshot_id` from `sync` or a generation ID from a cache-backed read result.
+Sync observes files already on the Mac. It cannot confirm that a particular iPad edit has arrived. `captured_at` alone does not prove the expected note is present; compare the image with that edit. If refresh fails, report the failure instead of presenting an old copy as current.
 
-## Project fields and interpret output
+## Interpret page evidence
 
-Use `uv run goodnotes schema COMMAND` to discover row projections and valid fields. Row-based command schemas include an output projection and a `--fields` example. For example, `uv run goodnotes --fields number,recognition pages "Notebook name" --with-recognition` keeps page numbers and recognition metadata. Add `--with-recognition` whenever selecting `recognition`. For search hits, `--fields path,page,source,text` keeps the source label with the text. Field projection retains surrounding response metadata, including warnings, pagination, and `snapshot`; use keys valid for the selected row level.
+Use the image as the visual source for handwriting. Native reconstruction is approximate. Preserve `annotation_status`, `image_source`, native coverage, `full_fidelity_verified`, object counts, unsupported reasons, and warnings when assessing the notes. `includes_handwriting: true` means supported strokes rendered; it does not establish completeness. Missing native data means unknown availability. Never substitute a clean background and describe it as the complete notes. Standalone `render` and `export` retain their background defaults; use `--layer native` with those commands for ink.
 
-Successful data responses are compact JSON by default. `--text` only indents it. Expected runtime errors are JSON on stderr with exit code `1`; invalid command syntax and parser-checked bounds exit `2`. Page-expression and other application-checked errors are runtime errors. An interrupt or broken pipe exits `130`. Read stderr instead of treating empty stdout as a result.
+Text parts retain `source`, engine, priority, and truncation. `handwriting` is stored recognition output with raw candidate delimiters, not a visual transcription. Quote only exact raw substrings; label cleaned wording as interpretation. `pdf` text can come from the stored index or a copied background. `textbox` is stored typed text. See [PDFs and handwriting](pdf-and-handwriting.md) for source and layer limits.
 
-## Use exports carefully
+## Keep output small
 
-`export --pages EXPR` selects distinct one-based pages in the listed order; omitting it exports all pages. It has no 20-page cap. `render`, `export`, and `bundle` require new destinations outside the snapshot and production Goodnotes locations. The default `background` layer does not overlay native ink. An `annotated` layer requires a user-supplied PDF registered with `attach-pdf`; the CLI checks the file and page count but cannot verify annotation inclusion or page order. Preserve `annotation_status: "user-provided-unverified"` and warnings with any conclusion.
+Routine responses are concise by default. They retain interpretation limits, pagination, and truncation. Use global `--verbose` when you need full metadata; bundle manifests always retain full render diagnostics. Errors are complete. `schema COMMAND` describes both response shapes.
 
-For source and annotation details, see [PDFs and handwriting](pdf-and-handwriting.md). For development and checks, see [Contributing](../CONTRIBUTING.md).
+Use `--max-chars` to bound read/bundle text for the question. Inspect `truncated` before concluding that text is absent. Concise output does not reduce source text or image size. Request only the needed pages. For custom selection, `--fields` projects the full field contract instead of the concise profile; row projection retains sibling warnings, pagination, and snapshot metadata.
+
+## Follow the relevant branch
+
+- **Search.** `search` covers stored index rows; `scan-pdfs` separately covers copied PDF backgrounds. Neither establishes handwriting completeness. Check coverage and warnings before interpreting no hits. Follow `next_offset` or `next_page_offset` with the same scope, query, and snapshot. See [search commands](commands.md#search).
+- **Recognition metadata.** `pages --with-recognition` reports stored-text availability and pending/unknown index state. `annotation_count` counts projected note items, not ink or OCR. See [pages](commands.md#pages).
+- **Cache access or refresh failures.** Setup/sync needs source read and cache write access. Metadata and text readers need only cache read access, including the existing `.view.lock`; native rendering also needs writable scratch. Default visual commands need writable artifact storage. With a read-only cache, use `--output` in a writable directory. Read `error.details` for the path, operation, and remedy. Do not bypass locks or silently select another cache. `doctor --access-only` checks permissions without writes or engines and includes an optional artifact-storage write hint. See [restricted agent setup](usage.md#read-access-for-an-agent).
+- **Continuous refresh.** `watch` is an optional foreground refresher for the selected cache, useful for cache-only readers. It observes Mac files, and readers still pin each request's generation. See [watch](commands.md#watch).
+- **Other output or errors.** Commands use compact JSON; `--text` indents it. Runtime errors go to stderr with exit 1, invalid syntax exits 2, interruption exits 130. Read stderr when stdout is empty. See [command reference](commands.md).

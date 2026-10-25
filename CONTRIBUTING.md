@@ -27,8 +27,10 @@ Keep the implementation within its package boundary:
 | `library` | Read SQLite rows and map folders, notebooks, pages, text, and search results. |
 | `text_index` | Query raw stored-text rows, verified PDF bindings, and index diagnostics using connections owned by `library`. |
 | `documents` | Resolve copied PDF pages, render pages, and export PDFs. |
+| `annotations` and `native` | Decode native objects from disposable copies and report reconstruction coverage. |
 | `cache` and `safety` | Validate snapshots, cache transitions, locks, and safe paths. |
 | `snapshot` | Copy, verify, and mark a Library snapshot. |
+| `watch` and `diagnostics` | Poll source metadata for refreshes and report filesystem access without changing permissions. |
 | `cli` and `output` | Parse commands and format structured output and errors. |
 
 Preserve text-source labels and one-based public page numbers. Keep operations on source SQLite databases out of the code; commands should read the validated copy. Before changing a command, inspect `uv run goodnotes COMMAND --help` and `uv run goodnotes schema [COMMAND]`. Update the [command reference](docs/commands.md) when the public interface changes, and update the [README](README.md) for changes to the quickstart or normal user workflow. Keep user-facing operating steps in the [agent guide](docs/agent-guide.md).
@@ -42,11 +44,24 @@ Run the checks relevant to the change:
 ```sh
 uv run pytest
 uv run ruff check .
-uv run mypy src/goodnotes_cli
+uv run ty check --error-on-warning src/goodnotes_cli tests
 ```
+
+For faster local test runs, use `uv run pytest -n 4` to distribute tests across
+four worker processes. Keep generated fixtures isolated per test.
+
+Decoder property tests use Hypothesis to generate synthetic binary inputs and
+check decoded values, malformed-input rejection, and resource limits. Run them
+with `uv run pytest tests/test_decoder_properties.py`. Hypothesis stores local
+failure examples in the ignored `.hypothesis/` directory; preserve a discovered
+regression as an explicit generated example when fixing it.
+
+Ty is the required type checker for application code and tests. The required
+CI command treats warnings as failures so new and existing diagnostics remain
+visible during the migration.
 
 Tests must use generated fixtures. Before submitting, review the diff and `git status` for private data, generated output, and machine-specific paths.
 
 ## Submit a change
 
-Describe the behavior that changed and list the checks you ran. Full reconstruction of native Goodnotes handwriting remains unsupported; describe a capability only when the code provides it.
+Describe the behavior that changed and list the checks you ran. Native ink reconstruction is experimental. Keep supported object counts, partial coverage, and rendering limitations explicit. Tests that exercise the RocksDB engine must generate their own native store and skip with a reason when the optional runtime is unavailable; run them with a compatible runtime before changing native storage handling.

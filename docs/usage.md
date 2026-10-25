@@ -16,7 +16,26 @@ On Linux, give `sync` a path to an available copy of the `Library` folder:
 uv run goodnotes sync --library /path/to/Library
 ```
 
-The folder must contain `Databases/` and `Attachments/`. Run `sync` again after Goodnotes changes the library. To rebuild the copy even when its saved file inventory appears unchanged, add `--force`.
+The folder must contain `Databases/` and `Attachments/`. `sync` captures changed files and reuses unchanged verified files. To rebuild even when the saved inventory appears unchanged, add `--force`.
+
+For agent conversations, sync once at the start of each request, then request a bundle. One bundle holds a single read view and needs no snapshot guard. If subsequent reads must match, use its returned `snapshot` with global `--expect-snapshot`. This requires no persistent watcher. Do not refresh between matching reads unless restarting against a newer generation.
+
+For optional continuous updates, leave this foreground command running in a separate terminal:
+
+```sh
+uv run goodnotes watch --interval 2 --debounce 1
+```
+
+Use `watch --library /path/to/Library` for an explicit source. Watch emits an initial result, then JSON events for updates, errors, and recovery. It stays quiet when unchanged and stops with Ctrl-C. This observes changes that reached the Mac; it cannot verify whether an iPad is fully synced. If watch is not running, refresh with `sync` after edits.
+
+For actual pen annotations, install the optional native runtime described in [PDFs and handwriting](pdf-and-handwriting.md), then render a page or prepare an agent bundle:
+
+```sh
+uv run goodnotes render "Notebook name" --page 3 --layer native --output /tmp/notes-page.png
+uv run goodnotes bundle "Notebook name" --pages 3 --output /tmp/notes-context
+```
+
+Inspect `native_annotations`, warnings, snapshot ID, and capture time before evaluating the image. Native reconstruction is approximate and reports unsupported objects; text recognition remains separate.
 
 To make a separate copy at a path you manage, use `snapshot`, then pass that copy with the global `--sandbox` option:
 
@@ -27,7 +46,7 @@ uv run goodnotes --sandbox /path/to/saved-copy ls
 
 ### Read access for an agent
 
-Install the CLI and run `sync` with a process that can read Goodnotes and write the CLI cache. An agent using the prepared copy needs read access to the installed CLI and cache. Browse commands create no cache files. Exports also need write access to their destination; `attach-pdf` needs write access to the cache's registration storage.
+Install the CLI and run `sync` with a process that can read Goodnotes and write the CLI cache. An agent using the prepared copy needs read access to the installed CLI and cache. Browse commands create no cache files. Default render/bundle requests also need write access to the separate artifact cache; a reader with a read-only cache can supply `--output` in a writable directory instead. Exports need write access to their destination; `attach-pdf` needs write access to the cache's registration storage.
 
 The default cache is `~/.cache/goodnotes-cli`. To select another location, use the same `GOODNOTES_DATA_DIR` value or global `--data-dir` option for both setup and reading:
 
@@ -106,11 +125,13 @@ Export a notebook to PDF, render one page to PNG, or create a small set of page 
 ```sh
 uv run goodnotes export "Notebook name" --pages 1-3,7 --output /tmp/selected-pages.pdf
 uv run goodnotes export "Notebook name" --output /tmp/notebook.pdf
-uv run goodnotes render "Notebook name" --page 3 --output /tmp/page-3.png
-uv run goodnotes bundle "Notebook name" --pages 1-3 --output /tmp/notebook-pages
+uv run goodnotes render "Notebook name" --page 3
+uv run goodnotes bundle "Notebook name" --pages 1-3
 ```
 
-`export --pages` selects distinct one-based page numbers in the listed order, with no 20-page cap; omitting it exports all pages. These commands use the `background` layer by default. It contains each page's source attachment and does not add native Goodnotes ink. `bundle` accepts up to 10 pages and applies one character budget across their text. For annotated PDF output, follow [PDFs and handwriting](pdf-and-handwriting.md).
+`export --pages` selects distinct one-based page numbers in the listed order, with no 20-page cap; omitting it exports all pages. Standalone export/render use the `background` layer by default, which does not add native Goodnotes ink. Bundle defaults to native annotated images and PDF text, returning both directly in its response. It accepts up to 10 pages and applies one character budget across their text. Use `--source all` for all stored text sources, or `--layer background` for clean images. For native and annotated PDF output, follow [PDFs and handwriting](pdf-and-handwriting.md).
+
+Without `--output`, renders and bundles are temporary. Their shared artifact cache retains at most 100 MB and expires entries after one day since their last CLI request, with cleanup on a later artifact operation. Returned paths are protected for five minutes, then may be evicted for capacity. Repeat the request if a path has expired. Add `--output /path/to/new.png` or `--output /path/to/new-directory` for a persistent copy that the cache never prunes. See [artifact retention](commands.md#artifact-retention).
 
 Output paths must be new. The CLI does not replace an existing file or directory.
 
@@ -146,4 +167,4 @@ uv run goodnotes schema
 uv run goodnotes schema read
 ```
 
-The CLI emits JSON by default. `--text` indents that JSON; `--json` keeps it compact. Global options such as `--data-dir`, `--fields`, `--text`, and `--expect-snapshot` go before the command name. See the [agent guide](agent-guide.md) for operational guidance and the [command reference](commands.md) for all flags.
+The CLI emits concise JSON by default. Global `--verbose` includes full metadata; `--fields` projects the full field contract. `--text` indents JSON and `--json` keeps it compact. Global options go before the command name. See the [agent guide](agent-guide.md) for operational guidance and the [command reference](commands.md) for all flags.

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import os
 from pathlib import Path
 from typing import Literal
@@ -25,6 +26,73 @@ def _os_cause(exc: BaseException) -> OSError | None:
     while cause is not None and not isinstance(cause, OSError):
         cause = cause.__cause__
     return cause
+
+
+def _permission_denied(exc: BaseException) -> bool:
+    cause = _os_cause(exc)
+    return isinstance(cause, PermissionError) or (
+        cause is not None and cause.errno in {errno.EACCES, errno.EPERM}
+    )
+
+
+class FilesystemAccessError(GoodnotesError):
+    """A source-read or output-write failure with a concrete recovery action."""
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        operation: str,
+        path: str | Path,
+        remedy: str,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.details = {"operation": operation, "path": str(path), "remedy": remedy}
+
+    @classmethod
+    def from_exception(
+        cls,
+        exc: BaseException,
+        *,
+        operation: str,
+        path: str | Path,
+        kind: Literal["source", "output"],
+        message: str | None = None,
+    ) -> FilesystemAccessError:
+        cause = _os_cause(exc)
+        failed_path = getattr(cause, "filename", None) if cause is not None else None
+        if isinstance(failed_path, bytes):
+            failed_path = os.fsdecode(failed_path)
+        permission_denied = _permission_denied(exc)
+        code = f"{kind}_{'permission_denied' if permission_denied else 'unavailable'}"
+        if kind == "source":
+            remedy = (
+                "Grant this CLI process read access to the selected Library and search access "
+                "to its parent directories. A sandboxed agent may need access granted by its "
+                "host. Keep Goodnotes source permissions unchanged and use the same --library "
+                "selection when retrying."
+                if permission_denied
+                else "Check that the selected Library exists and is readable, then retry "
+                "with the same --library selection."
+            )
+        else:
+            remedy = (
+                "Choose an output directory writable by this CLI process, or grant it "
+                "write/search access to that directory. A sandboxed agent may need access "
+                "granted by its host. Keep the snapshot and Goodnotes source unchanged."
+                if permission_denied
+                else "Check that the output parent exists and is writable, then retry with "
+                "a new output path outside the snapshot and Goodnotes source."
+            )
+        return cls(
+            code,
+            message or f"Could not access {kind} path: {failed_path or path}",
+            operation=operation,
+            path=failed_path or path,
+            remedy=remedy,
+        )
 
 
 class CacheAccessError(GoodnotesError):
@@ -97,7 +165,7 @@ class CacheAccessError(GoodnotesError):
         """Classify one cache setup, lock, or pointer failure and its cause chain."""
 
         os_error = _os_cause(exc)
-        if isinstance(os_error, PermissionError):
+        if _permission_denied(exc):
             code: CacheAccessCode = "cache_permission_denied"
         elif isinstance(os_error, FileNotFoundError) and missing_is_uninitialized:
             code = "cache_not_initialized"

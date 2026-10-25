@@ -4,20 +4,20 @@ from __future__ import annotations
 
 import hashlib
 import heapq
+import math
 import shlex
 import sqlite3
-from collections.abc import Iterator
-from contextlib import ExitStack
+from collections import OrderedDict
+from collections.abc import Generator, Iterator
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-import pymupdf
-
 from . import text_index
 from .errors import GoodnotesError, TextIndexUnavailableError
 from .models import Item, Page, PageRef, PageText, RecognitionStatus, SearchHit, TextPart
-from .safety import open_database
+from .safety import open_database, resolve_confined_file
 
 if TYPE_CHECKING:
     from .safety import Sandbox
@@ -25,13 +25,39 @@ if TYPE_CHECKING:
 
 _FOLDER = 0
 _NOTEBOOK = 1
-_TEXT_TABLES = {
-    "handwriting": ("annotation_text_content", "Handwriting"),
-    "textbox": ("textbox_text_content", "Textbox"),
-    "pdf": ("pdf_text_content", "PDF"),
-}
 _MAX_PDF_FALLBACK_BYTES = 128 * 1024 * 1024
 _MAX_PDF_FALLBACK_TEXT = 100_000
+_MAX_OPEN_PDFS = 4
+
+
+def _pymupdf() -> Any:
+    """Import PyMuPDF only for operations that actually read a PDF."""
+    import pymupdf
+
+    return pymupdf
+
+
+class _PDFDocumentCache:
+    """A small LRU of read-only PDF documents scoped to one Library session."""
+
+    def __init__(self, maximum: int = _MAX_OPEN_PDFS) -> None:
+        self.maximum = maximum
+        self.documents: OrderedDict[Path, Any] = OrderedDict()
+
+    def get(self, path: Path) -> Any:
+        document = self.documents.pop(path, None)
+        if document is None:
+            document = _pymupdf().open(path)
+        self.documents[path] = document
+        while len(self.documents) > self.maximum:
+            _, evicted = self.documents.popitem(last=False)
+            evicted.close()
+        return document
+
+    def close(self) -> None:
+        for document in reversed(self.documents.values()):
+            document.close()
+        self.documents.clear()
 
 
 @dataclass(frozen=True)
@@ -67,6 +93,9 @@ class Library:
         self._stack: ExitStack | None = None
         self._projection: sqlite3.Connection | None = None
         self._fts: sqlite3.Connection | None = None
+        self._fts_attempted = False
+        self._projection_schema: text_index.SchemaCache | None = None
+        self._fts_schema: text_index.SchemaCache | None = None
         self._active_items: dict[tuple[str, str], str] = {}
         self._entries: dict[tuple[str, str], _Entry] = {}
         self._links: dict[tuple[str, str], list[sqlite3.Row]] = {}
@@ -79,9 +108,23 @@ class Library:
         self._links_to_deleted_count = 0
         self._active_folder_count = 0
         self._active_notebook_count = 0
-        self._page_numbers: dict[tuple[str, str], int] = {}
+        self._page_numbers: dict[tuple[str, str], int] | None = None
+        self._page_cache: dict[tuple[str, str], Page] = {}
+        self._pages_by_notebook: dict[str, list[Page]] = {}
+        self._attachment_state_by_page: dict[tuple[str, str], tuple[str, str | None]] = {}
+        self._attachment_resolution_cache: dict[str, tuple[Path | None, str]] = {}
+        self._pdf_attachment_resolution_cache: dict[str, tuple[Path | None, str]] | None = None
         self._attachment_basename_cache: dict[str, list[Path]] | None = None
         self._text_warnings_cache: list[str] | None = None
+        self._page_refs_cache: dict[
+            tuple[tuple[str, ...], tuple[str, ...] | None], list[PageRef]
+        ] = {}
+        self._pdf_bindings_cache: dict[tuple[PageRef, ...], text_index._PDFPageBindings] = {}
+        self._scope_cache: dict[
+            tuple[tuple[str, str] | str, tuple[str, str] | str | None],
+            tuple[dict[str, Any], list[Item], set[str]],
+        ] = {}
+        self._pdf_documents: _PDFDocumentCache | None = None
 
     def __enter__(self) -> Library:
         if self._stack is not None:
@@ -90,29 +133,62 @@ class Library:
         stack = ExitStack()
         try:
             self._projection = stack.enter_context(open_database(self.sandbox.projection_path))
-            if self.sandbox.fts_path is not None:
-                fts_path = Path(self.sandbox.fts_path)
-                if fts_path.is_file():
-                    self._fts = stack.enter_context(open_database(fts_path))
+            self._projection_schema = text_index.SchemaCache(self._projection)
+            self._fts = None
+            self._fts_schema = None
+            self._fts_attempted = False
+            self._pdf_documents = None
+            self._pdf_attachment_resolution_cache = None
+            self._page_cache.clear()
+            self._pages_by_notebook.clear()
+            self._attachment_state_by_page.clear()
+            self._attachment_resolution_cache.clear()
+            self._pdf_attachment_resolution_cache = None
+            self._attachment_basename_cache = None
+            self._page_refs_cache.clear()
+            self._pdf_bindings_cache.clear()
+            self._scope_cache.clear()
+            self._page_numbers = None
             self._stack = stack
-            self._register_casefold()
             self._load_catalog()
             self._text_warnings_cache = None
         except Exception:
             stack.close()
             self._projection = None
             self._fts = None
+            self._projection_schema = None
+            self._fts_schema = None
             self._stack = None
             raise
         return self
 
     def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
-        if self._stack is not None:
-            self._stack.close()
-        self._stack = None
-        self._projection = None
-        self._fts = None
-        self._text_warnings_cache = None
+        try:
+            if self._pdf_documents is not None:
+                self._pdf_documents.close()
+        finally:
+            self._pdf_documents = None
+            self._pdf_attachment_resolution_cache = None
+            try:
+                if self._stack is not None:
+                    self._stack.close()
+            finally:
+                self._stack = None
+                self._projection = None
+                self._fts = None
+                self._projection_schema = None
+                self._fts_schema = None
+                self._fts_attempted = False
+                self._page_cache.clear()
+                self._pages_by_notebook.clear()
+                self._attachment_state_by_page.clear()
+                self._attachment_resolution_cache.clear()
+                self._attachment_basename_cache = None
+                self._page_refs_cache.clear()
+                self._pdf_bindings_cache.clear()
+                self._scope_cache.clear()
+                self._page_numbers = None
+                self._text_warnings_cache = None
 
     def list_items(self, folder: str | Item = "/", kind: str | None = None) -> list[Item]:
         """List direct children of a folder, or direct children of the library root."""
@@ -196,6 +272,9 @@ class Library:
         self._require_open()
         self._ensure_consistent_graph()
         item = self.resolve(notebook, kind="notebook")
+        cached = self._pages_by_notebook.get(item.id)
+        if cached is not None:
+            return list(cached)
         assert self._projection is not None
         rows = self._projection.execute(
             """
@@ -206,7 +285,9 @@ class Library:
             """,
             (item.id,),
         ).fetchall()
-        return [self._page_from_row(row, number) for number, row in enumerate(rows, start=1)]
+        pages = self._hydrate_page_rows(rows)
+        self._pages_by_notebook[item.id] = pages
+        return list(pages)
 
     def read_page(
         self,
@@ -221,7 +302,7 @@ class Library:
         if isinstance(page, bool) or not isinstance(page, int) or page < 1:
             raise GoodnotesError("Page numbers are one-based positive integers.")
         source = source.casefold() if isinstance(source, str) else ""
-        if source not in {"all", *_TEXT_TABLES}:
+        if source not in {"all", *text_index.TEXT_TABLES}:
             raise GoodnotesError("Read source must be all, handwriting, pdf, or textbox.")
         if max_chars is not None and (
             isinstance(max_chars, bool) or not isinstance(max_chars, int) or max_chars < 0
@@ -234,7 +315,7 @@ class Library:
         selected = pages[page - 1]
         parts: list[TextPart] = []
         warnings = self._read_warnings(source)
-        selected_sources = list(_TEXT_TABLES) if source == "all" else [source]
+        selected_sources = list(text_index.TEXT_TABLES) if source == "all" else [source]
         remaining = max_chars
         truncated = False
 
@@ -291,9 +372,10 @@ class Library:
                     "PDF background text was not read because the character budget was exhausted."
                 )
             else:
-                extracted_text, extraction_warning, extraction_truncated = (
-                    self._extract_pdf_fallback(selected, max_chars=remaining)
-                )
+                with self._pdf_session():
+                    extracted_text, extraction_warning, extraction_truncated = (
+                        self._extract_pdf_fallback(selected, max_chars=remaining)
+                    )
                 if extracted_text:
                     parts.append(
                         TextPart(
@@ -312,26 +394,29 @@ class Library:
 
     def _read_warnings(self, source: str) -> list[str]:
         """Return only source-coverage warnings relevant to this read request."""
+        self._ensure_fts()
         if source == "all":
-            selected_sources = list(_TEXT_TABLES)
+            selected_sources = list(text_index.TEXT_TABLES)
         else:
             selected_sources = [source]
         if self._fts is None:
-            labels = ", ".join(_TEXT_TABLES[item][1].lower() for item in selected_sources)
+            labels = ", ".join(text_index.TEXT_LABELS[item].lower() for item in selected_sources)
             return [
                 "The sandbox has no search index; indexed "
                 f"{labels} text is unavailable for this page."
             ]
         warnings: list[str] = []
         for selected in selected_sources:
-            label = _TEXT_TABLES[selected][1]
-            table = _TEXT_TABLES[selected][0]
+            label = text_index.TEXT_LABELS[selected]
+            table = text_index.TEXT_TABLES[selected]
             if not self._table_exists(self._fts, table):
                 warnings.append(
                     f"{label} text is unavailable because `{table}` is missing from the "
                     "search index."
                 )
-        if "pdf" in selected_sources and not text_index.page_meta_supports_pdf_mapping(self._fts):
+        if "pdf" in selected_sources and not text_index.page_meta_supports_pdf_mapping(
+            self._fts, schema=self._fts_schema
+        ):
             warnings.append(
                 "Indexed PDF text cannot be mapped because usable `page_meta` mapping is "
                 "unavailable in the search index."
@@ -339,7 +424,7 @@ class Library:
         if (
             "pdf" in selected_sources
             and self._table_exists(self._fts, "pdf_text_content")
-            and not text_index.pdf_identity_schema_available(self._fts)
+            and not text_index.pdf_identity_schema_available(self._fts, schema=self._fts_schema)
         ):
             warnings.append(
                 "Indexed PDF text cannot be verified because full PDF page identity columns are "
@@ -353,7 +438,7 @@ class Library:
         """Read one ordinary content table while loading at most its remaining budget."""
         if self._fts is None:
             return [], budget, False, False
-        table = _TEXT_TABLES[source][0]
+        table = text_index.TEXT_TABLES[source]
         if not self._table_exists(self._fts, table):
             return [], budget, False, False
 
@@ -361,53 +446,136 @@ class Library:
             ordering = (
                 "CASE priority WHEN 'primary' THEN 0 WHEN 'secondary' THEN 1 ELSE 2 END, text_id"
             )
-            fields = "text_id, length(text) AS text_length, engine_type, priority"
+            result_ordering = (
+                "CASE candidates.priority WHEN 'primary' THEN 0 WHEN 'secondary' THEN 1 "
+                "ELSE 2 END, candidates.text_id"
+            )
+            metadata_fields = ", engine_type, priority"
+            candidate_fields = ", engine_type, priority"
         else:
             ordering = "text_id"
-            fields = "text_id, length(text) AS text_length"
+            result_ordering = "candidates.text_id"
+            metadata_fields = ""
+            candidate_fields = ""
+
+        def validate_metadata(
+            row: sqlite3.Row,
+        ) -> tuple[int, int, str | None, str | None]:
+            text_id = row["text_id"]
+            if not isinstance(text_id, int) or isinstance(text_id, bool):
+                raise GoodnotesError(
+                    f"Search index has an invalid `{table}.text_id`; expected an integer."
+                )
+            if row["text_type"] != "text":
+                raise GoodnotesError(
+                    f"Search index has an invalid `{table}.text` value; expected text."
+                )
+            text_length = row["text_length"]
+            if not isinstance(text_length, int) or isinstance(text_length, bool) or text_length < 0:
+                raise GoodnotesError(
+                    f"Search index has an invalid `{table}.text` length; "
+                    "expected a non-negative integer."
+                )
+            engine: str | None = None
+            priority: str | None = None
+            if source == "handwriting":
+                engine_value = row["engine_type"]
+                priority_value = row["priority"]
+                if engine_value is not None and not isinstance(engine_value, str):
+                    raise GoodnotesError(
+                        f"Search index has an invalid `{table}.engine_type`; expected text or NULL."
+                    )
+                if priority_value is not None and not isinstance(priority_value, str):
+                    raise GoodnotesError(
+                        f"Search index has an invalid `{table}.priority`; expected text or NULL."
+                    )
+                engine = engine_value
+                priority = priority_value
+            return text_id, text_length, engine, priority
+
+        if budget == 0:
+            row = self._fts.execute(
+                f"""
+                SELECT text_id, typeof(text) AS text_type, length(text) AS text_length
+                       {metadata_fields}
+                FROM {table}
+                WHERE page_id = ? AND COALESCE(text, '') <> ''
+                ORDER BY {ordering}
+                LIMIT 1
+                """,
+                (page_id,),
+            ).fetchone()
+            if row is None:
+                return [], budget, False, False
+            validate_metadata(row)
+            return [], budget, True, True
+
         parts: list[TextPart] = []
         found = False
         rows = self._fts.execute(
             f"""
-            SELECT {fields}
-            FROM {table}
-            WHERE page_id = ? AND COALESCE(text, '') <> ''
-            ORDER BY {ordering}
+            WITH candidates AS (
+                SELECT text_id, typeof(text) AS text_type, length(text) AS text_length
+                       {candidate_fields},
+                       row_number() OVER (ORDER BY {ordering}) AS row_number,
+                       count(*) OVER () AS row_count,
+                       COALESCE(sum(length(text)) OVER (
+                           ORDER BY {ordering}
+                           ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                       ), 0) AS prior_length
+                FROM {table}
+                WHERE page_id = ? AND COALESCE(text, '') <> ''
+            )
+            SELECT candidates.*,
+                   CASE WHEN ? IS NULL THEN content.text
+                        ELSE substr(content.text, 1,
+                            min(candidates.text_length, ? - candidates.prior_length + 1))
+                   END AS bounded_text,
+                   CASE WHEN ? IS NULL THEN 0
+                        ELSE instr(content.text, char(0))
+                   END AS contains_nul
+            FROM candidates
+            JOIN {table} AS content
+              ON content.text_id = candidates.text_id AND content.page_id = ?
+            WHERE ? IS NULL OR candidates.prior_length < ?
+            ORDER BY {result_ordering}
             """,
-            (page_id,),
+            (page_id, budget, budget, budget, page_id, budget, budget),
         )
         for row in rows:
             found = True
-            if budget is not None and budget == 0:
-                return parts, budget, True, found
-            if budget is None:
-                content = self._fts.execute(
-                    f"SELECT text FROM {table} WHERE text_id = ?", (row["text_id"],)
-                ).fetchone()
-                text = content[0] if content is not None else ""
-                part_truncated = False
-            else:
-                content = self._fts.execute(
-                    f"SELECT substr(text, 1, ?) FROM {table} WHERE text_id = ?",
-                    (budget + 1, row["text_id"]),
-                ).fetchone()
-                text = content[0] if content is not None else ""
-                part_truncated = int(row["text_length"] or 0) > budget or len(text) > budget
+            _, text_length, engine, priority = validate_metadata(row)
+            if budget is not None and row["contains_nul"]:
+                raise GoodnotesError(
+                    f"Search index has embedded NUL in `{table}.text`; "
+                    "a bounded read cannot preserve this value."
+                )
+            text = row["bounded_text"]
+            if not isinstance(text, str):
+                raise GoodnotesError(
+                    f"Search index has an invalid `{table}.text` value; expected text."
+                )
+            available = budget
+            part_truncated = False
+            if available is not None:
+                part_truncated = text_length > available or len(text) > available
                 if part_truncated:
-                    text = text[:budget]
+                    text = text[:available]
             if text:
                 parts.append(
                     TextPart(
                         source=source,
                         text=text,
-                        engine=row["engine_type"] if source == "handwriting" else None,
-                        priority=row["priority"] if source == "handwriting" else None,
+                        engine=engine,
+                        priority=priority,
                         truncated=part_truncated,
                     )
                 )
             if budget is not None:
                 budget = max(0, budget - len(text))
             if part_truncated:
+                return parts, budget, True, found
+            if budget == 0 and row["row_number"] < row["row_count"]:
                 return parts, budget, True, found
         return parts, budget, False, found
 
@@ -430,12 +598,20 @@ class Library:
     def _recognition_status_for_page_ids(self, page_ids: list[str]) -> dict[str, RecognitionStatus]:
         """Read recognition row counts and optional pending flags without loading text."""
         assert self._projection is not None
-        raw_statuses = text_index.recognition_status(self._projection, self._fts, page_ids)
+        self._ensure_fts()
+        raw_statuses = text_index.recognition_status(
+            self._projection,
+            self._fts,
+            page_ids,
+            projection_schema=self._projection_schema,
+            fts_schema=self._fts_schema,
+        )
         return {page_id: RecognitionStatus(**status) for page_id, status in raw_statuses.items()}
 
     def text_warnings(self) -> list[str]:
         """Report library-wide text-source and page-mapping limitations for diagnostics."""
         self._require_open()
+        self._ensure_fts()
         if self._text_warnings_cache is not None:
             return list(self._text_warnings_cache)
         if self._fts is None:
@@ -446,11 +622,12 @@ class Library:
             return list(self._text_warnings_cache)
 
         warnings = [
-            f"{label} text is unavailable because `{table}` is missing from the search index."
-            for table, label in _TEXT_TABLES.values()
+            f"{text_index.TEXT_LABELS[source]} text is unavailable because `{table}` is missing "
+            "from the search index."
+            for source, table in text_index.TEXT_TABLES.items()
             if not self._table_exists(self._fts, table)
         ]
-        if not text_index.page_meta_supports_search(self._fts):
+        if not text_index.page_meta_supports_search(self._fts, schema=self._fts_schema):
             warnings.append(
                 "Stored-index search cannot map text rows to notebook pages because usable "
                 "`page_meta` columns are missing."
@@ -478,13 +655,25 @@ class Library:
         """Summarize stored text and mapping metadata for one resolved library scope."""
         self._require_open()
         self._ensure_consistent_graph()
+        self._ensure_fts()
         source = source.casefold() if isinstance(source, str) else ""
-        if source not in {"all", *_TEXT_TABLES}:
+        if source not in {"all", *text_index.TEXT_TABLES}:
             raise GoodnotesError("Coverage source must be all, handwriting, pdf, or textbox.")
         scope, _, notebook_ids = self._resolve_text_scope(folder, notebook)
         page_refs = self._page_refs_for_notebooks(notebook_ids)
-        requested_sources = list(_TEXT_TABLES) if source == "all" else [source]
-        details = text_index.coverage(self._fts, page_refs, requested_sources)
+        requested_sources = list(text_index.TEXT_TABLES) if source == "all" else [source]
+        pdf_bindings = (
+            self._pdf_bindings_for(page_refs)
+            if "pdf" in requested_sources and self._fts is not None
+            else None
+        )
+        details = text_index.coverage(
+            self._fts,
+            page_refs,
+            requested_sources,
+            schema=self._fts_schema,
+            pdf_bindings=pdf_bindings,
+        )
         mapping = details["page_meta"]
         source_details = details["sources"]
         warnings = list(details["warnings"])
@@ -559,10 +748,17 @@ class Library:
         """Read active page identities and current PDF mappings from the projection."""
         if not notebook_ids:
             return []
+        cache_key = (
+            tuple(sorted(notebook_ids)),
+            tuple(sorted(page_ids)) if page_ids is not None else None,
+        )
+        cached = self._page_refs_cache.get(cache_key)
+        if cached is not None:
+            return list(cached)
         assert self._projection is not None
-        page_columns = text_index.table_columns(self._projection, "pages")
+        page_columns = self._table_columns(self._projection, "pages")
         template_columns = (
-            text_index.table_columns(self._projection, "templates")
+            self._table_columns(self._projection, "templates")
             if self._table_exists(self._projection, "templates")
             else set()
         )
@@ -612,27 +808,54 @@ class Library:
                 )
                 for row in rows:
                     attachment_id = row["attachment_id"]
-                    attachment_id = str(attachment_id) if attachment_id else None
-                    pdf_page_no: int | None
-                    try:
-                        pdf_page_no = int(row["page_number"])
-                        if pdf_page_no < 1:
-                            pdf_page_no = None
-                    except (TypeError, ValueError):
-                        pdf_page_no = None
+                    if not isinstance(attachment_id, str) or not attachment_id:
+                        attachment_id = None
+                    page_number = row["page_number"]
+                    pdf_page_no = (
+                        page_number
+                        if isinstance(page_number, int)
+                        and not isinstance(page_number, bool)
+                        and page_number > 0
+                        else None
+                    )
                     result.append(
                         PageRef(
-                            document_id=row["document_id"],
-                            page_id=row["page_id"],
+                            document_id=self._required_text(
+                                row["document_id"], "pages.document_id"
+                            ),
+                            page_id=self._required_text(row["page_id"], "pages.id"),
                             attachment_id=attachment_id,
                             pdf_page_no=pdf_page_no,
                         )
                     )
-        return result
+        self._page_refs_cache[cache_key] = result
+        return list(result)
+
+    def _pdf_bindings_for(self, page_refs: list[PageRef]) -> text_index._PDFPageBindings:
+        assert self._fts is not None
+        key = tuple(page_refs)
+        cached = self._pdf_bindings_cache.get(key)
+        if cached is None:
+            cached = text_index.pdf_page_bindings(self._fts, page_refs, schema=self._fts_schema)
+            self._pdf_bindings_cache[key] = cached
+        return cached
+
+    @staticmethod
+    def _selector_cache_key(selector: str | Item | None) -> tuple[str, str] | str | None:
+        if isinstance(selector, Item):
+            return (selector.kind, selector.id)
+        return selector
 
     def _resolve_text_scope(
         self, folder: str | Item, notebook: str | Item | None
     ) -> tuple[dict[str, Any], list[Item], set[str]]:
+        folder_key = self._selector_cache_key(folder)
+        assert folder_key is not None
+        cache_key = (folder_key, self._selector_cache_key(notebook))
+        cached = self._scope_cache.get(cache_key)
+        if cached is not None:
+            scope, notebooks, notebook_ids = cached
+            return dict(scope), list(notebooks), set(notebook_ids)
         if notebook is not None:
             try:
                 parent_key = self._folder_key(folder, root_allowed=True)
@@ -646,7 +869,7 @@ class Library:
             if parent_key is not None:
                 raise GoodnotesError("Use either --notebook or a non-root --folder, not both.")
             item = self._resolve_notebook_selector(notebook, option="--notebook")
-            return (
+            result = (
                 {
                     "type": "notebook",
                     "notebook_id": item.id,
@@ -655,6 +878,8 @@ class Library:
                 [item],
                 {item.id},
             )
+            self._scope_cache[cache_key] = result
+            return dict(result[0]), list(result[1]), set(result[2])
 
         try:
             parent_key = self._folder_key(folder, root_allowed=True)
@@ -677,7 +902,9 @@ class Library:
         else:
             item = self._item_for_key(parent_key)
             scope = {"type": "folder", "folder_id": item.id, "path": item.path}
-        return scope, notebooks, {item.id for item in notebooks}
+        result = (scope, notebooks, {item.id for item in notebooks})
+        self._scope_cache[cache_key] = result
+        return dict(scope), list(notebooks), set(result[2])
 
     def _resolve_notebook_selector(self, selector: str | Item, *, option: str) -> Item:
         try:
@@ -713,27 +940,30 @@ class Library:
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
             raise GoodnotesError("Search limit must be a positive integer.")
         source = source.casefold() if isinstance(source, str) else ""
-        valid_sources = {"all", "handwriting", "pdf", "textbox"}
+        valid_sources = {"all", *text_index.TEXT_TABLES}
         if source not in valid_sources:
             raise GoodnotesError("Search source must be all, handwriting, pdf, or textbox.")
         _, _, notebook_ids = self._resolve_text_scope(folder, notebook)
+        self._ensure_fts()
         if self._fts is None:
             raise TextIndexUnavailableError("The sandbox has no search index.")
 
-        selected_sources = list(_TEXT_TABLES) if source == "all" else [source]
+        selected_sources = list(text_index.TEXT_TABLES) if source == "all" else [source]
         missing_sources = [
             item_source
             for item_source in selected_sources
-            if not text_index.search_source_available(self._fts, item_source)
+            if not text_index.search_source_available(
+                self._fts, item_source, schema=self._fts_schema
+            )
         ]
         if source != "all" and missing_sources:
-            label = _TEXT_TABLES[source][1]
+            label = text_index.TEXT_LABELS[source]
             raise TextIndexUnavailableError(f"{label} text is unavailable in this search index.")
         if source == "all" and len(missing_sources) == len(selected_sources):
             raise TextIndexUnavailableError(
                 "The search index has no available text content tables."
             )
-        if not text_index.page_meta_supports_search(self._fts):
+        if not text_index.page_meta_supports_search(self._fts, schema=self._fts_schema):
             raise TextIndexUnavailableError(
                 "Search results cannot be mapped because usable page metadata is missing."
             )
@@ -749,9 +979,7 @@ class Library:
             )
         pdf_bindings: text_index._PDFPageBindings | None = None
         if "pdf" in available:
-            pdf_bindings = text_index.pdf_page_bindings(
-                self._fts, self._page_refs_for_notebooks(notebook_ids)
-            )
+            pdf_bindings = self._pdf_bindings_for(self._page_refs_for_notebooks(notebook_ids))
             if not pdf_bindings["available"]:
                 if source == "pdf":
                     raise TextIndexUnavailableError(
@@ -774,6 +1002,7 @@ class Library:
             raise TextIndexUnavailableError("The requested text index mappings are unavailable.")
 
         source_order = {"handwriting": 0, "pdf": 1, "textbox": 2}
+        folded_query = query.casefold()
         candidates: list[_SearchCandidate] = []
         retained_keys: set[tuple[str, str, int, bytes]] = set()
         sequence = 0
@@ -788,14 +1017,14 @@ class Library:
                     row
                     for notebook_batch in notebook_batches
                     for row in text_index.search_pdf_rows(
-                        self._fts, pdf_bindings, query, notebook_batch
+                        self._fts, pdf_bindings, folded_query, notebook_batch
                     )
                 )
             else:
                 rows = (
                     row
                     for notebook_batch in notebook_batches
-                    for row in self._search_rows(item_source, query, notebook_batch)
+                    for row in self._search_rows(item_source, folded_query, notebook_batch)
                 )
             for row in rows:
                 document_id = row["document_id"]
@@ -859,6 +1088,27 @@ class Library:
         page_offset: int = 0,
         notebook: str | Item | None = None,
     ) -> dict[str, Any]:
+        """Search copied PDF backgrounds with an operation-scoped document cache."""
+        with self._pdf_session():
+            return self._scan_pdfs(
+                query,
+                folder,
+                limit=limit,
+                page_limit=page_limit,
+                page_offset=page_offset,
+                notebook=notebook,
+            )
+
+    def _scan_pdfs(
+        self,
+        query: str,
+        folder: str | Item = "/",
+        *,
+        limit: int = 20,
+        page_limit: int = 200,
+        page_offset: int = 0,
+        notebook: str | Item | None = None,
+    ) -> dict[str, Any]:
         """Search copied PDF backgrounds in a bounded window of notebook pages."""
         self._require_open()
         self._ensure_consistent_graph()
@@ -900,9 +1150,17 @@ class Library:
             pages_scanned += 1
             text, extraction_warning, extraction_truncated = self._extract_pdf_fallback(page)
             issue: str | None = None
-            if not page.attachment_path:
+            attachment_state, _ = self._attachment_state_by_page.get(
+                (page.document_id, page.id), ("unmapped", None)
+            )
+            if attachment_state != "available":
                 missing_backgrounds += 1
-                issue = "missing-background"
+                issue = {
+                    "missing": "missing-attachment",
+                    "unsafe": "unsafe-attachment-path",
+                    "ambiguous": "ambiguous-attachment",
+                    "unavailable": "unavailable-attachment",
+                }.get(attachment_state, "missing-background")
             elif page.pdf_page is None:
                 unmapped_backgrounds += 1
                 issue = "unmapped-background"
@@ -1009,13 +1267,18 @@ class Library:
                 """,
                 (notebook.id, fetch_count, local_offset),
             ).fetchall()
-            for index, row in enumerate(rows, start=local_offset + 1):
-                yield notebook, self._page_from_row(row, index)
+            pages = self._hydrate_page_rows(
+                rows,
+                numbers=list(range(local_offset + 1, local_offset + len(rows) + 1)),
+            )
+            for page in pages:
+                yield notebook, page
             remaining -= len(rows)
 
     def stats(self) -> dict[str, Any]:
         """Return counts and capability warnings suitable for a doctor/info command."""
         self._require_open()
+        self._ensure_fts()
         assert self._projection is not None
         active_folders = self._active_folder_count
         active_notebooks = self._active_notebook_count
@@ -1066,7 +1329,9 @@ class Library:
             warnings.append(
                 f"{self._links_to_deleted_count} active links to deleted items were ignored."
             )
-        page_meta_available = text_index.page_meta_supports_search(self._fts)
+        page_meta_available = text_index.page_meta_supports_search(
+            self._fts, schema=self._fts_schema
+        )
         page_meta_ids: set[str] = set()
         if self._fts is not None and page_meta_available:
             page_meta_ids = {
@@ -1115,6 +1380,27 @@ class Library:
         if self._stack is None or self._projection is None:
             raise GoodnotesError("Open Library in a `with` block before reading it.")
 
+    def _ensure_fts(self) -> sqlite3.Connection | None:
+        """Open the optional text index only when a text or diagnostic operation needs it."""
+        if self._fts_attempted:
+            return self._fts
+        self._require_open()
+        self._fts_attempted = True
+        if self.sandbox.fts_path is None:
+            return None
+        fts_path = Path(self.sandbox.fts_path)
+        if not fts_path.is_file():
+            return None
+        assert self._stack is not None
+        try:
+            self._fts = self._stack.enter_context(open_database(fts_path))
+        except Exception:
+            self._fts_attempted = False
+            raise
+        self._fts_schema = text_index.SchemaCache(self._fts)
+        self._register_casefold()
+        return self._fts
+
     def _register_casefold(self) -> None:
         if self._fts is not None:
             self._fts.create_function(
@@ -1124,15 +1410,20 @@ class Library:
                 deterministic=True,
             )
 
-    @staticmethod
-    def _table_exists(connection: sqlite3.Connection, name: str) -> bool:
-        return (
-            connection.execute(
-                "SELECT 1 FROM sqlite_master WHERE type IN ('table', 'view') AND name = ?",
-                (name,),
-            ).fetchone()
-            is not None
-        )
+    def _schema_for(self, connection: sqlite3.Connection) -> text_index.SchemaCache:
+        if connection is self._projection and self._projection_schema is not None:
+            return self._projection_schema
+        if connection is self._fts and self._fts_schema is not None:
+            return self._fts_schema
+        return text_index.SchemaCache(connection)
+
+    def _table_exists(self, connection: sqlite3.Connection | None, name: str) -> bool:
+        if connection is None:
+            return False
+        return text_index.table_exists(connection, name, schema=self._schema_for(connection))
+
+    def _table_columns(self, connection: sqlite3.Connection, name: str) -> set[str]:
+        return text_index.table_columns(connection, name, schema=self._schema_for(connection))
 
     def _load_catalog(self) -> None:
         assert self._projection is not None
@@ -1143,38 +1434,68 @@ class Library:
                 "The projection database does not contain the expected library tables."
             )
 
+        required_columns = {
+            "folders": {"id", "name", "updated_at", "deleted", "position"},
+            "documents": {"id", "name", "updated_at", "deleted", "position"},
+            "folder_to_folder_items": {
+                "id",
+                "item_type",
+                "item_id",
+                "parent_folder_id",
+                "root_folder_id",
+                "item_position",
+                "deleted",
+            },
+            "pages": {"id", "document_id", "template_id", "position", "group_id", "deleted"},
+        }
+        for table, expected in required_columns.items():
+            missing = expected - self._table_columns(projection, table)
+            if missing:
+                raise GoodnotesError(
+                    f"Projection database table `{table}` is missing required columns: "
+                    f"{', '.join(sorted(missing))}."
+                )
+
         folder_rows = projection.execute(
             "SELECT id, name, updated_at, deleted, position FROM folders"
         ).fetchall()
         document_rows = projection.execute(
             "SELECT id, name, updated_at, deleted, position FROM documents"
         ).fetchall()
-        live_folders = {
-            row["id"]: row for row in folder_rows if row["id"] and not bool(row["deleted"])
-        }
-        live_documents = {
-            row["id"]: row for row in document_rows if row["id"] and not bool(row["deleted"])
-        }
+        folder_ids: set[str] = set()
+        document_ids: set[str] = set()
+        live_folders: dict[str, sqlite3.Row] = {}
+        live_documents: dict[str, sqlite3.Row] = {}
+        for kind, rows, identifiers, active in (
+            ("folders", folder_rows, folder_ids, live_folders),
+            ("documents", document_rows, document_ids, live_documents),
+        ):
+            for row in rows:
+                item_id = self._required_text(row["id"], f"{kind}.id")
+                identifiers.add(item_id)
+                if self._deleted_flag(row["deleted"], f"{kind}.deleted"):
+                    continue
+                self._required_text(row["name"], f"{kind}.name")
+                self._finite_number(row["updated_at"], f"{kind}.updated_at")
+                self._required_text(row["position"], f"{kind}.position", allow_empty=True)
+                active[item_id] = row
         self._active_items = {
             **{("folder", item_id): row["name"] for item_id, row in live_folders.items()},
             **{("notebook", item_id): row["name"] for item_id, row in live_documents.items()},
         }
-        page_counts: dict[str, int] = {}
-        self._page_numbers = {}
-        for row in projection.execute(
-            """
-            SELECT id, document_id
-            FROM pages
-            WHERE COALESCE(deleted, 0) = 0
-            ORDER BY document_id, position, id
-            """
-        ).fetchall():
-            document_id = row["document_id"]
-            if document_id not in live_documents:
-                continue
-            number = page_counts.get(document_id, 0) + 1
-            page_counts[document_id] = number
-            self._page_numbers[(document_id, row["id"])] = number
+        page_counts = {
+            self._required_text(row["document_id"], "pages.document_id"): int(row["page_count"])
+            for row in projection.execute(
+                """
+                SELECT document_id, count(*) AS page_count
+                FROM pages
+                WHERE COALESCE(deleted, 0) = 0
+                GROUP BY document_id
+                """
+            )
+            if row["document_id"] in live_documents
+        }
+        self._page_numbers = None
 
         active_rows = projection.execute(
             """
@@ -1201,9 +1522,9 @@ class Library:
                 self._broken_link_count += 1
                 continue
             item_id = row["item_id"]
-            if not item_id or item_id not in live_rows:
-                any_rows = folder_rows if kind == "folder" else document_rows
-                if any(record["id"] == item_id for record in any_rows):
+            if not isinstance(item_id, str) or not item_id or item_id not in live_rows:
+                identifiers = folder_ids if kind == "folder" else document_ids
+                if item_id in identifiers:
                     self._links_to_deleted_count += 1
                 else:
                     self._broken_link_count += 1
@@ -1222,6 +1543,16 @@ class Library:
                 row = rows[0]
                 raw_parent = row["parent_folder_id"]
                 root_id = row["root_folder_id"]
+                if raw_parent is not None and not isinstance(raw_parent, str):
+                    raise GoodnotesError(
+                        "Projection database has an invalid folder_to_folder_items."
+                        "parent_folder_id value; expected text or NULL."
+                    )
+                if root_id is not None and not isinstance(root_id, str):
+                    raise GoodnotesError(
+                        "Projection database has an invalid folder_to_folder_items."
+                        "root_folder_id value; expected text or NULL."
+                    )
                 parent_is_root = (
                     raw_parent is None
                     or raw_parent == ""
@@ -1236,7 +1567,13 @@ class Library:
                     self._broken_link_count += 1
             kind, item_id = key
             record = live_folders[item_id] if kind == "folder" else live_documents[item_id]
-            position = row["item_position"] or record["position"] or ""
+            link_position = row["item_position"]
+            if link_position is not None and not isinstance(link_position, str):
+                raise GoodnotesError(
+                    "Projection database has an invalid folder_to_folder_items.item_position "
+                    "value; expected text or NULL."
+                )
+            position = link_position or record["position"]
             self._entries[key] = _Entry(
                 kind=kind,
                 id=item_id,
@@ -1244,7 +1581,7 @@ class Library:
                 parent_id=parent_id,
                 is_root=is_root,
                 position=position,
-                updated_at=float(record["updated_at"] or 0),
+                updated_at=self._finite_number(record["updated_at"], f"{kind}.updated_at"),
                 page_count=page_counts.get(item_id, 0) if kind == "notebook" else 0,
             )
             if len(rows) == 1 and (is_root or parent_id is not None):
@@ -1381,80 +1718,267 @@ class Library:
             )
         return selector.strip("/")
 
-    def _page_from_row(self, row: sqlite3.Row, number: int) -> Page:
+    def _hydrate_page_rows(
+        self, rows: list[sqlite3.Row], *, numbers: list[int] | None = None
+    ) -> list[Page]:
+        """Hydrate a bounded page set with batched template, note, and attachment reads."""
+        if not rows:
+            return []
         assert self._projection is not None
-        template_id = row["template_id"]
-        template = None
-        if template_id and self._table_exists(self._projection, "templates"):
-            template = self._projection.execute(
-                """
-                SELECT attachment_id, page_number, size_width, size_height
-                FROM templates WHERE id = ? AND document_id = ?
-                ORDER BY id LIMIT 1
-                """,
-                (template_id, row["document_id"]),
-            ).fetchone()
-        annotation_count = 0
-        if self._table_exists(self._projection, "notes_items") and row["group_id"]:
-            count_row = self._projection.execute(
-                "SELECT count(*) FROM notes_items WHERE group_id = ? AND COALESCE(deleted, 0) = 0",
-                (row["group_id"],),
-            ).fetchone()
-            annotation_count = int(count_row[0])
+        if numbers is None:
+            numbers = list(range(1, len(rows) + 1))
+        if len(numbers) != len(rows):
+            raise GoodnotesError("Page hydration received inconsistent page numbers.")
 
-        attachment_path: str | None = None
-        attachment_id = template["attachment_id"] if template is not None else None
-        if attachment_id and self._table_exists(self._projection, "attachments"):
-            attachment = self._projection.execute(
-                "SELECT path FROM attachments WHERE id = ? LIMIT 1", (attachment_id,)
-            ).fetchone()
-            if attachment is not None:
-                safe_path = self._safe_attachment_path(attachment["path"])
-                attachment_path = str(safe_path) if safe_path is not None else None
+        missing: list[sqlite3.Row] = []
+        number_by_page: dict[tuple[str, str], int] = {}
+        for row, number in zip(rows, numbers, strict=True):
+            document_id = self._required_text(row["document_id"], "pages.document_id")
+            page_id = self._required_text(row["id"], "pages.id")
+            number_by_page[(document_id, page_id)] = number
+            if (document_id, page_id) not in self._page_cache:
+                missing.append(row)
 
-        pdf_page = None
-        if template is not None and template["page_number"] is not None:
-            try:
-                candidate_page = int(template["page_number"])
-                if candidate_page > 0:
-                    pdf_page = candidate_page
-            except (TypeError, ValueError):
-                pdf_page = None
-
-        return Page(
-            id=row["id"],
-            document_id=row["document_id"],
-            number=number,
-            position=row["position"],
-            attachment_path=attachment_path,
-            pdf_page=pdf_page,
-            width=float(template["size_width"])
-            if template is not None and template["size_width"] is not None
-            else None,
-            height=float(template["size_height"])
-            if template is not None and template["size_height"] is not None
-            else None,
-            annotation_count=annotation_count,
+        templates: dict[tuple[str, str], sqlite3.Row] = {}
+        template_ids = sorted(
+            {
+                row["template_id"]
+                for row in missing
+                if isinstance(row["template_id"], str) and row["template_id"]
+            }
         )
+        if template_ids and self._table_exists(self._projection, "templates"):
+            for batch in text_index.id_batches(template_ids):
+                placeholders = ", ".join("?" for _ in batch)
+                for template in self._projection.execute(
+                    f"""
+                    SELECT id, document_id, attachment_id, page_number, size_width, size_height
+                    FROM templates WHERE id IN ({placeholders}) ORDER BY id
+                    """,
+                    batch,
+                ):
+                    key = (template["document_id"], template["id"])
+                    templates.setdefault(key, template)
 
-    def _safe_attachment_path(self, raw_path: str | None) -> Path | None:
-        """Resolve an untrusted stored path and return it only inside the sandbox copy."""
-        if not raw_path:
+        attachment_ids = sorted(
+            {
+                template["attachment_id"]
+                for template in templates.values()
+                if isinstance(template["attachment_id"], str) and template["attachment_id"]
+            }
+        )
+        attachments: dict[str, sqlite3.Row] = {}
+        if attachment_ids and self._table_exists(self._projection, "attachments"):
+            for batch in text_index.id_batches(attachment_ids):
+                placeholders = ", ".join("?" for _ in batch)
+                for attachment in self._projection.execute(
+                    f"SELECT id, path FROM attachments WHERE id IN ({placeholders}) ORDER BY id",
+                    batch,
+                ):
+                    attachments.setdefault(attachment["id"], attachment)
+
+        group_ids = sorted(
+            {
+                row["group_id"]
+                for row in missing
+                if isinstance(row["group_id"], str) and row["group_id"]
+            }
+        )
+        annotation_counts: dict[str, int] = {}
+        if group_ids and self._table_exists(self._projection, "notes_items"):
+            for batch in text_index.id_batches(group_ids):
+                placeholders = ", ".join("?" for _ in batch)
+                annotation_counts.update(
+                    {
+                        result["group_id"]: int(result["annotation_count"])
+                        for result in self._projection.execute(
+                            f"""
+                            SELECT group_id, count(*) AS annotation_count
+                            FROM notes_items
+                            WHERE group_id IN ({placeholders})
+                              AND COALESCE(deleted, 0) = 0
+                            GROUP BY group_id
+                            """,
+                            batch,
+                        )
+                    }
+                )
+
+        for row in missing:
+            page_id = self._required_text(row["id"], "pages.id")
+            document_id = self._required_text(row["document_id"], "pages.document_id")
+            position = self._required_text(row["position"], "pages.position", allow_empty=True)
+            template_id = row["template_id"]
+            template = (
+                templates.get((document_id, template_id))
+                if isinstance(template_id, str) and template_id
+                else None
+            )
+            attachment_id = template["attachment_id"] if template is not None else None
+            attachment_row = (
+                attachments.get(attachment_id)
+                if isinstance(attachment_id, str) and attachment_id
+                else None
+            )
+            if not attachment_id:
+                attachment_path, attachment_state = None, "unmapped"
+            elif attachment_row is None:
+                attachment_path, attachment_state = None, "missing"
+            else:
+                raw_attachment_path = attachment_row["path"]
+                attachment_path, attachment_state = self._resolve_attachment_path(
+                    raw_attachment_path
+                )
+                if (
+                    attachment_path is None
+                    and attachment_state == "missing"
+                    and isinstance(raw_attachment_path, str)
+                    and raw_attachment_path
+                    and not Path(raw_attachment_path).is_absolute()
+                    and ".." not in Path(raw_attachment_path).parts
+                ):
+                    # Keep a safe relative reference so document rendering can report that
+                    # its mapped file is missing, while re-validating it at the read boundary.
+                    attachment_path = Path(raw_attachment_path)
+            self._attachment_state_by_page[(document_id, page_id)] = (
+                attachment_state,
+                attachment_id if isinstance(attachment_id, str) else None,
+            )
+
+            raw_page = template["page_number"] if template is not None else None
+            pdf_page = (
+                raw_page if isinstance(raw_page, int) and not isinstance(raw_page, bool) else None
+            )
+            if pdf_page is not None and pdf_page < 1:
+                pdf_page = None
+            width = self._optional_dimension(
+                template["size_width"] if template is not None else None
+            )
+            height = self._optional_dimension(
+                template["size_height"] if template is not None else None
+            )
+            group_id = row["group_id"]
+            if group_id is not None and not isinstance(group_id, str):
+                raise GoodnotesError("Projection database has an invalid pages.group_id value.")
+            page = Page(
+                id=page_id,
+                document_id=document_id,
+                number=number_by_page[(document_id, page_id)],
+                position=position,
+                attachment_path=str(attachment_path) if attachment_path is not None else None,
+                pdf_page=pdf_page,
+                width=width,
+                height=height,
+                annotation_count=annotation_counts.get(group_id, 0) if group_id else 0,
+            )
+            self._page_cache[(document_id, page_id)] = page
+
+        result: list[Page] = []
+        for row, number in zip(rows, numbers, strict=True):
+            document_id = self._required_text(row["document_id"], "pages.document_id")
+            page_id = self._required_text(row["id"], "pages.id")
+            page = self._page_cache[(document_id, page_id)]
+            if page.number != number:
+                page = Page(
+                    id=page.id,
+                    document_id=page.document_id,
+                    number=number,
+                    position=page.position,
+                    attachment_path=page.attachment_path,
+                    pdf_page=page.pdf_page,
+                    width=page.width,
+                    height=page.height,
+                    annotation_count=page.annotation_count,
+                    rotation=page.rotation,
+                )
+                self._page_cache[(document_id, page_id)] = page
+            result.append(page)
+        return result
+
+    @staticmethod
+    def _required_text(value: Any, field: str, *, allow_empty: bool = False) -> str:
+        if not isinstance(value, str) or (not allow_empty and not value):
+            suffix = "text" if allow_empty else "non-empty text"
+            raise GoodnotesError(f"Projection database has an invalid {field}; expected {suffix}.")
+        return value
+
+    @staticmethod
+    def _finite_number(value: Any, field: str) -> float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise GoodnotesError(
+                f"Projection database has an invalid {field}; expected a finite number."
+            )
+        result = float(value)
+        if not math.isfinite(result):
+            raise GoodnotesError(
+                f"Projection database has an invalid {field}; expected a finite number."
+            )
+        return result
+
+    @staticmethod
+    def _deleted_flag(value: Any, field: str) -> bool:
+        if value is None:
+            return False
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise GoodnotesError(
+                f"Projection database has an invalid {field}; expected an integer flag or NULL."
+            )
+        return value != 0
+
+    @staticmethod
+    def _optional_dimension(value: Any) -> float | None:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
             return None
+        result = float(value)
+        return result if math.isfinite(result) else None
+
+    def _resolve_attachment_path(
+        self, raw_path: Any, *, for_read: bool = False
+    ) -> tuple[Path | None, str]:
+        """Resolve one stored reference, memoized within its pinned snapshot view.
+
+        Metadata hydration reuses results for repeated attachment references. A PDF
+        read uses a separate operation cache so the path is revalidated before it opens.
+        """
+        cache = (
+            self._pdf_attachment_resolution_cache if for_read else self._attachment_resolution_cache
+        )
+        if isinstance(raw_path, str) and cache is not None:
+            cached = cache.get(raw_path)
+            if cached is not None:
+                return cached
+
+        result = self._resolve_attachment_path_uncached(raw_path)
+        if isinstance(raw_path, str) and cache is not None:
+            cache[raw_path] = result
+        return result
+
+    def _resolve_attachment_path_uncached(self, raw_path: Any) -> tuple[Path | None, str]:
+        """Resolve a stored attachment without losing missing or unsafe diagnostics."""
+        if not isinstance(raw_path, str) or not raw_path:
+            return None, "missing"
         try:
             root = Path(self.sandbox.attachments_dir).resolve()
             stored_path = Path(raw_path)
-            candidate = stored_path if stored_path.is_absolute() else root / stored_path
-            resolved = candidate.resolve()
-            resolved.relative_to(root)
         except (OSError, RuntimeError, ValueError):
-            return None
-        if resolved.is_file() or stored_path.is_absolute():
-            return resolved
-        if ".." in stored_path.parts or not stored_path.name:
-            return None
+            return None, "unavailable"
+        if not stored_path.is_absolute() and ".." in stored_path.parts:
+            return None, "unsafe"
+        candidate = stored_path if stored_path.is_absolute() else root / stored_path
+        try:
+            resolved = resolve_confined_file(root, candidate)
+        except GoodnotesError:
+            return None, "unsafe"
+        except OSError:
+            return None, "unavailable"
+        if resolved is not None:
+            return resolved, "available"
+        if stored_path.is_absolute() or not stored_path.name:
+            return None, "missing"
         matches = self._attachment_paths_by_basename().get(stored_path.name, [])
-        return matches[0] if len(matches) == 1 else None
+        if len(matches) == 1:
+            return matches[0], "available"
+        return None, "ambiguous" if matches else "missing"
 
     def _attachment_paths_by_basename(self) -> dict[str, list[Path]]:
         if self._attachment_basename_cache is not None:
@@ -1463,11 +1987,10 @@ class Library:
         paths: dict[str, list[Path]] = {}
         for candidate in root.rglob("*"):
             try:
-                resolved = candidate.resolve()
-                resolved.relative_to(root)
-            except (OSError, RuntimeError, ValueError):
+                resolved = resolve_confined_file(root, candidate)
+            except (GoodnotesError, OSError, RuntimeError, ValueError):
                 continue
-            if resolved.is_file():
+            if resolved is not None:
                 paths.setdefault(candidate.name, []).append(resolved)
         self._attachment_basename_cache = paths
         return paths
@@ -1477,9 +2000,23 @@ class Library:
     ) -> tuple[str | None, str | None, bool]:
         """Extract one mapped PDF page from a safe copied attachment, with size bounds."""
         if not page.attachment_path:
+            status, _ = self._attachment_state_by_page.get(
+                (page.document_id, page.id), ("unmapped", None)
+            )
+            messages = {
+                "missing": "The mapped copied attachment is missing from the sandbox.",
+                "unsafe": "The stored attachment path is outside the sandbox copy.",
+                "ambiguous": (
+                    "The copied attachment cannot be resolved because its basename is ambiguous."
+                ),
+                "unavailable": "The copied attachment could not be inspected safely.",
+            }
             return (
                 None,
-                "No confined copied attachment is available for PDF text extraction.",
+                messages.get(
+                    status,
+                    "No confined copied attachment is available for PDF text extraction.",
+                ),
                 False,
             )
         if page.pdf_page is None or page.pdf_page < 1:
@@ -1488,11 +2025,13 @@ class Library:
                 "PDF text is not indexed and the page has no verified PDF page mapping.",
                 False,
             )
-        safe_path = self._safe_attachment_path(page.attachment_path)
-        if safe_path is None:
+        safe_path, status = self._resolve_attachment_path(page.attachment_path, for_read=True)
+        if status == "unsafe":
             return None, "The stored attachment path is outside the sandbox copy.", False
-        if not safe_path.is_file():
-            return None, "The copied PDF attachment is missing.", False
+        if safe_path is None:
+            if status == "missing":
+                return None, "The mapped copied attachment is missing from the sandbox.", False
+            return None, "The copied PDF attachment is unavailable.", False
         try:
             if safe_path.stat().st_size > _MAX_PDF_FALLBACK_BYTES:
                 return (
@@ -1500,11 +2039,11 @@ class Library:
                     "The copied PDF attachment exceeds the safe extraction size limit.",
                     False,
                 )
-            with pymupdf.open(safe_path) as pdf:
+            with self._pdf_document(safe_path) as pdf:
                 if page.pdf_page > pdf.page_count:
                     return None, "The mapped PDF page is outside the copied attachment.", False
                 text = pdf.load_page(page.pdf_page - 1).get_text("text").strip()
-        except (OSError, RuntimeError, ValueError, pymupdf.FileDataError):
+        except (OSError, RuntimeError, ValueError, _pymupdf().FileDataError):
             return None, "The copied attachment could not be read as a PDF.", False
         if not text:
             return None, "The mapped PDF page has no extractable text.", False
@@ -1520,42 +2059,39 @@ class Library:
         if max_chars is not None and len(text) > max_chars:
             text = text[:max_chars]
             truncated = True
-            warning = "PDF text was extracted from the confined copied attachment and truncated "
-            "to the requested character budget."
+            warning = (
+                "PDF text was extracted from the confined copied attachment and truncated "
+                "to the requested character budget."
+            )
         return text, warning, truncated
 
-    def _page_template_mapping(self, page_id: str) -> tuple[str, int] | None:
-        if (
-            self._fts is None
-            or not self._table_exists(self._fts, "page_meta")
-            or "template_attachment_id_and_page_no"
-            not in text_index.table_columns(self._fts, "page_meta")
-        ):
-            return None
-        row = self._fts.execute(
-            "SELECT template_attachment_id_and_page_no FROM page_meta WHERE page_id = ?",
-            (page_id,),
-        ).fetchone()
-        if row is None or not row[0]:
-            return None
-        attachment_id, separator, page_text = row[0].rpartition("_")
-        if not separator:
-            return None
+    @contextmanager
+    def _pdf_session(self) -> Generator[None, None, None]:
+        if self._pdf_documents is None:
+            self._pdf_documents = _PDFDocumentCache()
+        if self._pdf_attachment_resolution_cache is None:
+            self._pdf_attachment_resolution_cache = {}
+        yield
+
+    @contextmanager
+    def _pdf_document(self, path: Path) -> Generator[Any, None, None]:
+        if self._pdf_documents is not None:
+            yield self._pdf_documents.get(path)
+            return
+        document = _pymupdf().open(path)
         try:
-            page_number = int(page_text)
-        except (TypeError, ValueError):
-            return None
-        if page_number < 1:
-            return None
-        return attachment_id, page_number
+            yield document
+        finally:
+            document.close()
 
     def _read_pdf_text_for_page(
         self, page_ref: PageRef, budget: int | None
     ) -> tuple[list[TextPart], int | None, bool, bool, str | None]:
         """Read PDF index rows that match the projection-derived page identity."""
+        self._ensure_fts()
         if self._fts is None or not self._table_exists(self._fts, "pdf_text_content"):
             return [], budget, False, False, None
-        binding_result = text_index.pdf_page_bindings(self._fts, [page_ref])
+        binding_result = self._pdf_bindings_for([page_ref])
         if not binding_result["available"]:
             return (
                 [],
@@ -1585,63 +2121,127 @@ class Library:
             return [], budget, False, False, mapping_warning
 
         assert self._fts is not None
-        indexed_rows: list[sqlite3.Row] = []
+        parts: list[TextPart] = []
+        found = False
+
+        def validate_metadata(row: sqlite3.Row) -> tuple[int, int]:
+            text_id = row["text_id"]
+            if (
+                not isinstance(text_id, int)
+                or isinstance(text_id, bool)
+                or row["text_id_type"] != "integer"
+            ):
+                raise GoodnotesError(
+                    "Search index has an invalid `pdf_text_content.text_id`; expected an integer."
+                )
+            if row["text_type"] != "text":
+                raise GoodnotesError(
+                    "Search index has an invalid `pdf_text_content.text` value; expected text."
+                )
+            text_length = row["text_length"]
+            if not isinstance(text_length, int) or isinstance(text_length, bool) or text_length < 0:
+                raise GoodnotesError(
+                    "Search index has an invalid `pdf_text_content.text` length; "
+                    "expected a non-negative integer."
+                )
+            return text_id, text_length
+
         for batch in text_index.batches(text_ids):
             placeholders = ", ".join("?" for _ in batch)
-            indexed_rows.extend(
-                self._fts.execute(
+            if budget == 0:
+                row = self._fts.execute(
                     f"""
-                    SELECT text_id, length(text) AS text_length
+                    SELECT text_id, typeof(text_id) AS text_id_type,
+                           typeof(text) AS text_type, length(text) AS text_length
                     FROM pdf_text_content
                     WHERE text_id IN ({placeholders})
                       AND document_id = ? AND attachment_id = ? AND pdf_page_no = ?
                       AND COALESCE(text, '') <> ''
                     ORDER BY text_id
+                    LIMIT 1
                     """,
                     (*batch, page_ref.document_id, page_ref.attachment_id, page_ref.pdf_page_no),
-                ).fetchall()
+                ).fetchone()
+                if row is not None:
+                    validate_metadata(row)
+                    return parts, budget, True, True, mapping_warning
+                continue
+
+            rows = self._fts.execute(
+                f"""
+                WITH candidates AS (
+                    SELECT text_id, typeof(text_id) AS text_id_type,
+                           typeof(text) AS text_type, length(text) AS text_length,
+                           row_number() OVER (ORDER BY text_id) AS row_number,
+                           count(*) OVER () AS row_count,
+                           COALESCE(sum(length(text)) OVER (
+                               ORDER BY text_id
+                               ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                           ), 0) AS prior_length
+                    FROM pdf_text_content
+                    WHERE text_id IN ({placeholders})
+                      AND document_id = ? AND attachment_id = ? AND pdf_page_no = ?
+                      AND COALESCE(text, '') <> ''
+                )
+                SELECT candidates.*,
+                       CASE WHEN ? IS NULL THEN content.text
+                            ELSE substr(content.text, 1,
+                                min(candidates.text_length,
+                                    ? - candidates.prior_length + 1))
+                       END AS bounded_text,
+                       CASE WHEN ? IS NULL THEN 0
+                            ELSE instr(content.text, char(0))
+                       END AS contains_nul
+                FROM candidates
+                JOIN pdf_text_content AS content
+                  ON content.text_id = candidates.text_id
+                 AND content.document_id = ? AND content.attachment_id = ?
+                 AND content.pdf_page_no = ?
+                WHERE ? IS NULL OR candidates.prior_length < ?
+                ORDER BY candidates.text_id
+                """,
+                (
+                    *batch,
+                    page_ref.document_id,
+                    page_ref.attachment_id,
+                    page_ref.pdf_page_no,
+                    budget,
+                    budget,
+                    budget,
+                    page_ref.document_id,
+                    page_ref.attachment_id,
+                    page_ref.pdf_page_no,
+                    budget,
+                    budget,
+                ),
             )
-        parts: list[TextPart] = []
-        found = False
-        for row in indexed_rows:
-            found = True
-            if budget is not None and budget == 0:
-                return parts, budget, True, found, mapping_warning
-            if budget is None:
-                content = self._fts.execute(
-                    "SELECT text FROM pdf_text_content WHERE text_id = ? AND document_id = ? "
-                    "AND attachment_id = ? AND pdf_page_no = ?",
-                    (
-                        row["text_id"],
-                        page_ref.document_id,
-                        page_ref.attachment_id,
-                        page_ref.pdf_page_no,
-                    ),
-                ).fetchone()
-                text = content[0] if content is not None else ""
+            for row in rows:
+                found = True
+                _, text_length = validate_metadata(row)
+                if budget is not None and row["contains_nul"]:
+                    raise GoodnotesError(
+                        "Search index has embedded NUL in `pdf_text_content.text`; "
+                        "a bounded read cannot preserve this value."
+                    )
+                text = row["bounded_text"]
+                if not isinstance(text, str):
+                    raise GoodnotesError(
+                        "Search index has an invalid `pdf_text_content.text` value; expected text."
+                    )
+                available = budget
                 part_truncated = False
-            else:
-                content = self._fts.execute(
-                    "SELECT substr(text, 1, ?) FROM pdf_text_content WHERE text_id = ? "
-                    "AND document_id = ? AND attachment_id = ? AND pdf_page_no = ?",
-                    (
-                        budget + 1,
-                        row["text_id"],
-                        page_ref.document_id,
-                        page_ref.attachment_id,
-                        page_ref.pdf_page_no,
-                    ),
-                ).fetchone()
-                text = content[0] if content is not None else ""
-                part_truncated = int(row["text_length"] or 0) > budget or len(text) > budget
+                if available is not None:
+                    part_truncated = text_length > available or len(text) > available
+                    if part_truncated:
+                        text = text[:available]
+                if text:
+                    parts.append(TextPart(source="pdf", text=text, truncated=part_truncated))
+                if budget is not None:
+                    budget = max(0, budget - len(text))
                 if part_truncated:
-                    text = text[:budget]
-            if text:
-                parts.append(TextPart(source="pdf", text=text, truncated=part_truncated))
-            if budget is not None:
-                budget = max(0, budget - len(text))
-            if part_truncated:
-                return parts, budget, True, found, mapping_warning
+                    return parts, budget, True, found, mapping_warning
+                if budget == 0 and row["row_number"] < row["row_count"]:
+                    return parts, budget, True, found, mapping_warning
         return parts, budget, False, found, mapping_warning
 
     def _notebook_ids_under(self, parent_key: tuple[str, str] | None) -> set[str]:
@@ -1669,20 +2269,22 @@ class Library:
             for batch in text_index.id_batches(document_ids):
                 yield from self._search_rows(source, query, batch)
             return
-        if not document_ids or not text_index.page_meta_supports_search(self._fts):
+        if not document_ids or not text_index.page_meta_supports_search(
+            self._fts, schema=self._fts_schema
+        ):
             return
         if source not in {"handwriting", "textbox"}:
             return
-        table = _TEXT_TABLES[source][0]
+        table = text_index.TEXT_TABLES[source]
         if not self._table_exists(self._fts, table) or not {
             "page_id",
             "text_id",
             "text",
-        } <= text_index.table_columns(self._fts, table):
+        } <= self._table_columns(self._fts, table):
             return
         alias = "a" if source == "handwriting" else "t"
         scope = ", ".join("?" for _ in document_ids)
-        page_meta_columns = text_index.table_columns(self._fts, "page_meta")
+        page_meta_columns = self._table_columns(self._fts, "page_meta")
         mapping_filter = text_index.page_meta_live_filter(page_meta_columns, alias="p")
         yield from self._fts.execute(
             f"""
@@ -1691,18 +2293,49 @@ class Library:
             FROM {table} AS {alias}
             JOIN page_meta AS p ON p.page_id = {alias}.page_id
             WHERE p.document_id IN ({scope}) {mapping_filter}
-              AND instr(casefold({alias}.text), casefold(?)) > 0
+              AND instr(casefold({alias}.text), ?) > 0
             ORDER BY {alias}.text_id
             """,
             (*document_ids, query),
         )
 
     def _page_number_for_id(self, document_id: str, page_id: str) -> int | None:
+        self._ensure_page_numbers()
+        assert self._page_numbers is not None
         return self._page_numbers.get((document_id, page_id))
 
     def _page_numbers_by_id(self) -> dict[str, int]:
         """Return active page ids for checking page-index metadata consistency."""
+        self._ensure_page_numbers()
+        assert self._page_numbers is not None
         return {page_id: number for (_, page_id), number in self._page_numbers.items()}
+
+    def _ensure_page_numbers(self) -> None:
+        if self._page_numbers is not None:
+            return
+        assert self._projection is not None
+        page_numbers: dict[tuple[str, str], int] = {}
+        counts: dict[str, int] = {}
+        notebook_ids = self._active_items_by_kind("notebook")
+        for row in self._projection.execute(
+            """
+            SELECT id, document_id
+            FROM pages
+            WHERE COALESCE(deleted, 0) = 0
+            ORDER BY document_id, position, id
+            """
+        ):
+            page_id = self._required_text(row["id"], "pages.id")
+            document_id = self._required_text(row["document_id"], "pages.document_id")
+            if document_id not in notebook_ids:
+                continue
+            number = counts.get(document_id, 0) + 1
+            counts[document_id] = number
+            page_numbers[(document_id, page_id)] = number
+        self._page_numbers = page_numbers
+
+    def _active_items_by_kind(self, kind: str) -> set[str]:
+        return {item_id for item_kind, item_id in self._active_items if item_kind == kind}
 
     def _count(self, connection: sqlite3.Connection, table: str, where: str) -> int:
         if not self._table_exists(connection, table):

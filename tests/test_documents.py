@@ -7,13 +7,15 @@ import sqlite3
 import struct
 import zlib
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
+from uuid import uuid4
 
 import pymupdf as fitz
 import pytest
 
-from goodnotes_cli.documents import export_pdf, register_annotated_pdf, render_page
-from goodnotes_cli.errors import GoodnotesError
+import goodnotes_cli.documents as documents
+from goodnotes_cli.documents import export_pdf, register_annotated_pdf, render_page, render_pages
+from goodnotes_cli.errors import FilesystemAccessError, GoodnotesError
 from goodnotes_cli.models import Page
 from goodnotes_cli.safety import Sandbox
 
@@ -172,6 +174,62 @@ def test_export_orders_pages_and_uses_each_pages_attachment(tmp_path: Path) -> N
     assert result["warnings"]
 
 
+def test_missing_annotated_registration_does_not_create_sidecar(tmp_path: Path) -> None:
+    sandbox = FakeSandbox(tmp_path / "snapshot")
+    sandbox.add_notebook("generated-notebook", 1)
+    _make_pdf(sandbox.attachments_dir / "background.pdf", ["Generated background"])
+    page = _page("generated-page", 1, "background.pdf", document_id="generated-notebook")
+    before = {path.relative_to(tmp_path) for path in tmp_path.rglob("*")}
+    with pytest.raises(GoodnotesError, match="No annotated PDF is registered"):
+        render_page(sandbox, page, Path("missing.png"), layer="annotated")
+    assert {path.relative_to(tmp_path) for path in tmp_path.rglob("*")} == before
+
+
+def test_registry_stat_permission_failure_has_details(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from goodnotes_cli.documents import _read_registry
+
+    path = tmp_path / "denied.json"
+    original_lstat = Path.lstat
+
+    def denied(target: Path) -> os.stat_result:
+        if target == path:
+            raise PermissionError(13, "denied by generated fixture", str(target))
+        return original_lstat(target)
+
+    monkeypatch.setattr(Path, "lstat", denied)
+    with pytest.raises(FilesystemAccessError) as captured:
+        _read_registry(path, "generated-notebook")
+    assert captured.value.code == "source_permission_denied"
+    assert captured.value.details["operation"] == "read_annotated_pdf_record"
+    assert captured.value.details["path"] == str(path)
+
+
+def test_registry_parent_permission_failure_has_details(tmp_path: Path) -> None:
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        pytest.skip("A root process can traverse despite directory mode bits")
+    sandbox = FakeSandbox(tmp_path / "snapshot")
+    sandbox.add_notebook("generated-notebook", 1)
+    parent = tmp_path / ".goodnotes-cli"
+    parent.mkdir(mode=0o700)
+    parent.chmod(0)
+    try:
+        with pytest.raises(FilesystemAccessError) as captured:
+            render_page(
+                sandbox,
+                _page("generated-page", 1, None, document_id="generated-notebook"),
+                Path("denied.png"),
+                layer="annotated",
+            )
+    finally:
+        parent.chmod(0o700)
+    assert captured.value.code == "source_permission_denied"
+    assert captured.value.details["operation"] == "read_annotated_pdf_record"
+    assert Path(captured.value.details["path"]).is_relative_to(parent)
+    assert list(parent.iterdir()) == []
+
+
 def test_export_selects_reversed_noncontiguous_pages_from_mixed_attachments(
     tmp_path: Path,
 ) -> None:
@@ -260,7 +318,7 @@ def test_export_rejects_invalid_selection_without_creating_output(
 
 
 def test_export_deduplicates_repeated_image_streams_without_changing_pages(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     sandbox = FakeSandbox(tmp_path / "sandbox")
     page_count = 12
@@ -271,8 +329,19 @@ def test_export_deduplicates_repeated_image_streams_without_changing_pages(
         _page(f"page-{number}", number, "repeated-image.pdf") for number in range(1, page_count + 1)
     ]
 
+    source_opens = 0
+    original_open = documents.fitz.open
+
+    def tracked_open(*args: Any, **kwargs: Any) -> fitz.Document:
+        nonlocal source_opens
+        if args and Path(args[0]) == source:
+            source_opens += 1
+        return original_open(*args, **kwargs)
+
+    monkeypatch.setattr(documents.fitz, "open", tracked_open)
     result = export_pdf(sandbox, pages, Path("deduplicated.pdf"))
     exported_path = Path(str(result["path"]))
+    assert source_opens == 1
 
     baseline = fitz.open()
     try:
@@ -451,6 +520,409 @@ def test_render_page_checks_dpi_and_produces_png(tmp_path: Path) -> None:
         )
 
 
+def test_render_pages_reuses_background_pdf_and_preserves_pixels(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sandbox = FakeSandbox(tmp_path / "sandbox")
+    sandbox.add_notebook("notebook-1", 2)
+    source = sandbox.attachments_dir / "shared.pdf"
+    _make_pdf(source, ["background one", "background two"])
+    pages = [
+        _page("page-1", 1, "shared.pdf", pdf_page=1),
+        _page("page-2", 2, "shared.pdf", pdf_page=2),
+    ]
+
+    source_opens = 0
+    original_open = documents.fitz.open
+
+    def tracked_open(*args: Any, **kwargs: Any) -> fitz.Document:
+        nonlocal source_opens
+        if args and Path(args[0]) == source:
+            source_opens += 1
+        return original_open(*args, **kwargs)
+
+    monkeypatch.setattr(documents.fitz, "open", tracked_open)
+    results = render_pages(
+        sandbox,
+        pages,
+        [Path("page-one.png"), Path("page-two.png")],
+        dpi=72,
+    )
+
+    assert source_opens == 1
+    assert [result["page"] for result in results] == [1, 2]
+    with original_open(source) as source_doc:
+        expected = [source_doc[index].get_pixmap(dpi=72, alpha=False).samples for index in range(2)]
+    actual = []
+    for result in results:
+        with original_open(result["path"]) as rendered:
+            actual.append(rendered[0].get_pixmap(alpha=False).samples)
+    assert actual == expected
+
+
+def test_render_pages_verifies_registered_pdf_once_and_closes_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sandbox = FakeSandbox(tmp_path / "sandbox")
+    sandbox.add_notebook("notebook-1", 2)
+    source = tmp_path / "registered.pdf"
+    _make_pdf(source, ["registered one", "registered two"])
+    register_annotated_pdf(sandbox, "notebook-1", source, expected_pages=2)
+
+    hash_calls = 0
+    source_docs: list[fitz.Document] = []
+    original_hash = documents._sha256_stable
+    original_open = documents.fitz.open
+
+    def tracked_hash(path: Path) -> tuple[str, os.stat_result]:
+        nonlocal hash_calls
+        hash_calls += 1
+        return original_hash(path)
+
+    def tracked_open(*args: Any, **kwargs: Any) -> fitz.Document:
+        document = original_open(*args, **kwargs)
+        if args and Path(args[0]) == source:
+            source_docs.append(document)
+        return document
+
+    monkeypatch.setattr(documents, "_sha256_stable", tracked_hash)
+    monkeypatch.setattr(documents.fitz, "open", tracked_open)
+    results = render_pages(
+        sandbox,
+        [_page("page-1", 1, None), _page("page-2", 2, None)],
+        [Path("annotated-one.png"), Path("annotated-two.png")],
+        layer="annotated",
+        dpi=72,
+    )
+
+    assert len(results) == 2
+    assert hash_calls == 1
+    assert len(source_docs) == 1
+    assert source_docs[0].is_closed
+
+
+def test_annotated_render_failure_closes_registered_pdf(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sandbox = FakeSandbox(tmp_path / "sandbox")
+    sandbox.add_notebook("notebook-1", 2)
+    source = tmp_path / "registered.pdf"
+    _make_pdf(source, ["registered one", "registered two"])
+    register_annotated_pdf(sandbox, "notebook-1", source, expected_pages=2)
+
+    hash_calls = 0
+    source_docs: list[fitz.Document] = []
+    original_hash = documents._sha256_stable
+    original_open = documents.fitz.open
+
+    def tracked_hash(path: Path) -> tuple[str, os.stat_result]:
+        nonlocal hash_calls
+        hash_calls += 1
+        return original_hash(path)
+
+    def tracked_open(*args: Any, **kwargs: Any) -> fitz.Document:
+        document = original_open(*args, **kwargs)
+        if args and Path(args[0]) == source:
+            source_docs.append(document)
+        return document
+
+    monkeypatch.setattr(documents, "_sha256_stable", tracked_hash)
+    monkeypatch.setattr(documents.fitz, "open", tracked_open)
+    with pytest.raises(GoodnotesError, match="outside the registered PDF's 2 pages"):
+        render_pages(
+            sandbox,
+            [_page("page-1", 1, None), _page("page-3", 3, None)],
+            [Path("annotated-one.png"), Path("annotated-three.png")],
+            layer="annotated",
+            dpi=72,
+        )
+
+    assert hash_calls == 1
+    assert len(source_docs) == 1
+    assert source_docs[0].is_closed
+
+
+@pytest.mark.parametrize("mutation", ["mtime", "replacement"])
+def test_annotated_batch_detects_midbatch_mutation_without_rehashing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
+) -> None:
+    sandbox = FakeSandbox(tmp_path / "sandbox")
+    sandbox.add_notebook("notebook-1", 2)
+    source = tmp_path / "registered.pdf"
+    _make_pdf(source, ["registered one", "registered two"])
+    register_annotated_pdf(sandbox, "notebook-1", source, expected_pages=2)
+
+    hash_calls = 0
+    source_docs: list[fitz.Document] = []
+    original_hash = documents._sha256_stable
+    original_open = documents.fitz.open
+    original_publish = documents._publish_new_file
+
+    def tracked_hash(path: Path) -> tuple[str, os.stat_result]:
+        nonlocal hash_calls
+        hash_calls += 1
+        return original_hash(path)
+
+    def tracked_open(*args: Any, **kwargs: Any) -> fitz.Document:
+        document = original_open(*args, **kwargs)
+        if args and Path(args[0]) == source:
+            source_docs.append(document)
+        return document
+
+    def publish_then_mutate(destination: Path, writer: Any) -> None:
+        original_publish(destination, writer)
+        if destination.name != "annotated-one.png":
+            return
+        if mutation == "mtime":
+            current = source.stat()
+            os.utime(source, ns=(current.st_atime_ns, current.st_mtime_ns + 1_000_000))
+        else:
+            replacement = tmp_path / "replacement.pdf"
+            _make_pdf(replacement, ["replacement one", "replacement two"])
+            os.replace(replacement, source)
+
+    monkeypatch.setattr(documents, "_sha256_stable", tracked_hash)
+    monkeypatch.setattr(documents.fitz, "open", tracked_open)
+    monkeypatch.setattr(documents, "_publish_new_file", publish_then_mutate)
+    with pytest.raises(GoodnotesError, match="changed during this operation"):
+        render_pages(
+            sandbox,
+            [_page("page-1", 1, None), _page("page-2", 2, None)],
+            [Path("annotated-one.png"), Path("annotated-two.png")],
+            layer="annotated",
+            dpi=72,
+        )
+
+    assert hash_calls == 1
+    assert len(source_docs) == 1
+    assert source_docs[0].is_closed
+
+
+def test_render_pages_uses_one_native_store_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from goodnotes_cli.annotations import NativeOverlay
+
+    sandbox = FakeSandbox(tmp_path / "sandbox")
+    sandbox.add_notebook("notebook-1", 2)
+    _make_pdf(sandbox.attachments_dir / "background.pdf", ["one", "two"])
+    pages = [
+        Page(
+            id=str(uuid4()),
+            document_id="notebook-1",
+            number=number,
+            position=f"{number:02}",
+            attachment_path="attachments/background.pdf",
+            pdf_page=number,
+            width=612,
+            height=792,
+        )
+        for number in (1, 2)
+    ]
+    session_counts = {"opened": 0, "closed": 0, "reads": 0}
+
+    class FakeSession:
+        def __init__(self, _sandbox: Any) -> None:
+            session_counts["opened"] += 1
+
+        def __enter__(self) -> FakeSession:
+            return self
+
+        def __exit__(self, *_args: object) -> Literal[False]:
+            session_counts["closed"] += 1
+            return False
+
+        def read_page_records(self, _root_uuid: str) -> list[tuple[bytes, bytes]]:
+            session_counts["reads"] += 1
+            return []
+
+    def fake_render_native_overlay(
+        _sandbox: Any,
+        _page: Page,
+        *,
+        width_points: float,
+        height_points: float,
+        record_reader: Any,
+    ) -> NativeOverlay:
+        assert width_points == 612 and height_points == 792
+        record_reader("page-root")
+        return NativeOverlay(b"", {"rendered_strokes": 0, "warnings": []})
+
+    monkeypatch.setattr("goodnotes_cli.native.NativeStoreSession", FakeSession)
+    monkeypatch.setattr(
+        "goodnotes_cli.annotations.render_native_overlay", fake_render_native_overlay
+    )
+    results = render_pages(
+        sandbox,
+        pages,
+        [Path("native-one.png"), Path("native-two.png")],
+        layer="native",
+        dpi=72,
+    )
+
+    assert len(results) == 2
+    assert session_counts == {"opened": 1, "closed": 1, "reads": 2}
+
+
+def test_render_pages_closes_native_session_and_backgrounds_after_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from goodnotes_cli.annotations import NativeOverlay
+
+    sandbox = FakeSandbox(tmp_path / "sandbox")
+    sandbox.add_notebook("notebook-1", 2)
+    background = sandbox.attachments_dir / "background.pdf"
+    _make_pdf(background, ["one"])
+    pages = [
+        Page(
+            id=str(uuid4()),
+            document_id="notebook-1",
+            number=1,
+            position="01",
+            attachment_path="attachments/background.pdf",
+            pdf_page=1,
+            width=612,
+            height=792,
+        ),
+        Page(
+            id=str(uuid4()),
+            document_id="notebook-1",
+            number=2,
+            position="02",
+            attachment_path=None,
+            pdf_page=None,
+            width=612,
+            height=792,
+        ),
+    ]
+    session_counts = {"opened": 0, "closed": 0}
+
+    class FakeSession:
+        def __init__(self, _sandbox: Any) -> None:
+            session_counts["opened"] += 1
+
+        def __enter__(self) -> FakeSession:
+            return self
+
+        def __exit__(self, *_args: object) -> Literal[False]:
+            session_counts["closed"] += 1
+            return False
+
+        def read_page_records(self, _root_uuid: str) -> list[tuple[bytes, bytes]]:
+            return []
+
+    def fake_render_native_overlay(
+        _sandbox: Any,
+        _page: Page,
+        *,
+        width_points: float,
+        height_points: float,
+        record_reader: Any,
+    ) -> NativeOverlay:
+        return NativeOverlay(b"", {"rendered_strokes": 0, "warnings": []})
+
+    source_docs: list[fitz.Document] = []
+    original_open = documents.fitz.open
+
+    def tracked_open(*args: Any, **kwargs: Any) -> fitz.Document:
+        document = original_open(*args, **kwargs)
+        if args and Path(args[0]) == background:
+            source_docs.append(document)
+        return document
+
+    monkeypatch.setattr("goodnotes_cli.native.NativeStoreSession", FakeSession)
+    monkeypatch.setattr(
+        "goodnotes_cli.annotations.render_native_overlay", fake_render_native_overlay
+    )
+    monkeypatch.setattr(documents.fitz, "open", tracked_open)
+    with pytest.raises(GoodnotesError, match="no available background attachment"):
+        render_pages(
+            sandbox,
+            pages,
+            [Path("native-one.png"), Path("native-two.png")],
+            layer="native",
+            dpi=72,
+        )
+
+    assert session_counts == {"opened": 1, "closed": 1}
+    assert len(source_docs) == 1
+    assert source_docs[0].is_closed
+
+
+def test_native_pdf_export_uses_one_store_session_and_background_handle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from goodnotes_cli.annotations import NativeOverlay
+
+    sandbox = FakeSandbox(tmp_path / "sandbox")
+    sandbox.add_notebook("notebook-1", 2)
+    source = sandbox.attachments_dir / "background.pdf"
+    _make_pdf(source, ["native export one", "native export two"])
+    pages = [
+        Page(
+            id=str(uuid4()),
+            document_id="notebook-1",
+            number=number,
+            position=f"{number:02}",
+            attachment_path="attachments/background.pdf",
+            pdf_page=number,
+            width=612,
+            height=792,
+        )
+        for number in (1, 2)
+    ]
+    counts = {"opened": 0, "closed": 0, "reads": 0, "pdf_opens": 0}
+
+    class FakeSession:
+        def __init__(self, _sandbox: Any) -> None:
+            counts["opened"] += 1
+
+        def __enter__(self) -> FakeSession:
+            return self
+
+        def __exit__(self, *_args: object) -> Literal[False]:
+            counts["closed"] += 1
+            return False
+
+        def read_page_records(self, _root_uuid: str) -> list[tuple[bytes, bytes]]:
+            counts["reads"] += 1
+            return []
+
+    def fake_render_native_overlay(
+        _sandbox: Any,
+        _page: Page,
+        *,
+        width_points: float,
+        height_points: float,
+        record_reader: Any,
+    ) -> NativeOverlay:
+        record_reader("page-root")
+        return NativeOverlay(b"", {"rendered_strokes": 0, "warnings": []})
+
+    original_open = documents.fitz.open
+
+    def tracked_open(*args: Any, **kwargs: Any) -> fitz.Document:
+        if args and Path(args[0]) == source:
+            counts["pdf_opens"] += 1
+        return original_open(*args, **kwargs)
+
+    monkeypatch.setattr("goodnotes_cli.native.NativeStoreSession", FakeSession)
+    monkeypatch.setattr(
+        "goodnotes_cli.annotations.render_native_overlay", fake_render_native_overlay
+    )
+    monkeypatch.setattr(documents.fitz, "open", tracked_open)
+    result = export_pdf(sandbox, pages, Path("native-export.pdf"), layer="native")
+
+    assert result["includes_handwriting"] is False
+    assert counts == {"opened": 1, "closed": 1, "reads": 2, "pdf_opens": 1}
+    with original_open(result["path"]) as exported, original_open(source) as background:
+        assert exported.page_count == 2
+        assert [page.get_text() for page in exported] == [page.get_text() for page in background]
+        assert [page.get_pixmap(dpi=72, alpha=False).samples for page in exported] == [
+            page.get_pixmap(dpi=72, alpha=False).samples for page in background
+        ]
+
+
 def test_output_file_is_never_overwritten(tmp_path: Path) -> None:
     sandbox = FakeSandbox(tmp_path / "sandbox")
     sandbox.add_notebook("notebook-1", 1)
@@ -591,3 +1063,41 @@ def test_registered_pdf_integrity_detects_same_size_edit_with_restored_mtime(
             layer="annotated",
         )
     assert not (sandbox.outputs_dir / "changed.pdf").exists()
+
+
+def test_registered_pdf_is_hashed_before_pdf_parser_opens_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sandbox = FakeSandbox(tmp_path / "sandbox")
+    sandbox.add_notebook("notebook-1", 1)
+    source = tmp_path / "registered.pdf"
+    _make_pdf(source, ["registration order"])
+    events: list[str] = []
+    original_hash = documents._sha256_stable
+    original_open = documents.fitz.open
+
+    def tracked_hash(path: Path) -> tuple[str, os.stat_result]:
+        if path == source:
+            events.append("hash")
+        return original_hash(path)
+
+    def tracked_open(*args: Any, **kwargs: Any) -> fitz.Document:
+        if args and Path(args[0]) == source:
+            events.append("open")
+        return original_open(*args, **kwargs)
+
+    monkeypatch.setattr(documents, "_sha256_stable", tracked_hash)
+    monkeypatch.setattr(documents.fitz, "open", tracked_open)
+
+    register_annotated_pdf(sandbox, "notebook-1", source, expected_pages=1)
+
+    assert events == ["hash", "open"]
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO creation is not supported")
+def test_integrity_hash_does_not_block_on_fifo(tmp_path: Path) -> None:
+    fifo = tmp_path / "not-a-pdf.fifo"
+    os.mkfifo(fifo)
+
+    with pytest.raises(GoodnotesError, match="changed before its integrity check"):
+        documents._sha256_stable(fifo)

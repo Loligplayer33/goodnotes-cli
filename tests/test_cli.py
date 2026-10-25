@@ -1,7 +1,8 @@
-"""Subprocess tests of the installed agent command contract."""
+"""CLI contract tests; subprocesses cover behavior that needs process boundaries."""
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -14,9 +15,12 @@ from pathlib import Path
 
 import pymupdf
 import pytest
-from test_library import _create_snapshot
+from helpers import invoke_in_process
+from test_library import _add_repeated_fallback_pages, _create_snapshot
 
 import goodnotes_cli.cache as cache_module
+from goodnotes_cli.config import Settings
+from goodnotes_cli.errors import CacheAccessError
 
 
 @pytest.fixture
@@ -40,11 +44,15 @@ def invoke(
     *,
     sandbox: Path | None = None,
     data_dir: Path | None = None,
+    verbose: bool = True,
 ) -> subprocess.CompletedProcess[str]:
+    """Exercise the full response contract unless a test requests concise defaults."""
     environment = dict(os.environ)
     environment.pop("GOODNOTES_SANDBOX", None)
     environment["GOODNOTES_DATA_DIR"] = str(data_dir or tmp_path / "state")
     prefix = ["--sandbox", str(sandbox)] if sandbox is not None else []
+    if verbose:
+        prefix.append("--verbose")
     return subprocess.run(
         [sys.executable, "-m", "goodnotes_cli", *prefix, *arguments],
         capture_output=True,
@@ -60,6 +68,114 @@ def successful(result: subprocess.CompletedProcess[str]) -> dict:
     assert result.stderr == ""
     assert len(result.stdout.splitlines()) == 1
     return json.loads(result.stdout)
+
+
+def test_watch_runs_as_json_lines_and_leaves_unchanged_checks_quiet(
+    library_copy: Path, tmp_path: Path
+) -> None:
+    before = _tree_manifest(library_copy)
+    result = invoke(
+        [
+            "watch",
+            "--library",
+            str(library_copy / "Library"),
+            "--interval",
+            "0.05",
+            "--debounce",
+            "0",
+            "--iterations",
+            "3",
+        ],
+        tmp_path,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == ""
+    events = [json.loads(line) for line in result.stdout.splitlines()]
+    assert len(events) == 1
+    assert events[0]["event"] == "ready"
+    assert events[0]["iteration"] == 1
+    assert events[0]["captured_at"]
+    assert events[0]["capture_stats"]["source_captured_files"] > 0
+    assert _tree_manifest(library_copy) == before
+    assert len(list((tmp_path / "state" / "snapshots").glob("20*"))) == 1
+
+
+@pytest.mark.parametrize("command", ["sync", "watch"])
+def test_refresh_rejects_global_sandbox_instead_of_selecting_default_source(
+    command: str, library_copy: Path, tmp_path: Path
+) -> None:
+    response = invoke([command], tmp_path, sandbox=library_copy)
+    assert response.returncode == 1
+    assert response.stdout == ""
+    assert "omit the global --sandbox" in json.loads(response.stderr)["error"]["message"]
+    assert not (tmp_path / "state").exists()
+
+
+def test_doctor_access_only_reports_uninitialized_cache_without_creating_it(tmp_path: Path) -> None:
+    response = successful(invoke(["doctor", "--access-only"], tmp_path))
+    assert response["scope"] == "filesystem-access"
+    assert response["status"] == "issues"
+    assert not (tmp_path / "state").exists()
+
+
+def test_doctor_access_only_honors_explicit_sandbox(library_copy: Path, tmp_path: Path) -> None:
+    before = _tree_manifest(library_copy)
+    response = successful(invoke(["doctor", "--access-only"], tmp_path, sandbox=library_copy))
+    assert response["sandbox"] == str(library_copy)
+    assert response["cache_dir"] is None
+    assert not (tmp_path / "state").exists()
+    assert _tree_manifest(library_copy) == before
+
+
+def test_doctor_access_paths_require_access_only(tmp_path: Path) -> None:
+    response = invoke(["doctor", "--library", str(tmp_path / "source")], tmp_path)
+    assert response.returncode == 1
+    assert "require --access-only" in json.loads(response.stderr)["error"]["message"]
+
+
+def test_bounded_watch_ending_in_error_exits_unsuccessfully(tmp_path: Path) -> None:
+    response = invoke(
+        ["watch", "--library", str(tmp_path / "missing-source"), "--iterations", "1"],
+        tmp_path,
+    )
+    assert response.returncode == 1
+    assert response.stderr == ""
+    event = json.loads(response.stdout)
+    assert event["event"] == "error"
+    assert event["error"]["message"]
+
+
+def test_bundle_output_permission_error_retains_operation_and_path(
+    library_copy: Path, tmp_path: Path
+) -> None:
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        pytest.skip("A root process can write despite directory mode bits")
+    parent = tmp_path / "denied-output"
+    parent.mkdir(mode=0o700)
+    parent.chmod(0o500)
+    try:
+        response = invoke(
+            [
+                "bundle",
+                "doc-hostile",
+                "--layer",
+                "background",
+                "--source",
+                "all",
+                "--output",
+                str(parent / "bundle"),
+            ],
+            tmp_path,
+            sandbox=library_copy,
+        )
+    finally:
+        parent.chmod(0o700)
+    assert response.returncode == 1
+    error = json.loads(response.stderr)["error"]
+    assert error["code"] == "output_permission_denied"
+    assert error["details"]["operation"] == "write_bundle_output"
+    assert Path(error["details"]["path"]).is_relative_to(parent)
+    assert not list(parent.iterdir())
 
 
 def _tree_manifest(root: Path) -> tuple[tuple[object, ...], ...]:
@@ -133,20 +249,165 @@ def _restore_tree_writable(root: Path) -> None:
 
 
 def test_schema_needs_no_library(tmp_path: Path) -> None:
-    data = successful(invoke(["schema"], tmp_path))
+    data = successful(invoke_in_process(["schema"], tmp_path))
     assert data["page_numbers"] == "one-based"
     assert data["limits"]["read_pages"] == 20
 
 
 def test_schema_explains_field_projection_without_loading_notes(tmp_path: Path) -> None:
-    reading = successful(invoke(["schema", "read"], tmp_path))
+    reading = successful(invoke_in_process(["schema", "read"], tmp_path))
     assert reading["output"]["projection"] == "pages[]"
     assert "parts" in reading["output"]["fields"]
     assert "page_id" in reading["output"]["fields"]
-    pages = successful(invoke(["schema", "pages"], tmp_path))
+    pages = successful(invoke_in_process(["schema", "pages"], tmp_path))
     assert "number" in pages["output"]["fields"]
     assert "recognition" in pages["output"]["optional_fields"]
     assert not (tmp_path / "state").exists()
+
+
+def test_doctor_schema_documents_access_only_projection(tmp_path: Path) -> None:
+    data = successful(invoke_in_process(["schema", "doctor"], tmp_path))
+    output = data["output"]
+    assert "active_pages" in output["fields"]
+    assert "status" in output["optional_fields"]
+    assert "status" not in output["variants"]["default"]["fields"]
+    assert "status" in output["variants"]["access_only"]["fields"]
+    assert "active_pages" not in output["variants"]["access_only"]["fields"]
+
+
+def test_doctor_access_only_fields_are_preflighted_and_projected(tmp_path: Path) -> None:
+    invalid = invoke_in_process(["--fields", "status", "doctor"], tmp_path)
+    assert invalid.returncode == 1
+    assert "Unknown output fields: status" in json.loads(invalid.stderr)["error"]["message"]
+    assert not (tmp_path / "state").exists()
+
+    invalid_variant = invoke_in_process(
+        ["--fields", "active_pages", "doctor", "--access-only"], tmp_path
+    )
+    assert invalid_variant.returncode == 1
+    assert (
+        "Unknown output fields: active_pages"
+        in json.loads(invalid_variant.stderr)["error"]["message"]
+    )
+    assert not (tmp_path / "state").exists()
+
+    result = successful(
+        invoke_in_process(["--fields", "status,checks", "doctor", "--access-only"], tmp_path)
+    )
+    assert result["status"] == "issues"
+    assert isinstance(result["checks"], list)
+    assert not (tmp_path / "state").exists()
+
+
+def test_cli_module_import_does_not_load_pymupdf(tmp_path: Path) -> None:
+    command = [
+        sys.executable,
+        "-c",
+        "import sys; import goodnotes_cli.cli; assert 'pymupdf' not in sys.modules",
+    ]
+    result = subprocess.run(
+        command,
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_main_fallback_preserves_structured_error_details(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from goodnotes_cli import cli
+
+    def fail(*args: object, **kwargs: object) -> None:
+        raise CacheAccessError(
+            "cache_invalid",
+            "Malformed selected cache.",
+            operation="read_test_snapshot",
+            path="/synthetic/cache",
+        )
+
+    from goodnotes_cli.errors import CacheAccessError
+
+    monkeypatch.setattr(cli, "app", fail)
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main()
+
+    assert exit_info.value.code == 1
+    error = json.loads(capsys.readouterr().err)["error"]
+    assert error["code"] == "cache_invalid"
+    assert error["details"]["operation"] == "read_test_snapshot"
+    assert error["details"]["path"] == "/synthetic/cache"
+
+
+def test_main_keeps_broken_pipe_exit_code(monkeypatch: pytest.MonkeyPatch) -> None:
+    from goodnotes_cli import cli
+
+    def fail(*args: object, **kwargs: object) -> None:
+        raise BrokenPipeError
+
+    monkeypatch.setattr(cli, "app", fail)
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main()
+    assert exit_info.value.code == 130
+
+
+def test_command_broken_pipe_reaches_process_exit_handling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from goodnotes_cli import cli
+
+    def fail(*args: object, **kwargs: object) -> None:
+        raise BrokenPipeError
+
+    monkeypatch.setattr(cli, "emit", fail)
+    monkeypatch.setattr(sys, "argv", ["goodnotes", "schema"])
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main()
+    assert exit_info.value.code == 130
+
+
+def test_repository_query_sqlite_failure_is_structured_as_cache_error(
+    library_copy: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from goodnotes_cli.library import Library
+
+    def fail(*args: object, **kwargs: object) -> None:
+        raise sqlite3.OperationalError("synthetic query failure")
+
+    monkeypatch.setattr(Library, "list_items", fail)
+    result = invoke_in_process(["ls"], tmp_path, sandbox=library_copy)
+
+    assert result.returncode == 1
+    error = json.loads(result.stderr)["error"]
+    assert error["code"] == "cache_invalid"
+    assert error["details"]["operation"] == "query_snapshot_library"
+    assert error["details"]["path"] == str(library_copy)
+    assert error["details"]["remedy"]
+
+
+def test_document_sqlite_failure_is_not_classified_as_cache_access(
+    library_copy: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from goodnotes_cli import documents
+
+    def fail(*args: object, **kwargs: object) -> None:
+        raise sqlite3.OperationalError("synthetic document failure")
+
+    monkeypatch.setattr(documents, "export_pdf", fail)
+    result = invoke_in_process(
+        ["export", "doc-hostile", "--output", str(tmp_path / "output.pdf")],
+        tmp_path,
+        sandbox=library_copy,
+    )
+
+    assert result.returncode == 1
+    error = json.loads(result.stderr)["error"]
+    assert error["code"] == "operation_failed"
+    assert "details" not in error
 
 
 def test_field_errors_show_the_projection_level_and_valid_keys(
@@ -246,7 +507,16 @@ def test_top_level_writers_can_project_snapshot(
     elif writer == "attach-pdf":
         arguments = ["attach-pdf", "doc-hostile", str(annotated_pdf)]
     else:
-        arguments = ["bundle", "doc-hostile", "--output", str(tmp_path / "bundle")]
+        arguments = [
+            "bundle",
+            "doc-hostile",
+            "--layer",
+            "background",
+            "--source",
+            "all",
+            "--output",
+            str(tmp_path / "bundle"),
+        ]
 
     data = successful(invoke(["--fields", "snapshot", *arguments], tmp_path, sandbox=library_copy))
 
@@ -469,7 +739,7 @@ def test_schema_covers_every_registered_command(tmp_path: Path) -> None:
 
     from goodnotes_cli.cli import app
 
-    data = successful(invoke(["schema"], tmp_path))
+    data = successful(invoke_in_process(["schema"], tmp_path))
     group = get_command(app)
     assert isinstance(group, TyperGroup)
     assert set(data["commands"]) == set(group.commands)
@@ -499,29 +769,29 @@ def test_schema_covers_every_registered_command(tmp_path: Path) -> None:
     ],
 )
 def test_targeted_schema_and_help_need_no_library(command_name: str, tmp_path: Path) -> None:
-    data = successful(invoke(["schema", command_name], tmp_path))
+    data = successful(invoke_in_process(["schema", command_name], tmp_path))
     assert data["command"] == command_name
     assert any("--help" in p["flags"] for p in data["options"])
     assert any(p.get("envvar") == "GOODNOTES_DATA_DIR" for p in data["global_options"])
-    help_result = invoke([command_name, "--help"], tmp_path)
+    help_result = invoke_in_process([command_name, "--help"], tmp_path)
     assert help_result.returncode == 0
     assert "Example:" in help_result.stdout
     assert not (tmp_path / "state").exists()
 
 
 def test_targeted_schema_describes_actual_bounds_and_parameter_kinds(tmp_path: Path) -> None:
-    read = successful(invoke(["schema", "read"], tmp_path))
+    read = successful(invoke_in_process(["schema", "read"], tmp_path))
     budget = next(p for p in read["options"] if p["name"] == "max_chars")
     assert (budget["default"], budget["min"], budget["max"]) == (12000, 1, 1000000)
     assert read["arguments"][0]["name"] == "notebook"
-    listing = successful(invoke(["schema", "ls"], tmp_path))
+    listing = successful(invoke_in_process(["schema", "ls"], tmp_path))
     assert listing["arguments"] == []
     folder = next(p for p in listing["options"] if p["name"] == "folder")
     assert folder["flags"] == ["--folder"]
     assert folder["default"] == "/"
-    capture = successful(invoke(["schema", "snapshot"], tmp_path))
+    capture = successful(invoke_in_process(["schema", "snapshot"], tmp_path))
     assert [p["name"] for p in capture["arguments"]] == ["library", "destination"]
-    sync = successful(invoke(["schema", "sync"], tmp_path))
+    sync = successful(invoke_in_process(["schema", "sync"], tmp_path))
     force = next(p for p in sync["options"] if p["name"] == "force")
     assert force["flags"] == ["--force", "--no-force"]
 
@@ -619,12 +889,45 @@ def test_symlink_loop_in_managed_snapshot_pointer_returns_structured_error(
     error = json.loads(result.stderr)["error"]
     assert error["code"] == "cache_invalid"
     assert error["details"]["operation"] == "resolve_read_view"
-    expected_path = _resolution_error_path(pointer_target, runtime_fallback=state)
-    assert error["details"]["path"] == str(expected_path)
+    assert error["details"]["path"] == str(state)
     assert error["details"]["remedy"]
     assert pointer.read_bytes() == pointer_before
     assert _top_level_manifest(snapshots) == entries_before
     assert _tree_manifest(library_copy) == source_before
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_path"),
+    [("runtime", "state"), ("symlink_loop", "failure")],
+)
+def test_read_view_wraps_runtime_and_os_symlink_resolution_errors(
+    library_copy: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+    expected_path: str,
+) -> None:
+    state = tmp_path / "state"
+    cache_module.refresh_cache(library_copy / "Library", state)
+    failed_path = state / "snapshots" / "cycle-a"
+
+    def fail_snapshot_resolution(_settings: Settings) -> None:
+        if failure == "runtime":
+            raise RuntimeError("synthetic symlink resolution loop")
+        raise OSError(errno.ELOOP, "Too many levels of symbolic links", str(failed_path))
+
+    monkeypatch.setattr(Settings, "load_sandbox", fail_snapshot_resolution)
+    settings = Settings(data_dir=state)
+
+    with pytest.raises(CacheAccessError) as raised:
+        with cache_module.read_view(settings):
+            pytest.fail("the read view should reject the synthetic resolution failure")
+
+    error = raised.value
+    assert error.code == "cache_invalid"
+    assert error.details["operation"] == "resolve_read_view"
+    assert error.details["path"] == str(state if expected_path == "state" else failed_path)
+    assert error.details["remedy"]
 
 
 @pytest.mark.parametrize("arguments", [["read"], ["ls", "--limit", "0"], ["unknown"]])
@@ -667,6 +970,33 @@ def test_read_reports_budget_and_preserves_handwriting(library_copy: Path, tmp_p
     assert any("|" in part["text"] for part in raw["pages"][0]["parts"])
 
 
+def test_read_reuses_one_pdf_document_across_selected_pages(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sandbox = _create_snapshot(tmp_path / "snapshot", with_fts=False)
+    _add_repeated_fallback_pages(sandbox, 3)
+    actual_open = pymupdf.open
+    opened: list[pymupdf.Document] = []
+
+    def record_pdf_open(path: str | Path) -> pymupdf.Document:
+        document = actual_open(path)
+        opened.append(document)
+        return document
+
+    monkeypatch.setattr(pymupdf, "open", record_pdf_open)
+    result = successful(
+        invoke_in_process(
+            ["read", "doc-hostile", "--pages", "4-6", "--source", "pdf"],
+            tmp_path,
+            sandbox=sandbox.root,
+        )
+    )
+
+    assert len(result["pages"]) == 3
+    assert len(opened) == 1
+    assert opened[0].is_closed
+
+
 @pytest.mark.parametrize("expression", ["0", "1-30", "2-1", "1,1", "1,,2"])
 def test_bad_page_ranges_fail(library_copy: Path, tmp_path: Path, expression: str) -> None:
     result = invoke(["read", "doc-hostile", "--pages", expression], tmp_path, sandbox=library_copy)
@@ -687,7 +1017,18 @@ def test_background_render_and_bundle(library_copy: Path, tmp_path: Path) -> Non
     assert image.width > 0
     bundle = successful(
         invoke(
-            ["bundle", "doc-hostile", "--pages", "1-2", "--output", str(tmp_path / "bundle")],
+            [
+                "bundle",
+                "doc-hostile",
+                "--pages",
+                "1-2",
+                "--layer",
+                "background",
+                "--source",
+                "all",
+                "--output",
+                str(tmp_path / "bundle"),
+            ],
             tmp_path,
             sandbox=library_copy,
         )
@@ -890,6 +1231,10 @@ def test_bundle_budget_and_published_paths(library_copy: Path, tmp_path: Path) -
                 "1-2",
                 "--max-chars",
                 "5",
+                "--layer",
+                "background",
+                "--source",
+                "all",
                 "--output",
                 str(tmp_path / "limited"),
             ],
@@ -932,6 +1277,10 @@ def test_bundle_projects_top_level_fields_with_numeric_pages(
                 "pages,manifest",
                 "bundle",
                 "doc-hostile",
+                "--layer",
+                "background",
+                "--source",
+                "all",
                 "--pages",
                 "1-2",
                 "--output",
