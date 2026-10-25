@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -18,6 +19,8 @@ from helpers import invoke_in_process
 from test_library import _add_repeated_fallback_pages, _create_snapshot
 
 import goodnotes_cli.cache as cache_module
+from goodnotes_cli.config import Settings
+from goodnotes_cli.errors import CacheAccessError
 
 
 @pytest.fixture
@@ -886,12 +889,45 @@ def test_symlink_loop_in_managed_snapshot_pointer_returns_structured_error(
     error = json.loads(result.stderr)["error"]
     assert error["code"] == "cache_invalid"
     assert error["details"]["operation"] == "resolve_read_view"
-    expected_path = _resolution_error_path(pointer_target, runtime_fallback=state)
-    assert error["details"]["path"] == str(expected_path)
+    assert error["details"]["path"] == str(state)
     assert error["details"]["remedy"]
     assert pointer.read_bytes() == pointer_before
     assert _top_level_manifest(snapshots) == entries_before
     assert _tree_manifest(library_copy) == source_before
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_path"),
+    [("runtime", "state"), ("symlink_loop", "failure")],
+)
+def test_read_view_wraps_runtime_and_os_symlink_resolution_errors(
+    library_copy: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+    expected_path: str,
+) -> None:
+    state = tmp_path / "state"
+    cache_module.refresh_cache(library_copy / "Library", state)
+    failed_path = state / "snapshots" / "cycle-a"
+
+    def fail_snapshot_resolution(_settings: Settings) -> None:
+        if failure == "runtime":
+            raise RuntimeError("synthetic symlink resolution loop")
+        raise OSError(errno.ELOOP, "Too many levels of symbolic links", str(failed_path))
+
+    monkeypatch.setattr(Settings, "load_sandbox", fail_snapshot_resolution)
+    settings = Settings(data_dir=state)
+
+    with pytest.raises(CacheAccessError) as raised:
+        with cache_module.read_view(settings):
+            pytest.fail("the read view should reject the synthetic resolution failure")
+
+    error = raised.value
+    assert error.code == "cache_invalid"
+    assert error.details["operation"] == "resolve_read_view"
+    assert error.details["path"] == str(state if expected_path == "state" else failed_path)
+    assert error.details["remedy"]
 
 
 @pytest.mark.parametrize("arguments", [["read"], ["ls", "--limit", "0"], ["unknown"]])

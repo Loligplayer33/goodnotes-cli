@@ -192,18 +192,45 @@ def test_changed_sqlite_family_reuses_unchanged_source_member_digest(
     assert snapshot_module._stat_key(database.lstat()) == main_key
     original_hash = snapshot_module._hash_file
     hashed: list[Path] = []
+    original_copy = snapshot_module._copy_regular_file
+    copied_inputs: list[tuple[Path, bool, bool, int]] = []
 
     def record_hash(path: Path) -> tuple[tuple[int, int, int, int, int, int], int, str]:
         hashed.append(path)
         return original_hash(path)
 
+    def record_copy(source_path: Path, destination_path: Path, expected: Any) -> bool:
+        cloned = original_copy(source_path, destination_path, expected)
+        copied_inputs.append((source_path, expected.reused, cloned, expected.size))
+        return cloned
+
     monkeypatch.setattr(snapshot_module, "_hash_file", record_hash)
+    monkeypatch.setattr(snapshot_module, "_clone_file_from_fd", lambda *_args: False)
+    monkeypatch.setattr(snapshot_module, "_copy_regular_file", record_copy)
     second = create_snapshot(source, tmp_path / "second", previous_snapshot=first)
     stats = marker_data(second)["capture_stats"]
 
-    assert database not in hashed
+    source_hashes = [path for path in hashed if source in path.parents]
+    wal = Path(f"{database}-wal")
+    assert database not in source_hashes
+    assert wal in source_hashes
     assert any(second / "Library" in path.parents for path in hashed)
-    assert stats["source_bytes_hashed"] < stats["source_captured_bytes"]
+    assert stats["byte_copied_files"] == stats["total_files"]
+    assert stats["cloned_files"] == 0
+    source_digest_bytes = sum(path.stat().st_size for path in source_hashes)
+    source_copy_digest_bytes = sum(
+        size
+        for path, reused, cloned, size in copied_inputs
+        if source in path.parents and not reused and not cloned
+    )
+    assert stats["source_bytes_hashed"] == source_digest_bytes + source_copy_digest_bytes
+    assert any(
+        path == database and not reused and not cloned
+        for path, reused, cloned, _size in copied_inputs
+    )
+    assert any(
+        path == wal and not reused and not cloned for path, reused, cloned, _size in copied_inputs
+    )
     with open_database(second / "Library/Databases/projection.sqlite") as reader:
         assert reader.execute("SELECT name FROM item").fetchone()[0] == "second WAL state"
     writer.close()
