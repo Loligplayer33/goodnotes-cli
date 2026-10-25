@@ -5,7 +5,7 @@ import os
 import sqlite3
 import subprocess
 import sys
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import closing
 from pathlib import Path
 from typing import Any
@@ -463,7 +463,9 @@ def test_incremental_cached_file_replaced_after_planning_retries_using_source(
     calls = 0
 
     def replace_then_copy(
-        library: Path, destination: Path, entries: list[object]
+        library: Path,
+        destination: Path,
+        entries: Iterable[snapshot_module._Entry],
     ) -> dict[str, int]:
         nonlocal calls
         calls += 1
@@ -471,7 +473,7 @@ def test_incremental_cached_file_replaced_after_planning_retries_using_source(
             cached.chmod(0o644)
             cached.write_bytes(b"tampered previous cache")
             cached.chmod(0o444)
-        return original_copy(library, destination, entries)  # type: ignore[arg-type]
+        return original_copy(library, destination, entries)
 
     monkeypatch.setattr(snapshot_module, "_copy_snapshot_tree", replace_then_copy)
     second = create_snapshot(source, tmp_path / "second", previous_snapshot=first)
@@ -492,9 +494,13 @@ def test_native_source_changes_during_every_attempt_clean_incomplete_output(
     original_copy = snapshot_module._copy_snapshot_tree
     calls = 0
 
-    def copy_then_append(library: Path, destination: Path, entries: list[object]) -> dict[str, int]:
+    def copy_then_append(
+        library: Path,
+        destination: Path,
+        entries: Iterable[snapshot_module._Entry],
+    ) -> dict[str, int]:
         nonlocal calls
-        result = original_copy(library, destination, entries)  # type: ignore[arg-type]
+        result = original_copy(library, destination, entries)
         calls += 1
         with wal.open("ab") as stream:
             stream.write(b"new generated wal transaction")
@@ -1059,9 +1065,13 @@ def test_snapshot_retries_after_a_source_change(
     original_copy = snapshot_module._copy_snapshot_tree
     calls = 0
 
-    def copy_then_change(source: Path, destination: Path, entries: list[object]) -> dict[str, int]:
+    def copy_then_change(
+        source: Path,
+        destination: Path,
+        entries: Iterable[snapshot_module._Entry],
+    ) -> dict[str, int]:
         nonlocal calls
-        metrics = original_copy(source, destination, entries)  # type: ignore[arg-type]
+        metrics = original_copy(source, destination, entries)
         calls += 1
         if calls == 1:
             attachment.write_bytes(b"changed during first copy")
@@ -1091,9 +1101,9 @@ def test_snapshot_fails_during_active_wal_writes_without_locking_source(
     original_copy_file = snapshot_module._copy_regular_file
     copy_mutations = 0
 
-    def copy_then_write(source: Path, destination: Path, expected: object) -> bool:
+    def copy_then_write(source: Path, destination: Path, expected: snapshot_module._Entry) -> bool:
         nonlocal copy_mutations
-        cloned = original_copy_file(source, destination, expected)  # type: ignore[arg-type]
+        cloned = original_copy_file(source, destination, expected)
         if source.name == "projection.sqlite":
             copy_mutations += 1
             writer.execute("INSERT INTO item VALUES (?)", (f"during copy {copy_mutations}",))

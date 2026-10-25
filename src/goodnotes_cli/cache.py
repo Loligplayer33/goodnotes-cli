@@ -8,7 +8,7 @@ import json
 import os
 import re
 import stat
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -203,7 +203,7 @@ def _verify_lock_path(path: Path, opened: os.stat_result, *, operation: str) -> 
 
 
 @contextmanager
-def _file_lock(path: Path, *, exclusive: bool, create: bool = True) -> Iterator[None]:
+def _file_lock(path: Path, *, exclusive: bool, create: bool = True) -> Generator[None, None, None]:
     """Lock a persistent CLI-owned file, optionally requiring an existing read-only open."""
 
     operation = (
@@ -1083,7 +1083,7 @@ def _read_cache_state(requested: Path) -> Path:
 
 
 @contextmanager
-def read_view(settings: Settings) -> Iterator[Sandbox]:
+def read_view(settings: Settings) -> Generator[Sandbox, None, None]:
     """Resolve one snapshot under a shared lock and keep it protected through the read."""
 
     settings.cache_dir = None

@@ -44,7 +44,7 @@ Run the checks relevant to the change:
 ```sh
 uv run pytest
 uv run ruff check .
-uv run mypy src/goodnotes_cli
+uv run ty check --error-on-warning src/goodnotes_cli tests
 ```
 
 For faster local test runs, use `uv run pytest -n 4` to distribute tests across
@@ -56,9 +56,9 @@ with `uv run pytest tests/test_decoder_properties.py`. Hypothesis stores local
 failure examples in the ignored `.hypothesis/` directory; preserve a discovered
 regression as an explicit generated example when fixing it.
 
-Run `uv run ty check src/goodnotes_cli tests` to compare diagnostics with mypy.
-Both type checkers are installed for development; mypy remains the required CI
-check while the existing ty diagnostics are evaluated.
+Ty is the required type checker for application code and tests. The required
+CI command treats warnings as failures so new and existing diagnostics remain
+visible during the migration.
 
 Tests must use generated fixtures. Before submitting, review the diff and `git status` for private data, generated output, and machine-specific paths.
 

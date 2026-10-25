@@ -7,11 +7,11 @@ import os
 import shutil
 import sqlite3
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import ExitStack, contextmanager
 from functools import wraps
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any, cast
+from typing import TYPE_CHECKING, Annotated, Any, TypedDict, cast
 
 import typer
 from typer.core import TyperGroup
@@ -42,7 +42,9 @@ from .snapshot import create_snapshot
 from .watch import watch_library
 
 if TYPE_CHECKING:
+    from .artifacts import ArtifactCache
     from .library import Library
+    from .models import Page
 
 ItemSelector = Annotated[
     str, typer.Argument(help="Exact UUID, full library path, or unique exact name.")
@@ -71,6 +73,13 @@ class AgentGroup(TyperGroup):
                 details=getattr(exc, "details", None),
             )
             raise SystemExit(1) from None
+
+
+class _BundlePage(TypedDict):
+    page: int
+    image: str
+    render: dict[str, Any]
+    text: dict[str, Any]
 
 
 app = typer.Typer(
@@ -171,7 +180,7 @@ def settings(ctx: typer.Context) -> Settings:
 
 
 @contextmanager
-def repository(ctx: typer.Context) -> Iterator[Library]:
+def repository(ctx: typer.Context) -> Generator[Library, None, None]:
     cfg = settings(ctx)
     with read_view(cfg) as sandbox:
         cfg.snapshot_id = sandbox.root.name
@@ -577,29 +586,38 @@ def export_notebook(
 def render(
     ctx: typer.Context,
     notebook: ItemSelector,
-    output: Annotated[Path, typer.Option(help="New PNG file to write.")],
+    output: Annotated[
+        Path | None, typer.Option(help="Save a persistent PNG outside the cache.")
+    ] = None,
     page: Annotated[int, typer.Option(min=1)] = 1,
     layer: str = "background",
     dpi: Annotated[int, typer.Option(min=72, max=300)] = 150,
 ) -> None:
-    """Render one page to a new PNG for visual inspection.
+    """Render one page to a temporary cached PNG, or save it with --output.
 
     --layer native reconstructs supported copied ink and reports coverage. Background
     omits native ink; annotated requires attach-pdf. Page numbers start at 1.
-    Existing outputs are never replaced.
+    Cached images expire after a day of inactivity and share a 100 MB limit.
+    Returned paths are protected for five minutes. Explicit outputs are never replaced.
 
     Example: goodnotes render "Course Notes" --page 3 --output /tmp/page-3.png
     """
 
     with repository(ctx) as lib:
-        from .documents import render_page
+        from .documents import cached_render_pages, render_page
 
         all_pages = repository_query(ctx, lib, lib.pages, notebook)
         number = select_pages(str(page), len(all_pages))[0]
-        emit(
-            render_page(lib.sandbox, all_pages[number - 1], output, layer=layer, dpi=dpi),
-            settings(ctx),
-        )
+        if output is None:
+            from .artifacts import ArtifactCache
+
+            with ArtifactCache(_artifact_directory(settings(ctx)), lib.sandbox.root) as cache:
+                result = cached_render_pages(
+                    lib.sandbox, [all_pages[number - 1]], cache, layer=layer, dpi=dpi
+                )[0]
+        else:
+            result = render_page(lib.sandbox, all_pages[number - 1], output, layer=layer, dpi=dpi)
+        emit(result, settings(ctx))
 
 
 @command("attach-pdf")
@@ -632,20 +650,24 @@ def attach_pdf(
 def bundle(
     ctx: typer.Context,
     notebook: ItemSelector,
-    output: Annotated[Path, typer.Option(help="New output directory.")],
+    output: Annotated[
+        Path | None, typer.Option(help="Save a persistent bundle outside the cache.")
+    ] = None,
     pages: str = "1",
     layer: str = "native",
     dpi: Annotated[int, typer.Option(min=72, max=300)] = 150,
     max_chars: Annotated[int, typer.Option(min=1, max=1000000)] = 12000,
     source: Annotated[str, typer.Option(help="pdf, all, handwriting, or textbox text.")] = "pdf",
 ) -> None:
-    """Save page images and source-labeled text.json in a new directory.
+    """Inspect pages using a temporary cached bundle, or save it with --output.
 
     Select up to 10 distinct pages with --pages, e.g. 1-3,7. One character budget
     covers all text. Defaults to native ink images and PDF text. Native reconstruction
     reports coverage; annotated requires attach-pdf. Text keeps its original source labels.
     --source filters returned text only; the image still uses the selected layer.
     Returns page evidence directly. Global --verbose includes full metadata.
+    Cached outputs share a 100 MB limit and expire after a day of inactivity.
+    Returned paths are protected for five minutes; explicit outputs remain until removed.
 
     Example: goodnotes bundle "Course Notes" --pages 1-3 --output /tmp/course-pages
     """
@@ -659,14 +681,34 @@ def bundle(
         sandbox = lib.sandbox
         all_pages = repository_query(ctx, lib, lib.pages, notebook)
         selected = select_pages(pages, len(all_pages), maximum=10)
+        if output is None:
+            from .artifacts import ArtifactCache
+
+            try:
+                with ArtifactCache(_artifact_directory(cfg), sandbox.root) as cache:
+                    response = _cached_bundle(
+                        ctx,
+                        lib,
+                        notebook,
+                        all_pages,
+                        selected,
+                        cache,
+                        layer,
+                        dpi,
+                        max_chars,
+                        source,
+                    )
+            except NativeError as exc:
+                _bundle_native_remedy(exc)
+                raise
+            emit(response, cfg)
+            return
         destination = sandbox.ensure_output(output)
         parent_existed = destination.parent.exists()
         temporary: Path | None = None
         try:
             destination.parent.mkdir(parents=True, exist_ok=True)
             temporary = Path(tempfile.mkdtemp(prefix=".goodnotes-bundle-", dir=destination.parent))
-            manifest = []
-            remaining = max_chars
             filenames = [f"page-{number:04d}.png" for number in selected]
             rendered_pages = render_pages(
                 sandbox,
@@ -675,35 +717,12 @@ def bundle(
                 layer=layer,
                 dpi=dpi,
             )
-            for number, filename, rendered in zip(selected, filenames, rendered_pages, strict=True):
-                page_data = repository_query(
-                    ctx,
-                    lib,
-                    lib.read_page,
-                    notebook,
-                    number,
-                    source=source,
-                    max_chars=remaining,
-                )
-                text = serializable(page_data)
-                remaining -= sum(len(part["text"]) for part in text["parts"])
-                manifest.append(
-                    {
-                        "page": number,
-                        "image": filename,
-                        "render": {**serializable(rendered), "path": str(destination / filename)},
-                        "text": text,
-                    }
-                )
-            truncated = bound_page_text([entry["text"] for entry in manifest], max_chars)
-            text_manifest = {
-                "snapshot": cfg.snapshot_id,
-                "captured_at": sandbox.captured_at,
-                "pages": manifest,
-                "truncated": truncated,
-                "text_source": source,
-            }
-            (temporary / "text.json").write_text(json.dumps(text_manifest, ensure_ascii=False))
+            manifest, truncated = _bundle_content(
+                ctx, lib, notebook, selected, rendered_pages, max_chars, source
+            )
+            for entry in manifest:
+                entry["render"]["path"] = str(destination / entry["image"])
+            _write_bundle_manifest(temporary, manifest, truncated, cfg, sandbox.captured_at, source)
             publish_bundle(temporary, destination)
         except BaseException as exc:
             if temporary is not None:
@@ -714,28 +733,137 @@ def bundle(
                 except OSError:
                     pass
             if isinstance(exc, NativeError):
-                exc.details["remedy"] = (
-                    f"{exc.details['remedy']} For page backgrounds without annotations, "
-                    "rerun bundle with --layer background."
-                )
+                _bundle_native_remedy(exc)
             if isinstance(exc, OSError):
                 raise FilesystemAccessError.from_exception(
                     exc, operation="write_bundle_output", path=destination, kind="output"
                 ) from exc
             raise
-        response: dict[str, Any] = {
-            "directory": destination,
-            "manifest": destination / "text.json",
-            "pages": selected,
-            "layer": layer,
-            "truncated": truncated,
-            "captured_at": sandbox.captured_at,
-            "text_source": source,
-        }
-        response["page_evidence"] = [
+        emit(_bundle_response(destination, manifest, selected, layer, truncated, source), cfg)
+
+
+def _artifact_directory(cfg: Settings) -> Path:
+    return Path(cfg.cache_dir or cfg.data_dir or default_data_dir()).expanduser() / "artifacts"
+
+
+def _bundle_native_remedy(exc: NativeError) -> None:
+    exc.details["remedy"] = (
+        f"{exc.details['remedy']} For page backgrounds without annotations, "
+        "rerun bundle with --layer background."
+    )
+
+
+def _bundle_content(
+    ctx: typer.Context,
+    lib: Library,
+    notebook: str,
+    selected: list[int],
+    rendered_pages: list[dict[str, object]],
+    max_chars: int,
+    source: str,
+) -> tuple[list[_BundlePage], bool]:
+    manifest: list[_BundlePage] = []
+    remaining = max_chars
+    for number, rendered in zip(selected, rendered_pages, strict=True):
+        page_data = repository_query(
+            ctx, lib, lib.read_page, notebook, number, source=source, max_chars=remaining
+        )
+        text = serializable(page_data)
+        remaining -= sum(len(part["text"]) for part in text["parts"])
+        manifest.append(
+            {
+                "page": number,
+                "image": f"page-{number:04d}.png",
+                "render": dict(rendered),
+                "text": text,
+            }
+        )
+    return manifest, bound_page_text([entry["text"] for entry in manifest], max_chars)
+
+
+def _write_bundle_manifest(
+    temporary: Path,
+    manifest: list[_BundlePage],
+    truncated: bool,
+    cfg: Settings,
+    captured_at: str | None,
+    source: str,
+) -> None:
+    content = {
+        "snapshot": cfg.snapshot_id,
+        "captured_at": captured_at,
+        "pages": manifest,
+        "truncated": truncated,
+        "text_source": source,
+    }
+    (temporary / "text.json").write_text(json.dumps(content, ensure_ascii=False))
+
+
+def _bundle_response(
+    destination: Path,
+    manifest: list[_BundlePage],
+    selected: list[int],
+    layer: str,
+    truncated: bool,
+    source: str,
+) -> dict[str, Any]:
+    return {
+        "directory": str(destination),
+        "manifest": str(destination / "text.json"),
+        "pages": selected,
+        "layer": layer,
+        "truncated": truncated,
+        "captured_at": next(iter(manifest))["render"].get("captured_at"),
+        "text_source": source,
+        "page_evidence": [
             {**entry, "image": str(destination / entry["image"])} for entry in manifest
-        ]
-        emit(response, cfg)
+        ],
+    }
+
+
+def _cached_bundle(
+    ctx: typer.Context,
+    lib: Library,
+    notebook: str,
+    all_pages: list[Page],
+    selected: list[int],
+    cache: ArtifactCache,
+    layer: str,
+    dpi: int,
+    max_chars: int,
+    source: str,
+) -> dict[str, Any]:
+    from .artifacts import artifact_key
+    from .documents import cached_render_pages
+
+    cfg = settings(ctx)
+    rendered = cached_render_pages(
+        lib.sandbox, [all_pages[number - 1] for number in selected], cache, layer=layer, dpi=dpi
+    )
+    # Text always comes from this request's pinned read view, including on image hits.
+    manifest, truncated = _bundle_content(ctx, lib, notebook, selected, rendered, max_chars, source)
+    key = artifact_key(
+        {
+            "bundle": 1,
+            "snapshot": cfg.snapshot_id,
+            "captured_at": lib.sandbox.captured_at,
+            "pages": manifest,
+            "source": source,
+        }
+    )
+    destination = cache.destination(key)
+    for entry in manifest:
+        entry["render"]["path"] = str(destination / entry["image"])
+    response = _bundle_response(destination, manifest, selected, layer, truncated, source)
+    response["temporary"] = True
+    if cache.lookup(key) is not None:
+        return response
+    with cache.staging() as temporary:
+        for entry, image in zip(manifest, rendered, strict=True):
+            os.link(Path(str(image["path"])), temporary / entry["image"], follow_symlinks=False)
+        _write_bundle_manifest(temporary, manifest, truncated, cfg, lib.sandbox.captured_at, source)
+        cache.publish(key, temporary, {"kind": "bundle"})
+    return response
 
 
 def publish_bundle(temporary: Path, destination: Path) -> None:
@@ -888,10 +1016,10 @@ def schema(
                 "export": (
                     "NOTEBOOK --output FILE [--pages 1-3,7 --layer background|native|annotated]"
                 ),
-                "render": "NOTEBOOK --output PNG [--page N --layer LAYER --dpi N]",
+                "render": "NOTEBOOK [--output PNG --page N --layer LAYER --dpi N]",
                 "bundle": (
-                    "NOTEBOOK --output DIR "
-                    "[--pages 1-3 --layer LAYER --dpi N --max-chars N --source SOURCE]"
+                    "NOTEBOOK [--output DIR --pages 1-3 --layer LAYER --dpi N "
+                    "--max-chars N --source SOURCE]"
                 ),
                 "attach-pdf": "NOTEBOOK PDF",
                 "doctor": "[--access-only --library PATH --scratch-dir PATH --output-dir PATH]",

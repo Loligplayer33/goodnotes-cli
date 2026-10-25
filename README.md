@@ -79,10 +79,12 @@ After sync, browse and read commands need only read access to the cache. An agen
 For recent notes, have the agent sync once at the start of each request. Once [native rendering is set up](docs/pdf-and-handwriting.md#native-ink-without-manual-pdf-exports), one bundle provides actual pen annotations and slide text:
 
 ```sh
-uv run goodnotes bundle "Notebook name" --pages 3 --output /tmp/study-page-3
+uv run goodnotes bundle "Notebook name" --pages 3
 ```
 
-`uv run goodnotes watch` is optional for continuous refresh or for an agent with cache-only access. Both routes observe files already present on this Mac and cannot tell whether an iPad edit has arrived. Refreshes reuse verified unchanged files, and the managed cache retains one published generation after readers finish. Native rendering also needs writable temporary scratch and an output destination.
+`render` and `bundle` use a temporary artifact cache by default. Repeated requests reuse matching page renders; identical PNGs share storage. The cache retains up to 100 MB and expires entries after one day since their last CLI request. Cleanup runs on the next artifact operation and protects returned paths for five minutes. Add `--output` to save a persistent image or bundle instead. Explicitly saved files are never automatically removed.
+
+`uv run goodnotes watch` is optional for continuous refresh or for an agent with cache-only access. Both routes observe files already present on this Mac and cannot tell whether an iPad edit has arrived. Refreshes reuse verified unchanged files, and the managed cache retains one published generation after readers finish. Native rendering also needs writable temporary scratch. Managed visual requests need write access to the artifact directory; a reader with a read-only cache can provide `--output` in a writable location.
 
 Bundle holds one read view throughout. If later commands must match it, pin its returned `snapshot` with global `--expect-snapshot ID`.
 

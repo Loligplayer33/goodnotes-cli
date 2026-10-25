@@ -8,7 +8,7 @@ import math
 import shlex
 import sqlite3
 from collections import OrderedDict
-from collections.abc import Iterator
+from collections.abc import Generator, Iterator
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -2066,7 +2066,7 @@ class Library:
         return text, warning, truncated
 
     @contextmanager
-    def _pdf_session(self) -> Iterator[None]:
+    def _pdf_session(self) -> Generator[None, None, None]:
         if self._pdf_documents is None:
             self._pdf_documents = _PDFDocumentCache()
         if self._pdf_attachment_resolution_cache is None:
@@ -2074,7 +2074,7 @@ class Library:
         yield
 
     @contextmanager
-    def _pdf_document(self, path: Path) -> Iterator[Any]:
+    def _pdf_document(self, path: Path) -> Generator[Any, None, None]:
         if self._pdf_documents is not None:
             yield self._pdf_documents.get(path)
             return

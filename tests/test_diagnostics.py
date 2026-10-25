@@ -3,7 +3,9 @@ from __future__ import annotations
 import errno
 import os
 import sqlite3
+from collections.abc import Iterator
 from pathlib import Path
+from typing import Literal
 
 import pytest
 from test_cache import make_library
@@ -62,10 +64,16 @@ def test_source_permission_denial_reports_selected_path_and_remedy(
     target = source / "Databases" / "projection.sqlite"
     original_open = os.open
 
-    def denied_open(path: object, *args: object, **kwargs: object) -> int:
+    def denied_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
         if path == target:
             raise PermissionError(errno.EACCES, "generated source denial", str(target))
-        return original_open(path, *args, **kwargs)  # type: ignore[arg-type]
+        return original_open(path, flags, mode, dir_fd=dir_fd)
 
     monkeypatch.setattr(os, "open", denied_open)
     result = inspect_environment(tmp_path / "missing-cache", source)
@@ -89,10 +97,16 @@ def test_cache_lock_denial_is_reported_without_repair_or_lock_bypass(
     lock = state / ".view.lock"
     original_open = os.open
 
-    def denied_open(path: object, *args: object, **kwargs: object) -> int:
+    def denied_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
         if path == lock:
             raise PermissionError(errno.EPERM, "generated lock denial", str(lock))
-        return original_open(path, *args, **kwargs)  # type: ignore[arg-type]
+        return original_open(path, flags, mode, dir_fd=dir_fd)
 
     monkeypatch.setattr(os, "open", denied_open)
     result = inspect_environment(state)
@@ -115,10 +129,14 @@ def test_diagnostics_reject_symlinked_roots_without_traversing(
 
     original_scandir = os.scandir
 
-    def forbidden_scandir(path: object):
+    def forbidden_scandir(
+        path: str | os.PathLike[str] | None = None,
+    ) -> Iterator[os.DirEntry[str]]:
         if path == alias or path == destination:
             pytest.fail("a rejected symlink root must not be traversed")
-        return original_scandir(path)  # type: ignore[call-overload]
+        if path is None:
+            return original_scandir()
+        return original_scandir(path)
 
     monkeypatch.setattr(os, "scandir", forbidden_scandir)
     result = inspect_environment(
@@ -145,7 +163,9 @@ def test_diagnostics_reject_non_regular_active_pointer(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("kind", ["source", "output"])
-def test_filesystem_error_uses_chained_permission_path(kind: str) -> None:
+def test_filesystem_error_uses_chained_permission_path(
+    kind: Literal["source", "output"],
+) -> None:
     original = PermissionError(errno.EPERM, "generated denial", b"/generated/denied")
     wrapped = GoodnotesError("outer error")
     wrapped.__cause__ = original
@@ -212,10 +232,12 @@ def test_scratch_and_output_access_checks_do_not_create_probe_files(
     monkeypatch.setenv("GOODNOTES_SCRATCH_DIR", str(scratch))
     original_access = os.access
 
-    def denied_output(path: object, mode: int) -> bool:
+    def denied_output(
+        path: int | str | bytes | os.PathLike[str] | os.PathLike[bytes], mode: int
+    ) -> bool:
         if path == output:
             return False
-        return original_access(path, mode)  # type: ignore[arg-type]
+        return original_access(path, mode)
 
     monkeypatch.setattr(os, "access", denied_output)
     before_scratch, before_output = _tree_manifest(scratch), _tree_manifest(output)
@@ -244,10 +266,16 @@ def test_source_database_symlink_is_not_traversed(
     (source / "Databases").symlink_to(external, target_is_directory=True)
     original_open = os.open
 
-    def forbidden_external(path: object, *args: object, **kwargs: object) -> int:
+    def forbidden_external(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
         if path == source / "Databases" / "projection.sqlite":
             pytest.fail("a rejected source database directory must not be traversed")
-        return original_open(path, *args, **kwargs)  # type: ignore[arg-type]
+        return original_open(path, flags, mode, dir_fd=dir_fd)
 
     monkeypatch.setattr(os, "open", forbidden_external)
     result = inspect_environment(tmp_path / "missing-cache", source)

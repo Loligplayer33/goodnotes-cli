@@ -123,7 +123,7 @@ _PROJECTIONS: dict[str, _ProjectionSpec] = {
             "warnings",
             "snapshot",
         ),
-        optional_fields=("native_annotations", "captured_at"),
+        optional_fields=("native_annotations", "captured_at", "temporary"),
     ),
     "attach-pdf": _ProjectionSpec(
         ("document_id", "path", "pages", "registered", "warnings", "snapshot")
@@ -139,7 +139,7 @@ _PROJECTIONS: dict[str, _ProjectionSpec] = {
             "truncated",
             "snapshot",
         ),
-        optional_fields=("captured_at",),
+        optional_fields=("captured_at", "temporary"),
     ),
     "doctor": _ProjectionSpec(
         (
@@ -174,6 +174,7 @@ _PROJECTIONS: dict[str, _ProjectionSpec] = {
                     "library",
                     "scratch_dir",
                     "output_dir",
+                    "artifact_dir",
                     "status",
                     "checks",
                     "errors",

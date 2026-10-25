@@ -1,5 +1,4 @@
 # ruff: noqa
-# mypy: ignore-errors
 """Typed parser for Troy Hanson TPL memory images used by GoodNotes ink."""
 
 from __future__ import annotations
@@ -70,15 +69,28 @@ def _decode_fixed_array(
         return [row[0] for row in struct.iter_unpack("<" + formats, raw)]
     if len(children) == 1 and isinstance(children[0], tuple) and children[0][0] == "S":
         fields = children[0][1]
-        if fields and all(isinstance(child, str) and child in _FIXED_FORMATS for child in fields):
-            formats = "".join(_FIXED_FORMATS[child] for child in fields)
+        formats = _fixed_formats(fields) if fields else None
+        if formats is not None:
             raw = cursor.take(count * struct.calcsize("<" + formats))
             return [row for row in struct.iter_unpack("<" + formats, raw)]
-    if children and all(isinstance(child, str) and child in _FIXED_FORMATS for child in children):
-        formats = "".join(_FIXED_FORMATS[child] for child in children)
+    formats = _fixed_formats(children) if children else None
+    if formats is not None:
         raw = cursor.take(count * struct.calcsize("<" + formats))
         return [row for row in struct.iter_unpack("<" + formats, raw)]
     return None
+
+
+def _fixed_formats(children: tuple[_FormatNode, ...]) -> str | None:
+    """Return the struct format when every node is a fixed-width scalar."""
+    formats: list[str] = []
+    for child in children:
+        if not isinstance(child, str):
+            return None
+        format_code = _FIXED_FORMATS.get(child)
+        if format_code is None:
+            return None
+        formats.append(format_code)
+    return "".join(formats)
 
 
 def _parse_format(format_string: str) -> tuple[_FormatNode, ...]:

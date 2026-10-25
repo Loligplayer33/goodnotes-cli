@@ -7,7 +7,7 @@ import json
 import os
 import sqlite3
 import stat
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -425,7 +425,7 @@ def _check_database_read_access(path: Path) -> None:
 
 
 @contextmanager
-def open_database(path: str | Path) -> Iterator[sqlite3.Connection]:
+def open_database(path: str | Path) -> Generator[sqlite3.Connection, None, None]:
     """Open a snapshot SQLite file in immutable read-only mode."""
 
     try:

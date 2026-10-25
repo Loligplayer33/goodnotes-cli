@@ -10,17 +10,22 @@ import stat
 import tempfile
 import uuid
 from collections import OrderedDict
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from collections.abc import Callable, Generator
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePath
-from typing import Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
 
 import pymupdf as fitz
 
 from .errors import FilesystemAccessError, GoodnotesError
 from .models import Page
 from .safety import _require_not_production, open_database, resolve_confined_file, stat_key
+
+if TYPE_CHECKING:
+    from .artifacts import ArtifactCache
+
+_RENDER_CACHE_VERSION = 1
 
 
 class SandboxProtocol(Protocol):
@@ -353,6 +358,120 @@ def render_pages(
     )
 
 
+def cached_render_pages(
+    sandbox: SandboxProtocol,
+    pages: list[Page],
+    cache: ArtifactCache,
+    *,
+    layer: str = "background",
+    dpi: int = 150,
+) -> list[dict[str, object]]:
+    """Reuse verified page renders without opening a native engine on cache hits.
+
+    Keys belong to one immutable read view and include the current input metadata.
+    PNG publication also deduplicates identical images across views. Registered PDFs
+    retain their full integrity check once per operation, even on an artifact hit.
+    """
+    from .artifacts import artifact_key
+    from .native import native_store_fingerprint
+    from .output import serializable
+
+    _check_layer(layer)
+    _check_dpi(dpi)
+    if not pages:
+        raise GoodnotesError("Provide at least one page to render.")
+    native_inputs = native_store_fingerprint(sandbox) if layer == "native" else None
+    attachments: dict[str, Path] = {}
+    signatures: dict[Path, tuple[int, int, int, int, int, int]] = {}
+    registered: dict[str, _RegisteredPdf] = {}
+    rendered: list[dict[str, object]] = []
+
+    def check_inputs() -> None:
+        for path, expected in signatures.items():
+            if _pdf_source_signature(path) != expected:
+                raise GoodnotesError("A copied page background changed during rendering.")
+        if native_inputs is not None and native_store_fingerprint(sandbox) != native_inputs:
+            raise GoodnotesError("The copied native store changed during rendering.")
+        for verified in registered.values():
+            verified.ensure_unchanged()
+
+    try:
+        with ExitStack() as resources:
+            pdf_cache = resources.enter_context(_PdfDocumentCache())
+            record_reader: Callable[[str], list[tuple[bytes, bytes]]] | None = None
+            pending: list[tuple[int, str, Path, dict[str, object]]] = []
+            snapshot = (
+                str(sandbox.root),
+                stat_key(sandbox.root.lstat()),
+                stat_key((sandbox.root / "goodnotes-snapshot.json").lstat()),
+            )
+            native_key = artifact_key(native_inputs) if native_inputs is not None else None
+            for page in pages:
+                if layer == "annotated":
+                    if page.document_id not in registered:
+                        verified = _open_registered_pdf(sandbox, page.document_id)
+                        try:
+                            _check_registered_page_count(sandbox, page.document_id, verified.entry)
+                        except BaseException:
+                            verified.close()
+                            raise
+                        registered[page.document_id] = verified
+                    verified = registered[page.document_id]
+                    verified.ensure_unchanged()
+                    _check_annotated_page_number(page, _registered_page_count(verified.entry))
+                    background: object = (verified.entry, verified.signature)
+                else:
+                    attachment = page.attachment_path or ""
+                    if attachment not in attachments:
+                        attachments[attachment] = _resolve_attachment_path(sandbox, page)
+                    path = attachments[attachment]
+                    if path not in signatures:
+                        signatures[path] = _pdf_source_signature(path)
+                    background = (str(path), signatures[path])
+                key = artifact_key(
+                    {
+                        "renderer": _RENDER_CACHE_VERSION,
+                        "snapshot": snapshot,
+                        "page": serializable(page),
+                        "background": background,
+                        "native": native_key,
+                        "layer": layer,
+                        "dpi": dpi,
+                    }
+                )
+                hit = cache.lookup(key)
+                if hit is not None:
+                    result = dict(hit.result)
+                    result["path"] = str(hit.directory / "page.png")
+                else:
+                    if layer == "native" and record_reader is None:
+                        record_reader = resources.enter_context(_native_record_reader(sandbox))
+                    stage = resources.enter_context(cache.staging())
+                    result = _render_page_with_resources(
+                        sandbox,
+                        page,
+                        sandbox.ensure_output(stage / "page.png"),
+                        layer=layer,
+                        dpi=dpi,
+                        pdf_cache=pdf_cache,
+                        registered=registered,
+                        record_reader=record_reader,
+                    )
+                    result["path"] = str(cache.destination(key) / "page.png")
+                    pending.append((len(rendered), key, stage, result))
+                result["captured_at"] = getattr(sandbox, "captured_at", None)
+                result["temporary"] = True
+                rendered.append(result)
+            check_inputs()
+            for index, key, stage, result in pending:
+                cache.publish(key, stage, result)
+                rendered[index] = result
+            check_inputs()
+    finally:
+        _close_registered_pdfs(registered)
+    return rendered
+
+
 def _render_pages_with_resources(
     sandbox: SandboxProtocol,
     pages: list[Page],
@@ -631,7 +750,7 @@ def _native_warnings(metadata: dict[str, object]) -> list[str]:
 @contextmanager
 def _native_record_reader(
     sandbox: SandboxProtocol,
-) -> Iterator[Callable[[str], list[tuple[bytes, bytes]]]]:
+) -> Generator[Callable[[str], list[tuple[bytes, bytes]]], None, None]:
     from .native import NativeStoreSession
 
     with NativeStoreSession(sandbox) as session:

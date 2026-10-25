@@ -221,10 +221,10 @@ def test_snapshot_marker_permission_error_is_structured_even_for_root(
     marker = root / "goodnotes-snapshot.json"
     original_read = Path.read_text
 
-    def denied_read(path: Path, *args: object, **kwargs: object) -> str:
+    def denied_read(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
         if path == marker:
             raise PermissionError(errno.EACCES, "generated marker denial", str(marker))
-        return original_read(path, *args, **kwargs)  # type: ignore[arg-type]
+        return original_read(path, encoding=encoding, errors=errors)
 
     monkeypatch.setattr(Path, "read_text", denied_read)
     with pytest.raises(CacheAccessError) as caught:
@@ -262,10 +262,10 @@ def test_output_validation_permission_error_is_structured(
     destination = tmp_path / "output.png"
     original_resolve = Path.resolve
 
-    def denied_resolve(path: Path, *args: object, **kwargs: object) -> Path:
+    def denied_resolve(path: Path, strict: bool = False) -> Path:
         if path == destination:
             raise PermissionError(errno.EACCES, "generated output denial", str(destination))
-        return original_resolve(path, *args, **kwargs)  # type: ignore[arg-type]
+        return original_resolve(path, strict=strict)
 
     monkeypatch.setattr(Path, "resolve", denied_resolve)
     with pytest.raises(FilesystemAccessError) as caught:

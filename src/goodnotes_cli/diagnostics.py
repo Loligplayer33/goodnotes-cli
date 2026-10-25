@@ -136,8 +136,21 @@ def _probe(
     return True
 
 
-def _probe_writable_directory(checks: list[dict[str, Any]], *, name: str, path: Path) -> None:
-    if not _probe(checks, name=name, path=path, directory=True, kind="output"):
+def _probe_writable_directory(
+    checks: list[dict[str, Any]],
+    *,
+    name: str,
+    path: Path,
+    required: bool = True,
+) -> None:
+    if not _probe(
+        checks,
+        name=name,
+        path=path,
+        directory=True,
+        kind="output",
+        required=required,
+    ):
         return
     check = checks[-1]
     # This is deliberately only an access hint. Creating a test file would turn
@@ -160,6 +173,72 @@ def _probe_writable_directory(checks: list[dict[str, Any]], *, name: str, path: 
         )
 
 
+def _nearest_existing_artifact_directory(path: Path) -> tuple[Path, bool]:
+    """Find the directory used for a write hint without following path symlinks.
+
+    The artifact root is created lazily by an artifact-producing command. During
+    diagnostics, walk its components with ``lstat`` and stop at the first missing
+    component. This both finds the nearest existing parent and rejects symlinks
+    before probing or traversing them.
+    """
+
+    current = Path(path.anchor)
+    for component in path.parts[1:]:
+        candidate = current / component
+        try:
+            info = candidate.lstat()
+        except FileNotFoundError:
+            return current, False
+        if stat.S_ISLNK(info.st_mode):
+            raise ValueError("The artifact directory path must not contain symlinks.")
+        if not stat.S_ISDIR(info.st_mode):
+            raise ValueError("An artifact directory path component is not a directory.")
+        current = candidate
+    return current, True
+
+
+def _probe_artifact_directory(checks: list[dict[str, Any]], path: Path) -> None:
+    """Report artifact-cache write/search access without creating its root."""
+
+    operation = "inspect_artifact_directory"
+    try:
+        access_path, exists = _nearest_existing_artifact_directory(path)
+    except (OSError, ValueError) as exc:
+        _failure(
+            checks,
+            name="artifact_directory",
+            path=path,
+            operation=operation,
+            kind="output",
+            exc=exc,
+            required=False,
+        )
+        check = checks[-1]
+        check.update(
+            planned_path=str(path),
+            access_path=str(path),
+            directory_exists=None,
+            write_access_hint=False,
+            write_tested=False,
+        )
+        return
+
+    _probe_writable_directory(
+        checks,
+        name="artifact_directory",
+        path=access_path,
+        required=False,
+    )
+    check = checks[-1]
+    check.update(
+        planned_path=str(path),
+        access_path=str(access_path),
+        directory_exists=exists,
+    )
+    check.setdefault("write_access_hint", False)
+    check.setdefault("write_tested", False)
+
+
 def inspect_environment(
     data_dir: Path,
     library: Path | None = None,
@@ -167,6 +246,7 @@ def inspect_environment(
     sandbox: Path | None = None,
     scratch_dir: Path | None = None,
     output_dir: Path | None = None,
+    artifact_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Probe selected cache/source paths without writes or source database opens.
 
@@ -184,6 +264,9 @@ def inspect_environment(
         .absolute()
     )
     output = Path(output_dir).expanduser().absolute() if output_dir is not None else None
+    explicit_artifacts = (
+        Path(artifact_dir).expanduser().absolute() if artifact_dir is not None else None
+    )
     checks: list[dict[str, Any]] = []
     warnings = [
         "These checks establish point-in-time read access. Write access is an os.access hint; "
@@ -287,6 +370,8 @@ def inspect_environment(
     _probe_writable_directory(checks, name="scratch_directory", path=scratch)
     if output is not None:
         _probe_writable_directory(checks, name="output_directory", path=output)
+    artifacts = explicit_artifacts or Path(selected_cache or state) / "artifacts"
+    _probe_artifact_directory(checks, artifacts)
     errors = [check for check in checks if check["required"] and check["status"] != "ok"]
     return {
         "scope": "filesystem-access",
@@ -295,6 +380,7 @@ def inspect_environment(
         "library": str(source) if source is not None else None,
         "scratch_dir": str(scratch),
         "output_dir": str(output) if output is not None else None,
+        "artifact_dir": str(artifacts) if artifacts is not None else None,
         "status": "issues" if errors else "ready",
         "checks": checks,
         "errors": errors,

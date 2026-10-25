@@ -6,11 +6,14 @@ Notable changes to the project are recorded here. Versions follow Semantic Versi
 
 ### Added
 
+- Temporary render and bundle storage with image reuse, shared PNG payloads, a 100 MB cap, one-day idle expiry, and protected returned paths. Explicit `--output` destinations remain persistent.
+- Read-only artifact-directory access hints in `doctor --access-only`.
 - Notebook-scoped search and PDF scans, source-coverage diagnostics, metadata-only handwriting discovery, and selected-page PDF export.
 - Repository agent guidance in `AGENTS.md`, shared with Claude through a `CLAUDE.md` symlink.
 
 ### Changed
 
+- Type checking uses ty as the sole required checker, including warnings; mypy is no longer a development dependency.
 - Page hydration, search bindings and PDF scans reuse work within one read view. Multipage rendering and export share native-store and PDF resources.
 - Non-PDF commands defer PDF-library loading. Routine CLI contract tests run in process while process-specific tests retain subprocess coverage.
 - Incremental capture reuses unchanged original SQLite digests with copied-byte verification and reuses compatible prior projection validation for unchanged complete families.

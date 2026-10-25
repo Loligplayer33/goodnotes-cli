@@ -1,5 +1,4 @@
 # ruff: noqa
-# mypy: ignore-errors
 """A small, dependency-free protobuf wire decoder.
 
 This module intentionally knows no GoodNotes schema. It retains raw bytes and only

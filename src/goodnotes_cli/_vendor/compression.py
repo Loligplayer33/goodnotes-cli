@@ -1,5 +1,4 @@
 # ruff: noqa
-# mypy: ignore-errors
 """Decoder for Apple's framed LZ4 stream (``bv41`` / ``bv4$``)."""
 
 from __future__ import annotations

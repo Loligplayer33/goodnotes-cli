@@ -13,10 +13,12 @@ Use the installed `goodnotes` executable, or `uv run goodnotes` from the reposit
 2. Request the page evidence:
 
    ```sh
-   goodnotes --data-dir /path/to/cli-cache bundle "Course/Lectures/Notebook name" --pages 3 --output /tmp/study-page-3
+   goodnotes --data-dir /path/to/cli-cache bundle "Course/Lectures/Notebook name" --pages 3
    ```
 
-3. Read the inline source-labeled text and coverage, then open the absolute `image` path in `page_evidence`. No separate manifest-read call is needed. Use a new output directory each time. The full diagnostic manifest remains at `manifest` for investigation.
+3. Read the inline source-labeled text and coverage, then open the absolute `image` path in `page_evidence`. No separate manifest-read call is needed. The full diagnostic manifest is at `manifest` for investigation.
+
+Without `--output`, renders and bundles return `temporary: true`. Matching requests reuse page images, and bundle text always comes from the current pinned read view. The separate `artifacts/` directory under the selected data directory is capped at 100,000,000 logical bytes, counting shared PNGs only once. Entries expire after one day since their last CLI use; cleanup happens on the next artifact operation. Returned paths are protected for five minutes, then may be evicted for capacity before the day ends. Open them promptly. If a path has expired, repeat the command; this produces evidence for the currently selected view, not a historical version. Add `--output` only when a persistent copy is needed. Explicit outputs remain caller-owned and require a new destination each time.
 
 Bundle defaults to PDF text plus a native annotated image, and returns the evidence directly. This avoids redundant OCR candidates. Use `--source all` for all stored text sources, including recognition and typed text. The source filter affects text only. `--layer background` explicitly requests a clean page without native ink; missing native support never causes a silent fallback.
 
@@ -42,6 +44,6 @@ Use `--max-chars` to bound read/bundle text for the question. Inspect `truncated
 
 - **Search.** `search` covers stored index rows; `scan-pdfs` separately covers copied PDF backgrounds. Neither establishes handwriting completeness. Check coverage and warnings before interpreting no hits. Follow `next_offset` or `next_page_offset` with the same scope, query, and snapshot. See [search commands](commands.md#search).
 - **Recognition metadata.** `pages --with-recognition` reports stored-text availability and pending/unknown index state. `annotation_count` counts projected note items, not ink or OCR. See [pages](commands.md#pages).
-- **Cache access or refresh failures.** Setup/sync needs source read and cache write access. Readers need only cache read access, including the existing `.view.lock`; native rendering also needs writable scratch and output. Read `error.details` for the path, operation, and remedy. Do not bypass locks or silently select another cache. `doctor --access-only` checks permissions without writes or engines. See [restricted agent setup](usage.md#read-access-for-an-agent).
+- **Cache access or refresh failures.** Setup/sync needs source read and cache write access. Metadata and text readers need only cache read access, including the existing `.view.lock`; native rendering also needs writable scratch. Default visual commands need writable artifact storage. With a read-only cache, use `--output` in a writable directory. Read `error.details` for the path, operation, and remedy. Do not bypass locks or silently select another cache. `doctor --access-only` checks permissions without writes or engines and includes an optional artifact-storage write hint. See [restricted agent setup](usage.md#read-access-for-an-agent).
 - **Continuous refresh.** `watch` is an optional foreground refresher for the selected cache, useful for cache-only readers. It observes Mac files, and readers still pin each request's generation. See [watch](commands.md#watch).
 - **Other output or errors.** Commands use compact JSON; `--text` indents it. Runtime errors go to stderr with exit 1, invalid syntax exits 2, interruption exits 130. Read stderr when stdout is empty. See [command reference](commands.md).

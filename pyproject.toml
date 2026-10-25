@@ -19,7 +19,6 @@ goodnotes = "goodnotes_cli.cli:main"
 dev = [
     "pytest>=8,<10",
     "ruff>=0.12,<1",
-    "mypy>=1.16,<2",
     "ty>=0.0.91,<0.1",
     "pytest-xdist>=3.8,<4",
     "hypothesis>=6,<7",
@@ -36,8 +35,3 @@ line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
-
-[tool.mypy]
-python_version = "3.11"
-check_untyped_defs = true
-ignore_missing_imports = true

@@ -14,7 +14,7 @@ import re
 import shutil
 import stat
 import tempfile
-from collections.abc import Iterator, Mapping
+from collections.abc import Generator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -291,10 +291,19 @@ def _validate_options(source: Path, entries: Mapping[str, tuple[int, ...]]) -> N
                 )
 
 
-@contextmanager
-def _scratch_store(
-    source: Path, snapshot_root: Path, scratch_dir: Path | str | None = None
-) -> Iterator[Path]:
+def _validated_snapshot_store(sandbox: SnapshotProtocol) -> tuple[Sandbox, Path]:
+    validated = Sandbox.load(sandbox.root)
+    if Path(sandbox.library_dir).resolve() != validated.library_dir:
+        raise NativeError(
+            "native_data_unavailable",
+            "The native library does not match its snapshot.",
+            operation="resolve_native_snapshot",
+            path=sandbox.library_dir,
+        )
+    return validated, validated.library_dir / "Databases" / "notes_main.db"
+
+
+def _validated_inventory(source: Path) -> dict[str, tuple[int, int, int, int, int, int]]:
     before = _inventory(source)
     current = _read_small_regular(source / "CURRENT", before["CURRENT"], 4096)
     if (
@@ -308,6 +317,22 @@ def _scratch_store(
             path=source,
         )
     _validate_options(source, before)
+    return before
+
+
+def native_store_fingerprint(
+    sandbox: SnapshotProtocol,
+) -> dict[str, tuple[int, int, int, int, int, int]]:
+    """Validate the copied native store and return metadata for every regular file."""
+    _, source = _validated_snapshot_store(sandbox)
+    return _validated_inventory(source)
+
+
+@contextmanager
+def _scratch_store(
+    source: Path, snapshot_root: Path, scratch_dir: Path | str | None = None
+) -> Generator[Path, None, None]:
+    before = _validated_inventory(source)
     configured = scratch_dir if scratch_dir is not None else os.environ.get("GOODNOTES_SCRATCH_DIR")
     scratch_parent = (
         Path(configured).expanduser() if configured is not None else Path(tempfile.gettempdir())
@@ -433,15 +458,7 @@ class NativeStoreSession:
             raise RuntimeError("A NativeStoreSession can only be entered once.")
         self._entered = True
         try:
-            validated = Sandbox.load(self._sandbox.root)
-            if Path(self._sandbox.library_dir).resolve() != validated.library_dir:
-                raise NativeError(
-                    "native_data_unavailable",
-                    "The native library does not match its snapshot.",
-                    operation="resolve_native_snapshot",
-                    path=self._sandbox.library_dir,
-                )
-            source = validated.library_dir / "Databases" / "notes_main.db"
+            validated, source = _validated_snapshot_store(self._sandbox)
             self._scratch_context = _scratch_store(
                 source, validated.root, scratch_dir=self._scratch_dir
             )

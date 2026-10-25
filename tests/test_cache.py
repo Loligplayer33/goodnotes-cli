@@ -8,8 +8,9 @@ import multiprocessing
 import os
 import sqlite3
 import stat
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
+from multiprocessing.synchronize import Event as SyncEvent
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -194,7 +195,9 @@ def test_native_change_refreshes_only_changed_files_and_prunes_previous_generati
     assert (copied / wal.name).read_bytes() == wal.read_bytes()
     unchanged = cache_module.refresh_cache(source, cache)
     assert unchanged["status"] == "unchanged"
-    assert unchanged["capture_stats"]["source_bytes_hashed"] == 0  # type: ignore[index]
+    unchanged_stats = unchanged["capture_stats"]
+    assert isinstance(unchanged_stats, dict)
+    assert unchanged_stats["source_bytes_hashed"] == 0
 
 
 def test_force_rehashes_native_store_and_does_not_reuse_cached_files(tmp_path: Path) -> None:
@@ -633,7 +636,7 @@ def test_failed_force_refresh_preserves_the_active_pointer(
 def _refresh_in_process(
     source: str,
     data_dir: str,
-    start: multiprocessing.synchronize.Event,
+    start: SyncEvent,
     output: str,
 ) -> None:
     try:
@@ -648,9 +651,9 @@ def _refresh_in_process(
 def _refresh_waiting_to_publish(
     source: str,
     data_dir: str,
-    captured: multiprocessing.synchronize.Event,
-    publish_attempt: multiprocessing.synchronize.Event,
-    complete: multiprocessing.synchronize.Event,
+    captured: SyncEvent,
+    publish_attempt: SyncEvent,
+    complete: SyncEvent,
     output: str,
 ) -> None:
     original_create = cache_module.create_snapshot
@@ -676,13 +679,13 @@ def _refresh_waiting_to_publish(
     @contextmanager
     def observe_exclusive_view_lock(
         path: Path, *, exclusive: bool, create: bool = True
-    ) -> Iterator[None]:
+    ) -> Generator[None, None, None]:
         if path.name == cache_module._VIEW_LOCK and exclusive:
             publish_attempt.set()
         with original_lock(path, exclusive=exclusive, create=create):
             yield
 
-    cache_module.create_snapshot = capture_then_signal
+    vars(cache_module)["create_snapshot"] = capture_then_signal
     cache_module._file_lock = observe_exclusive_view_lock
     try:
         result = cache_module.refresh_cache(Path(source), Path(data_dir))
@@ -696,10 +699,10 @@ def _refresh_waiting_to_publish(
 def _read_view_paused_with_missing_pointer(
     data_dir: str,
     old_snapshot: str,
-    load_started: multiprocessing.synchronize.Event,
-    allow_load: multiprocessing.synchronize.Event,
-    yielded: multiprocessing.synchronize.Event,
-    release_reader: multiprocessing.synchronize.Event,
+    load_started: SyncEvent,
+    allow_load: SyncEvent,
+    yielded: SyncEvent,
+    release_reader: SyncEvent,
     output: str,
 ) -> None:
     def paused_load(settings: Settings) -> Sandbox:
@@ -722,8 +725,8 @@ def _read_view_paused_with_missing_pointer(
 
 def _read_explicit_view_paused(
     sandbox_path: str,
-    yielded: multiprocessing.synchronize.Event,
-    release_reader: multiprocessing.synchronize.Event,
+    yielded: SyncEvent,
+    release_reader: SyncEvent,
     output: str,
 ) -> None:
     try:
@@ -1239,7 +1242,9 @@ def test_explicit_managed_sandbox_takes_shared_view_lock(
     original_lock = cache_module._file_lock
 
     @contextmanager
-    def record_lock(path: Path, *, exclusive: bool, create: bool = True) -> Iterator[None]:
+    def record_lock(
+        path: Path, *, exclusive: bool, create: bool = True
+    ) -> Generator[None, None, None]:
         acquired.append((path, exclusive))
         with original_lock(path, exclusive=exclusive, create=create):
             yield

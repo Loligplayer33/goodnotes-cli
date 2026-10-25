@@ -18,6 +18,7 @@ from goodnotes_cli.native import (
     NativeStoreSession,
     _inventory,
     _scratch_store,
+    native_store_fingerprint,
     runtime_status,
 )
 
@@ -42,6 +43,87 @@ def valid_sandbox(tmp_path: Path) -> tuple[native.Sandbox, Path]:
     (source.parent / "projection.sqlite").touch()
     (root / "goodnotes-snapshot.json").write_text(json.dumps({"format_version": 1}))
     return native.Sandbox.load(root), source
+
+
+def test_native_store_fingerprint_validates_metadata_without_runtime_or_scratch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sandbox, source = valid_sandbox(tmp_path)
+    source_files = {path.name: path.read_bytes() for path in source.iterdir()}
+    scratch_parent = tmp_path / "scratch"
+    scratch_parent.mkdir()
+    before = _inventory(source)
+
+    monkeypatch.setattr(native, "NativeRuntime", lambda: pytest.fail("runtime was loaded"))
+    monkeypatch.setattr(
+        native.tempfile,
+        "TemporaryDirectory",
+        lambda **_: pytest.fail("scratch was created"),
+    )
+
+    fingerprint = native_store_fingerprint(sandbox)
+
+    assert fingerprint == before
+    assert set(fingerprint) == set(source_files)
+    assert {path.name: path.read_bytes() for path in source.iterdir()} == source_files
+    assert not list(scratch_parent.iterdir())
+
+
+def test_native_store_fingerprint_tracks_every_file(tmp_path: Path) -> None:
+    sandbox, source = valid_sandbox(tmp_path)
+    before = native_store_fingerprint(sandbox)
+
+    added = source / "new-generated-table.sst"
+    added.write_bytes(b"new generated store file")
+    after = native_store_fingerprint(sandbox)
+
+    assert added.name not in before
+    assert after[added.name] == native.stat_key(added.stat())
+    assert after != before
+
+
+def test_native_store_fingerprint_rejects_missing_store(tmp_path: Path) -> None:
+    sandbox, source = valid_sandbox(tmp_path)
+    shutil.rmtree(source)
+
+    with pytest.raises(NativeError, match="native store is missing") as result:
+        native_store_fingerprint(sandbox)
+
+    assert result.value.details["operation"] == "inspect_native_store"
+
+
+@pytest.mark.parametrize(
+    ("filename", "contents", "message"),
+    [
+        ("CURRENT", b"MANIFEST-999999\n", "local manifest"),
+        ("OPTIONS-000004", b"comparator=custom\n", "Unsupported native"),
+    ],
+)
+def test_native_store_fingerprint_rejects_invalid_control_metadata(
+    tmp_path: Path, filename: str, contents: bytes, message: str
+) -> None:
+    sandbox, source = valid_sandbox(tmp_path)
+    (source / filename).write_bytes(contents)
+
+    with pytest.raises(NativeError, match=message):
+        native_store_fingerprint(sandbox)
+
+
+@pytest.mark.parametrize("entry_kind", ["symlink", "directory", "fifo"])
+def test_native_store_fingerprint_rejects_nonregular_entries(
+    tmp_path: Path, entry_kind: str
+) -> None:
+    sandbox, source = valid_sandbox(tmp_path)
+    unsafe = source / "unsafe"
+    if entry_kind == "symlink":
+        unsafe.symlink_to(source / "CURRENT")
+    elif entry_kind == "directory":
+        unsafe.mkdir()
+    else:
+        os.mkfifo(unsafe)
+
+    with pytest.raises(NativeError, match="nonregular"):
+        native_store_fingerprint(sandbox)
 
 
 class FakeNativeRuntime:
