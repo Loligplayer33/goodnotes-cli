@@ -47,6 +47,19 @@ uv run ruff check .
 uv run mypy src/goodnotes_cli
 ```
 
+For faster local test runs, use `uv run pytest -n 4` to distribute tests across
+four worker processes. Keep generated fixtures isolated per test.
+
+Decoder property tests use Hypothesis to generate synthetic binary inputs and
+check decoded values, malformed-input rejection, and resource limits. Run them
+with `uv run pytest tests/test_decoder_properties.py`. Hypothesis stores local
+failure examples in the ignored `.hypothesis/` directory; preserve a discovered
+regression as an explicit generated example when fixing it.
+
+Run `uv run ty check src/goodnotes_cli tests` to compare diagnostics with mypy.
+Both type checkers are installed for development; mypy remains the required CI
+check while the existing ty diagnostics are evaluated.
+
 Tests must use generated fixtures. Before submitting, review the diff and `git status` for private data, generated output, and machine-specific paths.
 
 ## Submit a change

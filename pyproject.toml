@@ -16,7 +16,14 @@ dependencies = ["typer>=0.27.3,<0.28", "pymupdf>=1.26,<2"]
 goodnotes = "goodnotes_cli.cli:main"
 
 [dependency-groups]
-dev = ["pytest>=8,<10", "ruff>=0.12,<1", "mypy>=1.16,<2"]
+dev = [
+    "pytest>=8,<10",
+    "ruff>=0.12,<1",
+    "mypy>=1.16,<2",
+    "ty>=0.0.91,<0.1",
+    "pytest-xdist>=3.8,<4",
+    "hypothesis>=6,<7",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/goodnotes_cli"]
