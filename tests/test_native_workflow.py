@@ -99,6 +99,11 @@ def test_native_png_pdf_bundle_preserve_sources_and_readonly_cache(
 ) -> None:
     source, store = generated_source
     environment = _environment(tmp_path)
+    # This workflow never writes new native records after fixture setup. Close the
+    # producer before the source baseline so its append-only RocksDB LOG cannot
+    # advance independently while the reader-isolation assertions run. Other tests
+    # that exercise a live writer deliberately keep the store open.
+    store.close()
     original = _manifest(source)
     captured = _command(["--verbose", "sync", "--library", str(source)], environment)
     brief_refresh = _command(["sync", "--library", str(source)], environment)
