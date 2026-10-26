@@ -1,18 +1,18 @@
 # Releases
 
-The version in `[project].version` in `pyproject.toml` is the version source. `uv.lock` also records the local project version, so refresh it after each version change. The release workflow checks that a pushed `vX.Y.Z` tag matches the project version and that `CHANGELOG.md` has a section for that version.
+`pyproject.toml` is the version source. `uv.lock` records the local project version and must be refreshed when the project version changes. The release workflow checks that a pushed `vX.Y.Z` tag matches the project version and that `CHANGELOG.md` has a matching release heading.
 
 ## Prepare a release
 
-1. Choose the next version under [Semantic Versioning](https://semver.org/).
-2. Set `[project].version` in `pyproject.toml` to that version.
-3. Add a dated section for it near the top of `CHANGELOG.md` and move any completed entries out of `[Unreleased]`.
-4. Run `uv lock`, then `uv sync --locked --all-groups` and the local checks in `CONTRIBUTING.md`.
-5. Open and merge a pull request with the version and changelog updates. The CI workflow must pass on the pull request and the resulting commit on `main`.
+1. Choose a version under [Semantic Versioning](https://semver.org/).
+2. Update `[project].version` in `pyproject.toml`.
+3. Add a dated section near the top of `CHANGELOG.md` and move completed entries out of `[Unreleased]`.
+4. Run `uv lock`, then `uv sync --locked --all-groups` and the checks in [Contributing](../CONTRIBUTING.md).
+5. Commit the version and changelog changes. The release workflow runs on pushes to `main` as well as on version tags.
 
 ## Publish a GitHub Release
 
-After the release commit reaches `main`, create and push a version tag that matches `pyproject.toml`:
+After the release commit is on `main`, create and push a matching annotated tag:
 
 ```sh
 git switch main
@@ -21,19 +21,6 @@ git tag -a vX.Y.Z -m "Release vX.Y.Z"
 git push origin vX.Y.Z
 ```
 
-The tag starts the same CI checks. The workflow builds a source distribution and wheel, installs each into its own temporary environment, and runs `goodnotes schema` from outside the checkout for both installations. Only after those checks pass does it create a GitHub Release with the validated `.tar.gz` and `.whl` files attached. The release uses GitHub's generated release notes. It does not publish to PyPI.
+The tag triggers CI. The workflow checks the tag/version/changelog match, builds a source distribution and wheel, installs each in a temporary environment, and runs `goodnotes schema` from outside the checkout. After quality, documentation, test, and package jobs pass, the workflow creates a GitHub Release with both validated distributions and GitHub-generated release notes. It does not publish to PyPI.
 
-## Main branch checks
-
-Changes enter `main` through a pull request. No review approval is required, so a maintainer can merge their own pull request after CI passes. The branch must be up to date with `main` and pass these GitHub Actions checks:
-
-- `Quality checks`
-- `Tests (ubuntu-latest, Python 3.11)`
-- `Tests (ubuntu-latest, Python 3.12)`
-- `Tests (ubuntu-latest, Python 3.13)`
-- `Tests (macos-latest, Python 3.12)`
-- `Build and verify distributions`
-
-The rules apply to administrators too. Force pushes and branch deletion are disabled.
-
-CI uses generated test fixtures and does not require the Goodnotes app or a real Goodnotes library.
+See the current job definitions in [CI](../.github/workflows/ci.yml). Repository branch-protection and review settings are managed outside these files and are not specified here.

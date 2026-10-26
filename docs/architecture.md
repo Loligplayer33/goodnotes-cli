@@ -1,110 +1,154 @@
 # Architecture
 
-The normal workflow is `goodnotes sync`, followed by commands such as `goodnotes ls` or `goodnotes read`. On macOS, `sync` discovers the local Goodnotes Library and refreshes the CLI cache. Browse commands use a validated local read view. The CLI reads Goodnotes files but never opens a source SQLite database, controls the app, or writes to the source library.
+Goodnotes CLI reads a validated copy of a Goodnotes Library. `sync` creates or refreshes the copy. Browse and export commands read it. The CLI never opens a source SQLite database, controls Goodnotes, or writes to the source Library.
 
 ```text
-Goodnotes Library on macOS
-        |
-        | sync: stat inventory, then capture changed files and validate copy
-        v
-Managed CLI cache: active generation + active.json
-        |
-        +-- safety: validate the active copy and reject live library roots
-        +-- library: read folders, notebooks, pages, and stored text
-        +-- documents: read PDF pages, export, render, and attach PDFs
-        +-- CLI: emit compact JSON by default, or indented JSON with --text
+Goodnotes Library -> inventory -> independent staging copy -> validate
+                                               |                    |
+                                               | failure            | marker written last
+                                               v                    v
+                                   keep previous pointer      active generation
+                                                                    ^
+                                  shared .view.lock: read <---------+
+                                  exclusive .view.lock: publish/prune
 ```
-
-The default cache is `~/.cache/goodnotes-cli`, based on `XDG_CACHE_HOME`. `GOODNOTES_DATA_DIR` or the global `--data-dir` option selects another cache. The `--sandbox` option is an explicit development override for an existing marked copy. `snapshot LIBRARY DESTINATION` creates a separate named copy for a caller that needs a persistent view. Keep named snapshots outside the managed cache; `sync` prunes only its managed generations.
 
 ## Refresh and read lifecycle
 
-`sync` holds the cache's persistent `.sync.lock` for the full refresh, so concurrent refreshes run in sequence. It inventories the required databases, SQLite sidecars, optional native `notes_main.db` tree, and attachments. It also compares the saved stat inventory for the active cache tree. When the source path and both inventories match, `sync` reuses the active generation without hashing file contents. This catches ordinary cache damage without reading every byte. `sync --force` bypasses reuse and verifies a new capture. Read commands do not refresh automatically. The explicit foreground `watch` command polls metadata and calls the same refresh function after changes settle.
+| Setting or command | Contract |
+| --- | --- |
+| Default cache | `~/.cache/goodnotes-cli`, based on `XDG_CACHE_HOME`. |
+| Select cache | `GOODNOTES_DATA_DIR` or global `--data-dir`. |
+| `--sandbox` | Use an existing marked copy, usually for development. |
+| `snapshot LIBRARY DESTINATION` | Create a caller-owned copy. Keep it outside the managed cache; `sync` prunes only managed generations. |
+| `watch` | Poll metadata and call the same refresh function after changes settle. Read commands do not refresh. |
 
-When the inventory changes, `sync` builds a staging generation. Unchanged files reuse the previous verified copy only when source and cache metadata match. Reuse trusts the previous digest; it does not rehash unchanged bytes. Changed files receive a fresh content check. On macOS the copier tries independent APFS clones; elsewhere it falls back to independent byte copies. It never hardlinks snapshot files. SQLite reuse requires the entire original database-and-sidecar family to match, since WAL consolidation changes the completed database bytes. Native capture includes CURRENT, manifests, SSTs, WALs, and other regular store files without opening the source engine. Source and completed-cache fingerprints remain separate. After copied-WAL consolidation and projection validation, the marker is written last. Detected source changes trigger up to three attempts; failure preserves the previous view.
+### Capture invariants
 
-If a WAL changes while the source main database's complete stat signature stays identical, capture can reuse that main file's original source digest. It still copies the current source main file and verifies the copied bytes against that digest. It never substitutes the previous consolidated database for a changed SQLite family. An unchanged complete family can also reuse its projection integrity result when the marker's validation version and copied-file digest match. This relies on the same metadata fingerprints, successful clone byte preservation and prior verified marker chain as ordinary file reuse. `--force` bypasses these shortcuts and hashes the source again.
+| Phase | Invariant |
+| --- | --- |
+| Inventory | Compare source and active-copy metadata for databases, SQLite sidecars, optional native `notes_main.db` files, and attachments. Matching inventories allow reuse without hashing all bytes. `--force` bypasses reuse. |
+| Copy | Copy changed files to independent inodes. macOS tries APFS clones; fallback copies bytes. Snapshot files are never hardlinked to source files. |
+| Reuse | Reuse a prior verified digest only when source and cache metadata match. SQLite reuse requires the complete original database-and-sidecar family to match. |
+| SQLite validation | Consolidate sidecars only in unpublished staging copies. Validate the copied projection database, then write the snapshot marker last. Keep source and completed-copy fingerprints separate. |
+| Retry | Retry a detected source change up to three times. If no stable copy succeeds, fail and preserve the previous active pointer. |
+| Publish | Compare the pre-capture and final source inventories. On mismatch, publish the validated view with `source_changed_during_refresh: true` and its `captured_at` time. The next sync captures again. |
 
-With `--verbose`, `capture_stats` reports captured and reused files, source bytes hashed, clone and byte-copy counts, and capture time. Byte counts are logical file sizes, not unique physical disk allocation. Activity counters describe the successful attempt; capture time includes failed attempts. An unchanged refresh reports zero capture activity.
+Matching inventories mean only that the two checks matched. They do not prove the source stayed unchanged through command return. An edit after the final check is picked up by the next sync.
 
-After capture, `sync` takes a final source inventory before it waits for the exclusive `.view.lock` to publish. It compares that inventory with the one taken before capture, including any earlier capture attempts. If they differ, or an edit makes that final inventory unstable, sync publishes the validated view, sets `source_changed_during_refresh: true`, and warns that the view is valid as of `captured_at`. Permission failures and unsafe filesystem entries remain errors. If the inventories match, the flag is false. That means the two checks matched, not that the source stayed unchanged through command return. Updates after the final check, including while sync waits to publish, are detected by the next sync. A changed inventory leaves out the reusable source fingerprint, so the next sync captures a fresh view. `captured_at` is the validated view's capture time; sync does not promise the latest source state at return.
+If a WAL changes while the source main database's full stat signature stays the same, capture may reuse that file's saved digest. It still copies and checks the current main file. A changed SQLite family never reuses the prior consolidated database.
 
-Readers acquire the persistent `.view.lock` in shared mode before resolving `active.json` and keep it through their final database or attachment read. `sync` does not hold this lock during inventory or capture. It takes the lock exclusively only to update or publish the active pointer and prune old managed generations. A long-running reader can delay publication and cleanup while capture continues. Once readers release the lock, the cache keeps the active generation and removes superseded managed generations. Explicit `--sandbox` paths that point into this managed cache follow the same lock and retention rules. Custom named snapshots outside the cache are not pruned.
+Projection validation can be reused only when the SQLite family is unchanged and the marker version and copied-file digest match.
 
-Sync creates persistent locks. Readers open the existing view lock read-only and create no cache paths. The lock must be regular, is opened without following symlinks, and retains the same identity through acquisition. Readers block publication and pruning until they finish. Missing or inaccessible locks fail with actionable cache errors. Do not delete or replace locks during use. Restricted runners need read access to the selected private cache. Native rendering also needs writable temporary scratch outside that cache; it clones the copied native store there and removes it after extraction.
+With `--verbose`, `capture_stats` reports file counts, source bytes hashed, clone and copy counts, and capture time. Byte counts are logical file sizes. Counters describe the successful attempt; elapsed time includes failed attempts.
 
-### Generated artifact storage
+## File access and locks
 
-Without `--output`, `render` and `bundle` use a separately owned `artifacts/` store under the selected data directory. It is outside immutable snapshot generations. The artifact lock is acquired after the shared read-view lock and serializes publication, retention updates, and cleanup. Metadata/text-only readers do not initialize or write this store. Explicit outputs remain caller-owned, are never overwritten, and are never pruned by the artifact cache.
+| Path | Writer | Reader | Rule |
+| --- | --- | --- | --- |
+| Source Library | None | `sync` copies files | Never open source SQLite or RocksDB. The Goodnotes app does not coordinate with CLI locks. |
+| Staging generation | `sync` and SQLite consolidation | None | Independent, unpublished files only. Remove abandoned staging on the next sync. |
+| Completed snapshot | None | CLI, read-only | Immutable after marker publication. |
+| `active.json` and pruning | `sync` | Readers resolve pointer under lock | Update pointer and prune under exclusive `.view.lock`. |
+| `.sync.lock` | `sync` | Other refreshes wait | Serialize the full refresh. |
+| `.view.lock` | `sync` creates persistent file | Readers open read-only, shared | Hold through final database or attachment read. Sync waits for readers before publish/prune. |
+| Artifact store | Render/bundle commands | Returned paths | Separate managed store, outside immutable snapshots. Explicit outputs remain caller-owned. |
 
-The retained payload limit is 100,000,000 logical bytes, counting shared PNG inodes once along with manifests and entry metadata. Small fixed control files and in-progress staging are excluded. Entries expire after 86,400 seconds since their last CLI request; capacity pressure can evict older unused entries sooner. Every returned entry has a five-minute protection period. Maintenance runs on subsequent artifact operations, without a background process. If protected entries prevent publication within the limit, the command fails with an actionable capacity error.
+Locks must be regular files, opened without following symlinks, and retain the same identity during acquisition. Readers do not create cache paths or recreate missing locks. Do not remove or replace a lock while a CLI process may hold it. A long reader delays publication and cleanup, while capture proceeds.
 
-Page-render keys include the pinned snapshot identity, current background/native input fingerprints, page metadata, layer, DPI, and a renderer version. Native image keys also include the copied attachment bindings and file signatures for the page's document. The renderer checks inputs before and after reuse; cache hits do not open RocksDB. A renderer version change invalidates older page renders. Registered annotated PDFs retain full digest verification once per operation. New snapshot generations render again; content-addressed PNG blobs deduplicate identical resulting bytes across generations. Only generated PNGs use hardlinks, entirely within the artifact store; source and snapshot files never do.
+## SQLite copy consolidation
 
-Bundle text is read on every request. A key derived from current text, render metadata, and provenance selects a self-contained bundle of generated PNG hardlinks and a single text manifest. Atomic staged publication and ownership markers distinguish complete managed outputs from abandoned work. Cleanup validates owned paths and uses the shared no-follow removal boundary. It never discovers or deletes arbitrary caller output directories.
+SQLite may write only to independent staging copies, after capture verification. The completed snapshot stays immutable and readers open it read-only.
 
-If a refresh is interrupted with Ctrl-C, the CLI removes its partial staging directory. If the process is killed before cleanup, the next `sync` removes abandoned staging directories. A crash never makes an incomplete staging directory active. The Goodnotes app does not participate in these locks. The copy is not a transaction coordinated with the app, so a source that keeps changing can make `sync` fail after three attempts.
+| Copied family | Consolidation |
+| --- | --- |
+| WAL, no rollback journal | Make staging files writable; remove copied SHM so SQLite can rebuild it; checkpoint committed WAL pages; switch to DELETE journal mode; verify checkpoint; remove only empty sidecars after closing the connection. |
+| Hot rollback journal | Recover the staging copy, then back it up into a separate staging database. |
+| Non-WAL fallback | Write to staging output in DELETE journal mode. |
+
+SQLite may accept only a valid committed WAL prefix. A successful checkpoint,
+backup, or integrity check cannot prove that a torn or reset WAL tail held no
+additional edits. Generated [snapshot tests](../tests/test_snapshot.py) cover both cases.
+
+## Generated artifact storage
+
+Without `--output`, `render` and `bundle` use the `artifacts/` store under the selected data directory. It is separate from snapshot generations. Artifact locking follows the shared view lock. Text-only readers do not initialize this store.
+
+| Limit | Behavior |
+| --- | --- |
+| 100,000,000 logical bytes | Count unique PNG inodes, manifests, and entry metadata. Exclude small control files and in-progress staging. |
+| 86,400-second idle expiry | Measure from the last CLI request. Capacity pressure may evict older unused entries earlier. |
+| 5-minute lease | Protect a returned entry from expiry and capacity eviction. If protected entries block publication, return a capacity error. |
+| Cleanup | Run on later artifact operations. There is no background process. |
+
+| Cache key or publication | Included checks |
+| --- | --- |
+| Page render | Snapshot identity, current background/native fingerprints, page metadata, layer, DPI, and renderer version. |
+| Native image | Copied attachment bindings and file signatures for the page's document. |
+| Reuse | Check inputs before and after reuse. A cache hit does not open RocksDB. A renderer version change invalidates old page renders. |
+| Annotated PDF | Verify the full digest once per operation. |
+| Bundle | Read current text on every request. Key by text, render metadata, and provenance. |
+| Publish and cleanup | Stage files and use ownership markers. Cleanup validates managed paths and uses no-follow removal. It never discovers caller output directories. |
+
+New snapshot generations render again. Content-addressed PNG data can deduplicate identical output across generations. Generated PNGs may use hardlinks within the artifact store; source and snapshot files never do.
 
 ## Package boundaries
 
-`models` contains the data structures shared by the other modules. `errors` defines expected failures that the CLI can show without a Python traceback.
+Keep changes inside the package that owns the behavior. `models` holds shared data structures; `errors` defines expected CLI failures.
 
-`safety` validates the selected sandbox and marker, and prevents normal commands from opening a live Goodnotes library. Shared containment checks compare filesystem identity when path spellings differ, so case aliases and existing aliases at different path depths cannot bypass the boundary. Distinct paths on case-sensitive volumes stay distinct. Shared cleanup traverses directory descriptors without following symlinks and never changes a symlink target's permissions. Keep these rules here so every command uses the same checks.
+| Package | Responsibility |
+| --- | --- |
+| `safety` | Validate copies and markers, reject live Library roots, enforce containment, and provide no-follow cleanup. |
+| `snapshot` | Copy databases and attachments, verify changes, consolidate copied sidecars, validate projection, and mark completed snapshots. |
+| `cache` | Manage active generations, pointers, refresh, locks, and pruning. |
+| `library` | Own read-only connections and map folders, notebooks, pages, PDF bindings, stored text, and search results. |
+| `text_index` | Batch read-only queries for recognition counts, PDF bindings, raw indexed rows, and diagnostics. `library` owns connections and result mapping. |
+| `documents` | Resolve PDF backgrounds, render PNGs, export PDFs, verify reuse inputs, and publish bundles. Render/export default to `background`; study bundles default to `native`. |
+| `annotations` | Decode observed protobuf, Apple LZ4, and TPL formats with bounded expansion. |
+| `native`, `native_assets`, `native_render` | Open copied stores on disposable scratch, validate copied image bindings and rasters, draw supported records, and report coverage. |
+| `artifacts` | Retain regenerable outputs, deduplicate payloads, enforce leases, and clean managed paths. It does not read Goodnotes databases or determine fidelity. |
+| `watch`, `diagnostics` | Poll source metadata and report access/runtime availability without changing permissions. |
+| `cli` | Define commands, validate options, and connect library and document operations. |
+| `output` | Format structured responses, concise profiles, full metadata, and expected errors. |
 
-`snapshot` copies databases and attachments to a new cache snapshot. It includes SQLite sidecars such as WAL files when they exist, verifies changed files and source stability, consolidates copied database sidecars, checks the copied projection database, and writes a `goodnotes-snapshot.json` marker last. `sync` switches the cache's active pointer only after snapshot creation returns. Reader connections open completed copies in read-only mode.
+Each `Library` session caches immutable schema metadata, hydrated pages, page references, and verified PDF bindings for one pinned view. PDF fallback extraction reuses a bounded set of open documents and closes them at operation end. These caches do not cross commands or snapshots.
 
-Consolidation may write only to independent, unpublished staging copies after capture verification. For WAL families without a rollback journal, it makes only staging files writable, discards the copied SHM index and lets SQLite rebuild it, checkpoints committed WAL pages into the copied main file, and switches the copy to DELETE journal mode. It requires a completed checkpoint and removes only empty sidecars after closing the connection. This preserves copy-on-write sharing for unchanged main-file pages. A hot rollback journal is recovered only on its independent staging copy before backup into a separate staging database. Non-WAL fallback output also uses DELETE journal mode. Engines never open source files. Completed snapshots remain immutable.
+Goodnotes search may require a custom FTS tokenizer. The CLI reads ordinary stored rows instead of virtual FTS tables that require that tokenizer.
 
-`library` maps stored rows to folders, notebooks, ordered pages, and text search results. It labels each text result by source. `read` uses indexed PDF text when available, then extracts text from the mapped PDF background in the copied library if the index has no text. `search` uses indexed rows. PDF text may omit annotations and cannot read image-only writing. Handwriting results are stored recognition candidates. `textbox` results are typed text stored on the page. These sources retain their provenance; recognition candidates are not a visual rendering of handwriting.
+## Native rendering and annotations
 
-The library's search database uses a Goodnotes-specific full-text-search tokenizer. The CLI opens it only when a text operation needs it and reads ordinary stored rows instead of querying virtual FTS tables that require that tokenizer. One `Library` session caches immutable schema metadata, hydrated pages, page references and verified PDF bindings. Page hydration batches template, attachment and annotation queries. PDF fallback extraction reuses a bounded set of open documents and closes them when the operation ends. These caches belong to one pinned read view; they are not shared across CLI commands or snapshots.
+Native rendering opens RocksDB only on disposable scratch cloned from a validated copy. Fresh engine options keep writes in scratch; copied `OPTIONS` files are not loaded. Remove scratch after extraction. A 64 MiB limit applies to byte-copy fallback per extraction.
 
-`text_index` contains read-only, batched queries for stored recognition counts, verified PDF bindings, raw indexed text rows, and scoped diagnostics. `library` owns the connections, selectors, page numbers, and mapping of raw rows into domain search results. It derives PDF page identities from the projection's document, attachment, and PDF page. Read, search, and coverage use the same binding checks so stale index pointers cannot assign another page's text. Metadata counts do not establish source completeness. Recognition status reports stored text availability and a pending-index flag, not whether a page has ink or whether recognition is accurate.
+| Observed support | Limits |
+| --- | --- |
+| Pen and highlighter records; filled paths; one outlined ellipse form; variable-width pencil strokes; one two-point open stroked shape; some linked PNG/JPEG images. | Pencil texture is approximate. Images require exact copied attachment binding, matching placement rectangles, and unrotated, uncropped placement. |
+| Decoded native records | Unknown visibility, transforms, versions, active types, or decode failures reduce coverage. Fail if no supported object remains. |
+| Missing native root | Report unavailable data, not an empty page. Never silently substitute background-only output. |
 
-`documents` maps notebook pages to backgrounds, renders PNGs, and exports PDFs. Explicit selections preserve listed order. Standalone render/export default to `background`, which omits native ink. The study `bundle` command defaults to `native`, composing supported copied pen and highlight records, filled paths, one outlined ellipse form, variable-width pencil strokes, and some linked native PNG/JPEG images over the mapped background. Pencil texture remains approximate. Coverage counts, capture time, and warnings accompany native output. `native` opens RocksDB only on disposable independent scratch; fresh options keep engine paths there and never load copied OPTIONS configuration. `annotations` decodes observed protobuf, Apple LZ4, and TPL formats with bounded expansion. Native images require an exact copied attachment binding, matching placement rectangles, and an untransformed placement. Page/background rotations, unsupported crop geometry, ambiguous versions, unknown visibility, and other transforms remain explicit. Full fidelity and all annotation types are unverified. Missing native data never silently falls back to background output.
-
-`artifacts` owns bounded storage, payload deduplication, leases, and cleanup for disposable generated outputs. It does not read Goodnotes databases or decide source fidelity. `documents` owns render reuse and verifies rendering inputs; `cli` builds current bundle text and selects managed storage only when no explicit output is supplied.
-
-`attach-pdf` retains the separate `annotated` layer for a registered user export. It checks file integrity and page count, but not page order or annotation inclusion. Registration stores a private sidecar path, without copying the PDF. Lookup creates no directories. Annotated results preserve `includes_handwriting: null` and `annotation_status: user-provided-unverified`.
-
-Multipage document operations share source resources within the command. Native extraction uses one disposable `NativeStoreSession`, with independent byte and point budgets for each page. Background PDFs use bounded handle reuse. A registered annotated PDF is hashed once for the operation; its verified file signature is checked before and after each use and before successful completion. Repeated PDF insertions use the supported insertion lifecycle to retain resource sharing. All handles and scratch stores close on success or failure; no engine handle survives into another command.
-
-`cli` defines the Typer commands and translates expected errors into compact JSON by default. Routine responses use concise profiles that retain interpretation limits while removing incidental metadata and repeated diagnostics. Global `--verbose` includes full metadata; `--fields` explicitly projects the full field contract. `--text` indents JSON for inspection and `--json` selects compact formatting. `bundle` returns page evidence directly; its full on-disk manifest is independent of the response profile. `schema` describes both output shapes without reading notebook data. Keep command parsing and presentation separate from storage queries and PDF handling.
+Generated checks cover observed records. They do not establish compatibility with every Goodnotes format or full visual fidelity. See [verification](verification.md) for the evidence boundary and [PDF and handwriting](pdf-and-handwriting.md) for output interpretation.
 
 ## Data and numbering
 
-Public page numbers start at 1, including `--page` and both ends of a `--pages` range. Internal ordering may use zero-based PDF page indexes, so conversion belongs at the CLI or document boundary.
-
-Listing and tree commands return at most 100 items by default and accept `--limit` and `--offset`. Stored-index `search` returns up to 20 snippets by default, identifies its coverage as `stored-index`, and includes warnings for missing text tables or page metadata. `scan-pdfs` searches copied PDF backgrounds independently of that index. It scans 200 pages by default and accepts a `--page-limit` up to 250. Its `next_page_offset` cursor counts pages scanned, not hits. It reports missing, unmapped, unreadable, or truncated backgrounds, and it does not search handwriting.
-
-Paged browse results include the read-view generation ID as `snapshot`. Clients can send that value back through the global `--expect-snapshot ID` option. If another `sync` has changed the active generation, the command returns a structured `stale_snapshot` error. A client should restart its page sequence against the new generation instead of mixing result pages from two views.
-
-`read` defaults to page 1 and accepts no more than 20 requested pages in one call. Its `--max-chars` option caps returned text. `bundle` accepts up to 10 pages and applies one `--max-chars` budget across the text in its manifest. Both outputs report truncation.
-
-The `read` and `search` commands preserve source labels. An agent can distinguish PDF text, handwriting recognition candidates, and typed text without guessing which mechanism produced a string. PDF text may omit annotations. Recognition candidates do not reproduce their visual position, shape, or color. The `bundle` command writes page images and source-labeled text for up to 10 requested pages. It defaults to PDF text, and its `--source` override filters text without changing the rendered image. The selected source is always recorded as `text_source` in the manifest and response.
+| Contract | Value |
+| --- | --- |
+| Page numbers | Public pages are one-based, including `--page` and both ends of `--pages`. Convert to zero-based PDF indexes at the CLI or document boundary. |
+| JSON | Compact by default. `--text` indents JSON; `--verbose` returns full metadata; `--fields` projects the full contract. |
+| Unknown values | Keep unknown/unavailable distinct from absent, false, or zero. Preserve source labels, warnings, coverage, and annotation status. |
+| List/tree | 100 items by default. |
+| Search | 20 snippets by default. |
+| Read | Page 1 by default; at most 20 pages and 12,000 combined characters by default. |
+| Bundle | At most 10 pages and one shared 12,000-character default text budget. |
+| Pagination | Results include generation ID `snapshot`. `--expect-snapshot ID` rejects a sequence after refresh; restart against the new view. |
+| Annotated PDF | Registration checks path, digest, and page count. It does not verify order or annotation inclusion, copy the PDF, or ingest text. Status is `user-provided-unverified`. |
 
 ## Dependencies and execution
 
-Python 3.11 or newer is required. Typer handles commands, PyMuPDF reads and renders PDFs, and the standard library handles SQLite. Native rendering additionally requires a compatible RocksDB shared library and writable scratch. Install a current engine with `brew install rocksdb` on macOS, or select an absolute shared-library path through `GOODNOTES_ROCKSDB_LIBRARY`. `GOODNOTES_SCRATCH_DIR` selects scratch storage. Large native stores require copy-on-write support; fallback byte copying is capped at 64 MiB per extraction. `doctor --access-only` checks filesystem access without creating files or opening databases and reports optional runtime availability separately. `uv` manages the Python project environment.
+| Requirement | Details |
+| --- | --- |
+| Python | 3.11 or newer. `uv` manages the project environment. |
+| CLI and PDF | Typer provides command parsing; PyMuPDF reads and renders PDFs. SQLite uses the standard library. |
+| Native engine | Compatible RocksDB shared library and writable scratch. On macOS, install with `brew install rocksdb`. |
+| Runtime paths | `GOODNOTES_ROCKSDB_LIBRARY` selects an absolute shared-library path; `GOODNOTES_SCRATCH_DIR` selects scratch. |
+| Diagnostics | `doctor --access-only` reports access and optional runtime availability without creating files or opening databases. |
 
-Run the CLI from the repository with `uv run goodnotes ...`. Do not install project dependencies globally or add a runtime dependency without a concrete need. Development tools live in the `dev` dependency group. Global options such as `--data-dir`, `--sandbox`, `--fields`, `--text`, `--json`, and `--expect-snapshot` go before the command name.
-
-## Design references
-
-Commands use familiar names, explicit flags, and help text that can be read without opening the source. Those choices follow the [Command Line Interface Guidelines](https://clig.dev/) and the help conventions in the [GitHub CLI reference](https://cli.github.com/manual/gh_help_reference).
-
-The `src/` layout keeps the installable package separate from project files, following the [uv project layout guidance](https://docs.astral.sh/uv/concepts/projects/layout/). [Typer](https://typer.tiangolo.com/) provides the typed command tree and option parsing.
-
-## Safety rules
-
-- In normal use, `sync` checks source file metadata and copies changed files into the CLI cache. It does not write to Goodnotes or open the source databases.
-- Reader SQLite connections open completed copies in read-only mode. Consolidation can write only to independent, unpublished staging copies.
-- `.sync.lock` serializes refreshes. `.view.lock` protects pointer resolution, active readers, publication, and pruning. Neither lock is placed in the Goodnotes library.
-- Source copying is not coordinated with the Goodnotes app. Detected changes trigger bounded retries; sustained changes fail the refresh and preserve the previous active view.
-- Managed cache generations can expire at the next successful refresh after readers finish. A caller-created snapshot outside the managed cache remains until its owner removes it.
-- `--sandbox` is a development override for an existing marked copy.
-- Keep snapshots, annotated-PDF registrations, and extracted note content outside the repository.
-- Use generated fixtures for automated tests and examples.
-- Report unsupported annotation rendering as a capability limit. Do not label OCR candidates as a visual reconstruction.
-
-See [Robustness and failure behavior](robustness.md) for concurrency cases, recovery behavior, coverage warnings, and the tests that exercise these boundaries.
+Use `uv run goodnotes ...`; do not install project dependencies globally. Put global options such as `--data-dir`, `--sandbox`, `--fields`, `--text`, `--json`, and `--expect-snapshot` before the command name.

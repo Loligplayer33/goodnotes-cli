@@ -1,295 +1,566 @@
 # Command reference
 
-Run the CLI from this repository with `uv run goodnotes`. Global options go before the command. For example:
+Generated from the registered Typer commands and their machine-readable schema. After changing the CLI, update this page with `uv run --locked python scripts/docs.py`.
 
-```sh
-uv run goodnotes --text ls --limit 50
-uv run goodnotes --expect-snapshot SNAPSHOT_ID pages "Course Notes"
-```
+Run the CLI as `uv run goodnotes`. Put global options before the command. Use `uv run goodnotes COMMAND --help` for terminal help and `uv run goodnotes schema COMMAND` for the complete machine-readable contract.
 
-Use `uv run goodnotes --help` for the command index, `uv run goodnotes COMMAND --help` for readable examples and options, and `uv run goodnotes schema COMMAND` for structured arguments, options, defaults, bounds, and output-field hints. Plain `schema` returns the compact overview.
+For interpreting fields, warnings, and pagination, see [results and output](output.md) and the [agent guide](agent-guide.md).
 
 ## Command index
 
-| Command | Use |
+| Command | Syntax |
 | --- | --- |
-| [sync](#sync) | Refresh the managed local read view. |
-| [watch](#watch) | Refresh the copy automatically while a foreground process runs. |
-| [snapshot](#snapshot) | Create a separate named copy of a Library directory. |
-| [ls](#ls) | List a folder's direct children. |
-| [tree](#tree) | List descendants within a depth and result limit. |
-| [info](#info) | Resolve an item selector. |
-| [pages](#pages) | List a notebook's pages in current order. |
-| [read](#read) | Read source-labelled text from notebook pages. |
-| [search](#search) | Search text stored in the search index. |
-| [scan-pdfs](#scan-pdfs) | Search copied PDF backgrounds. |
-| [export](#export) | Export a notebook to PDF. |
-| [render](#render) | Render one notebook page to PNG. |
-| [attach-pdf](#attach-pdf) | Register a user-exported PDF for the annotated layer. |
-| [bundle](#bundle) | Write selected page images and text to a new directory. |
-| [doctor](#doctor) | Inspect the active read view and its available text sources. |
-| [schema](#schema) | Print the CLI's machine-readable command contract. |
+| [`sync`](#sync) | `goodnotes sync [OPTIONS]` |
+| [`watch`](#watch) | `goodnotes watch [OPTIONS]` |
+| [`snapshot`](#snapshot) | `goodnotes snapshot [OPTIONS] LIBRARY DESTINATION` |
+| [`ls`](#ls) | `goodnotes ls [OPTIONS]` |
+| [`tree`](#tree) | `goodnotes tree [OPTIONS]` |
+| [`info`](#info) | `goodnotes info [OPTIONS] NOTEBOOK` |
+| [`pages`](#pages) | `goodnotes pages [OPTIONS] NOTEBOOK` |
+| [`read`](#read) | `goodnotes read [OPTIONS] NOTEBOOK` |
+| [`search`](#search) | `goodnotes search [OPTIONS] QUERY` |
+| [`scan-pdfs`](#scan-pdfs) | `goodnotes scan-pdfs [OPTIONS] QUERY` |
+| [`export`](#export) | `goodnotes export [OPTIONS] NOTEBOOK` |
+| [`render`](#render) | `goodnotes render [OPTIONS] NOTEBOOK` |
+| [`bundle`](#bundle) | `goodnotes bundle [OPTIONS] NOTEBOOK` |
+| [`attach-pdf`](#attach-pdf) | `goodnotes attach-pdf [OPTIONS] NOTEBOOK PDF` |
+| [`doctor`](#doctor) | `goodnotes doctor [OPTIONS]` |
+| [`schema`](#schema) | `goodnotes schema [OPTIONS] [COMMAND]` |
 
 ## Global options
 
-These options are accepted before a command. They apply only where the command uses them.
+Accepted before a command:
 
-| Option | Default or environment | Effect |
-| --- | --- | --- |
-| `--sandbox PATH` | `GOODNOTES_SANDBOX`; unset by default | Read from an existing marked snapshot instead of the active managed view. |
-| `--data-dir PATH` | `GOODNOTES_DATA_DIR`; otherwise `$XDG_CACHE_HOME/goodnotes-cli`, or `~/.cache/goodnotes-cli` | Select the managed cache location. |
-| `--text` | Off | Indent JSON for inspection. |
-| `--json` | On | Emit compact JSON. If both `--text` and `--json` are given, compact JSON wins. |
-| `--verbose` | Off | Include full JSON metadata instead of the concise response profile. |
-| `--fields FIELDS` | All fields | Comma-separated keys to keep. It selects keys in object rows under `items`, `pages`, or `hits` when present; otherwise it selects top-level response keys. An unknown key returns the valid keys for that level. |
-| `--expect-snapshot ID` | Unset | Fail with `stale_snapshot` if a cache-backed command opens a different read-view generation. |
-| `--version` | N/A | Print the CLI version and exit. |
-| `--help` | N/A | Show the CLI or command's help and exit. |
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--sandbox` | Path | Unset; env `GOODNOTES_SANDBOX` | Use an existing read view. |
+| `--data-dir` | Path | Unset; env `GOODNOTES_DATA_DIR` | Managed cache directory; use the same selection for sync and reads. |
+| `--text` | Flag | `False` | Indent JSON for inspection. |
+| `--json` | Flag | `False` | Compact JSON, the default. |
+| `--verbose` | Flag | `False` | Include full metadata and native format diagnostics. |
+| `--fields` | Text | Unset | Comma-separated row fields or response keys; see schema COMMAND output. |
+| `--expect-snapshot` | Text | Unset | Reject a changed pagination generation. |
+| `--version` | Flag | `False` | Print the version. |
 
-`GOODNOTES_DATA_DIR` takes precedence over the default cache path; `--data-dir` overrides the environment. The same precedence applies to `GOODNOTES_SANDBOX` and `--sandbox`.
-
-Field selection filters object rows while keeping surrounding metadata, including warnings and pagination. Empty row arrays stay empty and still validate requested field names. Responses without object-row arrays, such as `bundle`, use top-level selection. Valid optional response keys are omitted when absent. Cache-backed commands always retain `snapshot`. Declared fields are checked before commands write outputs or cache state. Use `schema COMMAND` for field names; selecting `recognition` requires `pages --with-recognition`.
-
-Concise profiles apply by default to sync/watch, listings, item and page metadata, page reads, renders, exports, and bundles. Other commands retain their full responses. Sync/watch omit the snapshot path and detailed capture counters. Listings omit parent IDs and timestamps. Page reads share the document ID at the response level. Native summaries keep coverage, fidelity status, object counts, unsupported reasons, and warnings. `--verbose` restores full metadata; `--fields` deliberately projects the full field contract instead of the concise profile. Errors are always complete. Use `schema COMMAND` for both output shapes.
-
-## Names, folders, and pages
-
-`NOTEBOOK` accepts an exact UUID, exact full library path, or unique exact name. `FOLDER` accepts the same selector forms but must resolve to a folder. An ambiguous name fails instead of choosing an item. Use the full path or UUID when names repeat. `ls` and `tree` use `/` when `--folder` is omitted. `search` and `scan-pdfs` use `/` when neither scope option is supplied.
-
-Public page numbers start at 1. Page expressions such as `1-3,7` preserve the listed order and reject duplicates, empty entries, reversed ranges, and pages outside the notebook. Page-count limits depend on the command: `read` accepts at most 20, `bundle` at most 10, and `export` has no 20-page cap.
+`--fields` is unset by default, so omitting it uses the command's default response profile. Supplying it selects keys from the full response contract; consult `schema COMMAND` for the command-specific fields. Compact JSON is the default output format; the schema reports the `--json` flag's parser default separately.
 
 ## Commands
 
 ### sync
 
 ```text
-goodnotes sync [--library PATH] [--force | --no-force]
+goodnotes sync [OPTIONS]
 ```
 
-| Option | Default | Effect |
-| --- | --- | --- |
-| `--library PATH` | Goodnotes Library at `~/Library/Containers/com.goodnotesapp.x/Data/Library` on macOS | Choose the source Library directory. |
-| `--force` / `--no-force` | `--no-force` | Capture and validate a fresh generation even when inventory checks match. |
+Create or refresh the managed library copy.
 
-Refreshes the active managed copy and removes superseded managed generations after readers finish. It reads source Library files but does not open source SQLite databases, control Goodnotes, or write to the source library. The result includes `status` (`ready` or `unchanged`), `snapshot_id`, `checked_at`, `source_changed_during_refresh`, and, when available, `captured_at` and `warnings`. Global `--verbose` adds the `snapshot` generation path and detailed capture counters. A true `source_changed_during_refresh` means the published copy is valid as of `captured_at`; it does not promise that the source stayed unchanged until the command returned.
+Reads source files without opening source SQLite or writing to Goodnotes. Reuses
+an unchanged copy unless --force is set. Later source edits require another sync.
+Requires cache write access and initializes persistent locks for read-only readers.
 
-With global `--verbose`, `capture_stats` reports logical file and byte counts for captured, reused, cloned, copied, and hashed data. Unchanged files can reuse a prior verified digest when both source and cached-file metadata match. A clone shares storage blocks but has an independent file identity; byte counts do not measure physical disk allocation. `--force` bypasses reuse. Sync includes the optional `notes_main.db` native store and its WAL files. Do not combine `sync` with the global `--sandbox` option; choose the source with `--library`.
+**Options**
+
+| Name | Type | Default | Description and bounds |
+| --- | --- | --- | --- |
+| `--library` | Path | Unset | Goodnotes Library directory. |
+| `--force` / `--no-force` | Flag | `False` | Rebuild and verify even when files appear unchanged. |
+
+Example:
+
+```sh
+goodnotes sync --library /path/to/Library
+```
+
+Output details: [`uv run goodnotes schema sync`](#schema) reports the fields and output profile.
+
 
 ### watch
 
 ```text
-goodnotes watch [--library PATH] [--interval SECONDS] [--debounce SECONDS] [--iterations N]
+goodnotes watch [OPTIONS]
 ```
 
-| Option | Default | Bounds or effect |
-| --- | --- | --- |
-| `--library PATH` | Same discovery as `sync` | Source Library directory; excludes global `--sandbox`. |
-| `--interval SECONDS` | `2` | `0.05` to `3600` seconds between metadata checks |
-| `--debounce SECONDS` | `1` | `0` to `60` seconds to coalesce edits before capture |
-| `--iterations N` | Unset | Stop after `N` polling iterations, at least `1`; otherwise run until interrupted. |
+Keep the copied library refreshed while this foreground process runs.
 
-Runs serial copied-data refreshes. Compact output is one JSON object per event: `ready`, `updated`, `recovered`, or `error`. Unchanged checks after startup emit nothing. Success events contain the sync result plus `event` and `iteration`; error events contain structured `error` details and `retry_in_seconds`. Transient failures leave the prior copy selected and retry with backoff. If a bounded run ends with an unrecovered error, it exits `1`; Ctrl-C exits `130`. With `--text`, each event is indented across multiple lines.
+Emits one JSON object per ready, updated, recovery, or error event. Unchanged
+checks stay quiet. Ctrl-C stops the watcher. This observes files on the Mac;
+it cannot establish whether the latest iPad changes have reached this Mac.
 
-Watch checks files on the Mac. It does not confirm that the latest iPad edit has reached Goodnotes on this Mac, and it does not start a background service after the command exits.
+**Options**
+
+| Name | Type | Default | Description and bounds |
+| --- | --- | --- | --- |
+| `--library` | Path | Unset | Goodnotes Library directory. |
+| `--interval` | Number | `2` | Seconds between metadata checks. Bounds: 0.05 to 3600. |
+| `--debounce` | Number | `1` | Seconds to coalesce edits before capture. Bounds: 0 to 60. |
+| `--iterations` | Integer | Unset | Stop after this many polling iterations. Bounds: at least 1. |
+
+Example:
+
+```sh
+goodnotes watch --library /path/to/Library --interval 2
+```
+
+Output details: [`uv run goodnotes schema watch`](#schema) reports the fields and output profile.
+
 
 ### snapshot
 
 ```text
-goodnotes snapshot LIBRARY DESTINATION
+goodnotes snapshot [OPTIONS] LIBRARY DESTINATION
 ```
 
-Creates an independent, validated copy at a new destination. The destination must not already exist and must not overlap the source Library. The result is `{"snapshot":"DESTINATION","status":"ready"}`; here `snapshot` is the destination path, not the generation ID accepted by `--expect-snapshot`. This command does not make the copy the active managed view.
+Create an independent copy at a new destination.
+
+LIBRARY must contain Databases/ and Attachments/. Does not change the active cache.
+Read the result with the global --sandbox option.
+
+**Arguments**
+
+| Name | Type | Default | Description and bounds |
+| --- | --- | --- | --- |
+| `LIBRARY` | Path | Required | Source Library directory. |
+| `DESTINATION` | Path | Required | New snapshot directory to create. |
+
+Example:
+
+```sh
+goodnotes snapshot /path/to/Library /path/to/saved-copy
+```
+
+Output details: [`uv run goodnotes schema snapshot`](#schema) reports the fields and output profile.
+
 
 ### ls
 
 ```text
-goodnotes ls [--folder FOLDER] [--limit N] [--offset N]
+goodnotes ls [OPTIONS]
 ```
 
-| Option | Default | Bounds |
-| --- | --- | --- |
-| `--folder FOLDER` | `/` | Folder selector; see [Names, folders, and pages](#names-folders-and-pages). |
-| `--limit N` | `100` | `1` to `1000` items |
-| `--offset N` | `0` | `0` or greater |
+List a folder's direct children.
 
-Lists direct children in stored order. The result has an `items` array, `next_offset`, and the active read-view `snapshot` ID. Item rows include `id`, `name`, `kind`, `path`, and `page_count`; global `--verbose` adds `parent_id` and `updated_at`.
+--folder accepts a path, UUID, or unique name; / selects the root. Continue with
+next_offset and pin the returned snapshot ID using global --expect-snapshot.
+
+**Options**
+
+| Name | Type | Default | Description and bounds |
+| --- | --- | --- | --- |
+| `--folder` | Text | `/` | Folder UUID, path, or unique exact name; / is the root. |
+| `--limit` | Integer | `100` | Bounds: 1 to 1000. |
+| `--offset` | Integer | `0` | Bounds: at least 0. |
+
+Example:
+
+```sh
+goodnotes ls --folder "Course" --limit 20
+```
+
+Output details: [`uv run goodnotes schema ls`](#schema) reports the fields and output profile.
+
 
 ### tree
 
 ```text
-goodnotes tree [--folder FOLDER] [--depth N] [--limit N] [--offset N]
+goodnotes tree [OPTIONS]
 ```
 
-| Option | Default | Bounds |
-| --- | --- | --- |
-| `--folder FOLDER` | `/` | Folder selector; see [Names, folders, and pages](#names-folders-and-pages). |
-| `--depth N` | `3` | `1` to `50` levels |
-| `--limit N` | `100` | `1` to `1000` items |
-| `--offset N` | `0` | `0` or greater |
+List descendants within a depth and result limit.
 
-Lists descendants in stored sibling order. The result has `items`, `next_offset`, and the active read-view `snapshot` ID. Use `next_offset` as the next `--offset`.
+--folder selects the starting folder, / by default. Continue with next_offset;
+global --expect-snapshot keeps pagination on one generation.
+
+**Options**
+
+| Name | Type | Default | Description and bounds |
+| --- | --- | --- | --- |
+| `--folder` | Text | `/` | Folder UUID, path, or unique exact name; / is the root. |
+| `--depth` | Integer | `3` | Bounds: 1 to 50. |
+| `--limit` | Integer | `100` | Bounds: 1 to 1000. |
+| `--offset` | Integer | `0` | Bounds: at least 0. |
+
+Example:
+
+```sh
+goodnotes tree --folder "Course" --depth 2
+```
+
+Output details: [`uv run goodnotes schema tree`](#schema) reports the fields and output profile.
+
 
 ### info
 
 ```text
-goodnotes info NOTEBOOK
+goodnotes info [OPTIONS] NOTEBOOK
 ```
 
-Resolves an active folder or notebook by UUID, full path, or unique name. Returns the item record. Ambiguous or unreachable selectors fail; the CLI does not guess.
+Show a folder or notebook's metadata.
+
+NOTEBOOK accepts an exact UUID, full library path, or unique exact name.
+Ambiguous names fail; use a full path or UUID to disambiguate.
+
+**Arguments**
+
+| Name | Type | Default | Description and bounds |
+| --- | --- | --- | --- |
+| `NOTEBOOK` | Text | Required | Exact UUID, full library path, or unique exact name. |
+
+Example:
+
+```sh
+goodnotes info "Course Notes"
+```
+
+Output details: [`uv run goodnotes schema info`](#schema) reports the fields and output profile.
+
 
 ### pages
 
 ```text
-goodnotes pages NOTEBOOK [--limit N] [--offset N] [--with-recognition | --no-with-recognition]
+goodnotes pages [OPTIONS] NOTEBOOK
 ```
 
-| Option | Default | Bounds |
-| --- | --- | --- |
-| `--limit N` | `100` | `1` to `1000` pages |
-| `--offset N` | `0` | `0` or greater |
-| `--with-recognition` / `--no-with-recognition` | `--no-with-recognition` | Add or omit stored recognition status metadata. |
+List pages in current notebook order, numbered from 1.
 
-Lists the notebook's active pages in current order, numbered from 1. The result has a `pages` array, shared `document_id`, `next_offset`, and the active read-view `snapshot` ID. Page rows include their IDs, numbers, and annotation counts. Global `--verbose` adds position, background/PDF mapping, dimensions, and per-row document IDs. `--with-recognition` adds per-page availability and index state without returning candidate text. The top-level `annotation_count_source` is `projection.notes_items`; it does not count ink or OCR results.
+Returns pages and next_offset. --with-recognition adds metadata without reading
+candidate text. annotation_count counts projected note items, not ink or recognition.
+Continue with --offset and pin --expect-snapshot for a consistent generation.
+
+**Arguments**
+
+| Name | Type | Default | Description and bounds |
+| --- | --- | --- | --- |
+| `NOTEBOOK` | Text | Required | Exact UUID, full library path, or unique exact name. |
+
+**Options**
+
+| Name | Type | Default | Description and bounds |
+| --- | --- | --- | --- |
+| `--limit` | Integer | `100` | Bounds: 1 to 1000. |
+| `--offset` | Integer | `0` | Bounds: at least 0. |
+| `--with-recognition` / `--no-with-recognition` | Flag | `False` | Include stored handwriting recognition availability and index state. |
+
+Example:
+
+```sh
+goodnotes pages "Course Notes" --limit 20
+```
+
+Output details: [`uv run goodnotes schema pages`](#schema) reports the fields and output profile.
+
 
 ### read
 
 ```text
-goodnotes read NOTEBOOK [--page N | --pages EXPR] [--source SOURCE] [--max-chars N]
+goodnotes read [OPTIONS] NOTEBOOK
 ```
 
-| Option | Default | Bounds or values |
-| --- | --- | --- |
-| `--page N` | Page `1` if neither page option is given | `1` or greater |
-| `--pages EXPR` | Unset | Up to 20 distinct pages, for example `1-3,7` |
-| `--source SOURCE` | `all` | `all`, `pdf`, `handwriting`, or `textbox` |
-| `--max-chars N` | `12000` | `1` to `1000000` characters across the selected pages |
+Read page text with PDF, handwriting, and textbox source labels.
 
-Use either `--page` or `--pages`, not both. Returns a `pages` array of page IDs and source-labelled `parts`, plus `truncated` and the active read-view `snapshot` ID. PDF text may come from the stored index or from a mapped PDF background in the copy. Handwriting text is stored recognition output, not a visual reading of ink. It preserves raw candidate delimiters. Label any cleaned reconstruction as an interpretation, not an exact quotation. A pending-index warning may appear even when no candidate text is returned. See [PDF and handwriting](pdf-and-handwriting.md) for source limits.
+Defaults to page 1. Choose --page or --pages, up to 20 distinct pages. The
+character budget covers all selected pages; check truncated in the response.
+Handwriting is stored recognition output. Native ink and attached PDFs are not decoded.
+
+**Arguments**
+
+| Name | Type | Default | Description and bounds |
+| --- | --- | --- | --- |
+| `NOTEBOOK` | Text | Required | Exact UUID, full library path, or unique exact name. |
+
+**Options**
+
+| Name | Type | Default | Description and bounds |
+| --- | --- | --- | --- |
+| `--page` | Integer | Unset | Bounds: at least 1. |
+| `--pages` | Text | Unset | Up to 20 pages, e.g. 1-3,7. |
+| `--source` | Text | `all` | all, pdf, handwriting, or textbox. |
+| `--max-chars` | Integer | `12000` | Bounds: 1 to 1000000. |
+
+Example:
+
+```sh
+goodnotes read "Course Notes" --pages 1-3,7 --source handwriting
+```
+
+Output details: [`uv run goodnotes schema read`](#schema) reports the fields and output profile.
+
 
 ### search
 
 ```text
-goodnotes search QUERY [--folder FOLDER | --notebook NOTEBOOK] [--source SOURCE] [--limit N] [--offset N]
+goodnotes search [OPTIONS] QUERY
 ```
 
-| Option | Default | Bounds or values |
-| --- | --- | --- |
-| `--folder FOLDER` | Unset | Folder selector; mutually exclusive with `--notebook`. |
-| `--notebook NOTEBOOK` | Unset | One notebook by UUID, path, or unique exact name; mutually exclusive with `--folder`. |
-| `--source SOURCE` | `all` | `all`, `pdf`, `handwriting`, or `textbox` |
-| `--limit N` | `20` | `1` to `100` hits |
-| `--offset N` | `0` | `0` or greater |
+Search stored text for a literal, case-insensitive phrase.
 
-Finds literal, case-insensitive substrings in stored search-index rows. The result includes `hits`, `next_offset`, `coverage: "stored-index"`, `coverage_detail`, `warnings`, and the active read-view `snapshot` ID. `coverage_detail` reports the resolved scope, source-specific stored-text counts, metadata diagnostics, warnings, and next steps. Its completeness remains `unknown`; metadata rows do not prove index coverage. Search does not start a PDF scan automatically. Run [scan-pdfs](#scan-pdfs) separately when copied PDF text may be missing from the index.
+Choose --notebook for one notebook or --folder for a subtree. coverage_detail
+reports scoped source availability, not proof that every page was indexed.
+No hits do not prove absence; scan-pdfs searches PDF backgrounds separately.
+Snippets are capped at 320 characters.
+
+**Arguments**
+
+| Name | Type | Default | Description and bounds |
+| --- | --- | --- | --- |
+| `QUERY` | Text | Required | Literal, case-insensitive text to find. |
+
+**Options**
+
+| Name | Type | Default | Description and bounds |
+| --- | --- | --- | --- |
+| `--folder` | Text | Unset | Folder selector; defaults to /. Use with --notebook omitted. |
+| `--notebook` | Text | Unset | Exact notebook UUID, path, or unique name; excludes --folder. |
+| `--source` | Text | `all` | all, pdf, handwriting, or textbox. |
+| `--limit` | Integer | `20` | Bounds: 1 to 100. |
+| `--offset` | Integer | `0` | Bounds: at least 0. |
+
+Example:
+
+```sh
+goodnotes search "regression" --folder "Course" --limit 10
+```
+
+Output details: [`uv run goodnotes schema search`](#schema) reports the fields and output profile.
+
 
 ### scan-pdfs
 
 ```text
-goodnotes scan-pdfs QUERY [--folder FOLDER | --notebook NOTEBOOK] [--limit N] [--page-limit N] [--page-offset N]
+goodnotes scan-pdfs [OPTIONS] QUERY
 ```
 
-| Option | Default | Bounds |
-| --- | --- | --- |
-| `--folder FOLDER` | Unset | Folder selector; mutually exclusive with `--notebook`. |
-| `--notebook NOTEBOOK` | Unset | One notebook by UUID, path, or unique exact name; mutually exclusive with `--folder`. |
-| `--limit N` | `20` | `1` to `100` hits |
-| `--page-limit N` | `200` | `1` to `250` notebook pages scanned per call |
-| `--page-offset N` | `0` | `0` or greater |
+Search PDF background text when the stored index misses it.
 
-Searches extracted text from copied PDF backgrounds only. It does not search the stored index, handwriting, or a PDF registered with `attach-pdf`. The result includes `hits`, resolved `scope`, `total_pages` for that scope, `pages_scanned`, `next_page_offset`, `scan_complete`, `coverage_complete`, `stop_reason`, `warnings`, and the active read-view `snapshot` ID. `stop_reason` is `complete`, `hit-limit`, or `page-limit`. `scan_complete` means no pages remain in the scoped sequence. `coverage_complete` is true only for a scan starting at offset `0` that reaches the end without extraction gaps; it does not describe handwriting or registered PDFs. Continue with `--page-offset` set to `next_page_offset` and keep the query, scope, and snapshot fixed. The cursor counts scanned pages, not matching hits. Warnings may report missing, unmapped, unreadable, or truncated background pages.
+Choose --notebook or --folder. Continue next_page_offset with --page-offset,
+the same scope, query, and snapshot. coverage_complete requires a complete
+scan from offset 0 without extraction gaps. Does not search handwriting or attached PDFs.
+
+**Arguments**
+
+| Name | Type | Default | Description and bounds |
+| --- | --- | --- | --- |
+| `QUERY` | Text | Required | Literal, case-insensitive PDF text to find. |
+
+**Options**
+
+| Name | Type | Default | Description and bounds |
+| --- | --- | --- | --- |
+| `--folder` | Text | Unset | Folder selector; defaults to /. Use with --notebook omitted. |
+| `--notebook` | Text | Unset | Exact notebook UUID, path, or unique name; excludes --folder. |
+| `--limit` | Integer | `20` | Bounds: 1 to 100. |
+| `--page-limit` | Integer | `200` | Bounds: 1 to 250. |
+| `--page-offset` | Integer | `0` | Bounds: at least 0. |
+
+Example:
+
+```sh
+goodnotes scan-pdfs "regression" --folder "Course" --page-limit 50
+```
+
+Output details: [`uv run goodnotes schema scan-pdfs`](#schema) reports the fields and output profile.
+
 
 ### export
 
 ```text
-goodnotes export NOTEBOOK --output FILE [--pages EXPR] [--layer LAYER]
+goodnotes export [OPTIONS] NOTEBOOK
 ```
 
-| Option | Default | Values |
-| --- | --- | --- |
-| `--output FILE` | Required | New `.pdf` path |
-| `--pages EXPR` | All pages | Distinct one-based page numbers; preserves listed order, with no 20-page cap |
-| `--layer LAYER` | `background` | `background`, `native`, or `annotated` |
+Export all pages, or selected pages in listed order, to a new PDF.
 
-Exports all active notebook pages in current order when `--pages` is omitted. For example, `--pages 1-3,7` exports those pages in that listed order. The result includes the output path, `pages` count, `selected_pages`, source, `includes_handwriting`, `annotation_status`, and warnings. Native output also reports stroke, filled-path, and image counts; images do not count as handwriting. The background layer does not overlay native Goodnotes ink. The native layer reconstructs supported objects from the copied native store and reports coverage; it never silently substitutes background-only output when native data is unavailable. See [native ink](pdf-and-handwriting.md#native-ink-without-manual-pdf-exports) for setup and limitations. The annotated layer requires a PDF registered with [attach-pdf](#attach-pdf); registration cannot verify annotation inclusion or page order. Existing output paths are never overwritten; outputs must be outside the snapshot and production Goodnotes locations.
+The default background layer omits native ink. The annotated layer requires
+attach-pdf and uses an unverified user export. Existing outputs are never replaced.
+
+**Arguments**
+
+| Name | Type | Default | Description and bounds |
+| --- | --- | --- | --- |
+| `NOTEBOOK` | Text | Required | Exact UUID, full library path, or unique exact name. |
+
+**Options**
+
+| Name | Type | Default | Description and bounds |
+| --- | --- | --- | --- |
+| `--output` | Path | Required | New PDF file to write. |
+| `--layer` | Text | `background` | background, native, or annotated. |
+| `--pages` | Text | Unset | Selected pages in listed order, e.g. 1-3,7. Defaults to all. |
+
+Example:
+
+```sh
+goodnotes export "Course Notes" --output /tmp/course.pdf
+```
+
+Output details: [`uv run goodnotes schema export`](#schema) reports the fields and output profile.
+
+For temporary cache behavior and persistent output paths, see [temporary and saved files](output.md#temporary-and-saved-files).
+
 
 ### render
 
 ```text
-goodnotes render NOTEBOOK [--output PNG] [--page N] [--layer LAYER] [--dpi N]
+goodnotes render [OPTIONS] NOTEBOOK
 ```
 
-| Option | Default | Bounds or values |
-| --- | --- | --- |
-| `--output PNG` | Managed temporary cache | New persistent `.png` path when supplied |
-| `--page N` | `1` | `1` or greater, within the notebook |
-| `--layer LAYER` | `background` | `background`, `native`, or `annotated` |
-| `--dpi N` | `150` | `72` to `300` |
+Render one page to a temporary cached PNG, or save it with --output.
 
-Renders one page for visual inspection. Returns the output path, notebook and page IDs, source page, layer, DPI, annotation status, and warnings. Native output also includes a `native_annotations` summary with separate `rendered_strokes`, `rendered_paths`, and `rendered_images` counts. Native images do not count as handwriting. Without `--output`, the response includes `temporary: true` and follows the [artifact retention policy](#artifact-retention). Explicit output-path and annotation limits are the same as [export](#export).
+--layer native reconstructs supported copied ink and reports coverage. Background
+omits native ink; annotated requires attach-pdf. Page numbers start at 1.
+Cached images expire after a day of inactivity and share a 100 MB limit.
+Returned paths are protected for five minutes. Explicit outputs are never replaced.
 
-### attach-pdf
+**Arguments**
 
-```text
-goodnotes attach-pdf NOTEBOOK PDF
+| Name | Type | Default | Description and bounds |
+| --- | --- | --- | --- |
+| `NOTEBOOK` | Text | Required | Exact UUID, full library path, or unique exact name. |
+
+**Options**
+
+| Name | Type | Default | Description and bounds |
+| --- | --- | --- | --- |
+| `--output` | Path | Unset | Save a persistent PNG outside the cache. |
+| `--page` | Integer | `1` | Bounds: at least 1. |
+| `--layer` | Text | `background` |  |
+| `--dpi` | Integer | `150` | Bounds: 72 to 300. |
+
+Example:
+
+```sh
+goodnotes render "Course Notes" --page 3 --output /tmp/page-3.png
 ```
 
-Registers a user-exported full notebook PDF for the `annotated` layer. It checks that the input is a regular, readable PDF with the notebook's current page count, then stores registration metadata in a sidecar tied to this snapshot generation. The command records the PDF path rather than copying it. Keep the file available and unchanged. Page count and file-integrity checks cannot confirm that annotations are present or that the PDF page order matches the notebook. Results report `annotation_status: "user-provided-unverified"` for annotated outputs.
+Output details: [`uv run goodnotes schema render`](#schema) reports the fields and output profile.
+
+For temporary cache behavior and persistent output paths, see [temporary and saved files](output.md#temporary-and-saved-files).
+
 
 ### bundle
 
 ```text
-goodnotes bundle NOTEBOOK [--output DIR] [--pages EXPR] [--source SOURCE] [--layer LAYER] [--dpi N] [--max-chars N]
+goodnotes bundle [OPTIONS] NOTEBOOK
 ```
 
-| Option | Default | Bounds or values |
-| --- | --- | --- |
-| `--output DIR` | Managed temporary cache | New persistent directory when supplied |
-| `--pages EXPR` | `1` | Up to 10 distinct pages, for example `1-3,7` |
-| `--source SOURCE` | `pdf` | Text sources: `all`, `pdf`, `handwriting`, or `textbox`. Does not change images. |
-| `--layer LAYER` | `native` | `background`, `native`, or `annotated` |
-| `--dpi N` | `150` | `72` to `300` |
-| `--max-chars N` | `12000` | `1` to `1000000` characters across all selected pages |
+Inspect pages using a temporary cached bundle, or save it with --output.
 
-Creates `page-NNNN.png` files and `text.json` in a managed temporary directory, or the new persistent directory supplied through `--output`. By default, it returns concise `page_evidence` with native annotated images and PDF text, plus the manifest path, selected pages, layer, text source, truncation status, capture time, and active read-view `snapshot` ID. Native evidence includes separate stroke, filled-path, and image counts; images do not count as handwriting. Managed responses include `temporary: true`. Native cache misses require the optional runtime and copied store; a previously verified cached image can be reused without opening the engine. If a page-local native decode, mapping, or rendering error occurs in a multi-page request and at least one selected page renders, the bundle returns every selected row in order with `status: "partial"`, `failed_pages`, and a warning. Failed rows retain source-labelled text and a structured `render_error`, set `image` to null, and omit successful-render metadata. Failed pages never become background-only images. A single-page or all-pages failure remains a structured error and publishes no bundle. Engine, safety, source-integrity, output, and other global failures remain fatal. Explicit destinations are not overwritten; outputs must be outside the snapshot and production Goodnotes locations.
+Select up to 10 distinct pages with --pages, e.g. 1-3,7. One character budget
+covers all text. Defaults to native ink images and PDF text. Native reconstruction
+reports coverage; annotated requires attach-pdf. Text keeps its original source labels.
+--source filters returned text only; the image still uses the selected layer.
+Returns page evidence directly. A bundle with at least one rendered native image keeps
+text for failed pages and reports their render errors; a bundle with no rendered images
+remains an error. Global --verbose includes full metadata.
+Cached outputs share a 100 MB limit and expire after a day of inactivity.
+Returned paths are protected for five minutes; explicit outputs remain until removed.
 
-### Artifact retention
+**Arguments**
 
-Managed renders and bundles share a separate CLI-owned `artifacts/` directory under the selected data directory. The cap is 100,000,000 bytes of unique retained PNG payloads, manifests, and entry metadata, excluding small fixed control files and in-progress staging. PNGs are content-addressed and hard-linked only between generated artifacts, so identical images count once. Goodnotes files and snapshot files are never linked into this cache.
+| Name | Type | Default | Description and bounds |
+| --- | --- | --- | --- |
+| `NOTEBOOK` | Text | Required | Exact UUID, full library path, or unique exact name. |
 
-Matching renders from the same pinned view reuse their PNGs. Across new snapshots, the CLI revalidates and renders the page, then shares storage if the PNG bytes are identical. Bundle text is queried for every request, and current text and provenance determine its manifest. Changes to rendering settings, source inputs, or the renderer version invalidate image reuse.
+**Options**
 
-Entries expire after 86,400 seconds since their last CLI use. Expired and least-recently-used entries are removed on subsequent managed artifact operations. Entries used within the last five minutes are protected so another tool can open returned image paths. If a result cannot fit without removing protected artifacts, the command returns `artifact_cache_capacity`; retry later or use `--output`. Retention does not delete explicitly saved outputs, named snapshots, source files, or unrelated directories. No background cleaner runs after the CLI exits.
+| Name | Type | Default | Description and bounds |
+| --- | --- | --- | --- |
+| `--output` | Path | Unset | Save a persistent bundle outside the cache. |
+| `--pages` | Text | `1` |  |
+| `--layer` | Text | `native` |  |
+| `--dpi` | Integer | `150` | Bounds: 72 to 300. |
+| `--max-chars` | Integer | `12000` | Bounds: 1 to 1000000. |
+| `--source` | Text | `pdf` | pdf, all, handwriting, or textbox text. |
 
-Metadata and text commands still require only read access to the library cache. Default visual requests also need write access to artifact storage. A reader with read-only cache access can use a writable explicit `--output` destination instead.
+Example:
 
-Evidence appears directly in stdout, so an agent can read the text and open absolute image paths without another manifest-read call. Concise output shares the document ID and keeps one page ID and image path per page, source-labeled text, annotation coverage, and distinct warnings. Global `--verbose` includes full nested metadata. The on-disk `text.json` retains full diagnostics regardless of output mode. The same character budget and truncation flags apply to stdout and the manifest.
+```sh
+goodnotes bundle "Course Notes" --pages 1-3 --output /tmp/course-pages
+```
 
-`--source` filters text using the same rules as `read` and is always recorded as `text_source` in stdout and the manifest. Use `--source all` to include stored recognition candidates and typed text. Use `--layer background` when deliberately requesting clean page images, or `--layer annotated` for a registered PDF export. These overrides preserve the original browsing, reading, and export capabilities.
+Output details: [`uv run goodnotes schema bundle`](#schema) reports the fields and output profile.
+
+For temporary cache behavior and persistent output paths, see [temporary and saved files](output.md#temporary-and-saved-files).
+
+
+### attach-pdf
+
+```text
+goodnotes attach-pdf [OPTIONS] NOTEBOOK PDF
+```
+
+Register a Goodnotes-exported PDF for annotated rendering and export.
+
+Checks file integrity and page count, not annotation inclusion or page order.
+Keep the PDF unchanged at its path. Re-register after a new snapshot generation.
+Does not add the PDF's text to read, search, or scan-pdfs.
+
+**Arguments**
+
+| Name | Type | Default | Description and bounds |
+| --- | --- | --- | --- |
+| `NOTEBOOK` | Text | Required | Exact UUID, full library path, or unique exact name. |
+| `PDF` | Path | Required | Existing PDF exported from Goodnotes. |
+
+Example:
+
+```sh
+goodnotes attach-pdf "Course Notes" /path/to/annotated.pdf
+```
+
+Output details: [`uv run goodnotes schema attach-pdf`](#schema) reports the fields and output profile.
+
 
 ### doctor
 
 ```text
-goodnotes doctor [--access-only] [--library PATH] [--scratch-dir PATH] [--output-dir PATH]
+goodnotes doctor [OPTIONS]
 ```
 
-Reports active and deleted item counts, tree consistency issues, search-index availability, available content tables, page-metadata gaps, and warnings for the selected read view. It does not refresh the source library.
+Report local library counts, missing metadata, and text-source warnings.
 
-`storage` contains the resolved managed `cache_dir`, selected `snapshot_path`, and `captured_at` from the snapshot marker. `cache_dir` is `null` for a caller-owned named snapshot; `captured_at` is `null` when an older marker has no capture time. The result also retains the generation ID as `snapshot`.
+storage contains cache_dir, snapshot_path, and captured_at; unknown values are null.
+Reads the selected copy without refreshing it or contacting Goodnotes.
 
-`--access-only` checks filesystem access without opening a database or writing files. It works before cache initialization and honors global `--data-dir` or `--sandbox`. The other three options require `--access-only`: `--library` checks an explicitly selected source, `--scratch-dir` selects the native scratch directory, and `--output-dir` checks an output directory. The result separates checks with `ok`, `missing`, `denied`, or `invalid` status and includes remedies. Write-access hints do not prove that an actual write will succeed. Doctor does not change permissions, create locks, or repair a cache.
+**Options**
 
-The access report also includes `artifact_dir` and an optional `artifact_directory` check. For an uncreated cache directory it reports the nearest existing parent that needs write/search access. Artifact storage is optional for metadata readers and commands with an explicit output, so this check does not make an otherwise usable read view unavailable.
+| Name | Type | Default | Description and bounds |
+| --- | --- | --- | --- |
+| `--access-only` / `--no-access-only` | Flag | `False` | Check filesystem access without opening databases or writing files. |
+| `--library` | Path | Unset | Optional source Library to check with --access-only. |
+| `--scratch-dir` | Path | Unset | Native scratch directory to check with --access-only. |
+| `--output-dir` | Path | Unset | Output directory to check with --access-only. |
+
+Example:
+
+```sh
+goodnotes doctor
+```
+
+Output details: [`uv run goodnotes schema doctor`](#schema) reports the fields and output profile.
+
 
 ### schema
 
 ```text
-goodnotes schema [COMMAND]
+goodnotes schema [OPTIONS] [COMMAND]
 ```
 
-Prints the command contract without loading notebook data. With no command, it reports the compact CLI overview. With a command name, it returns that command's contract, option metadata, and output-field hints where available. Row-based commands identify the projection level, valid row keys, and a `--fields` example. These keys are derived from the output models; `pages` marks `recognition` optional because it requires `--with-recognition`. Use `goodnotes COMMAND --help` for human-readable help. Treat schema output as a discovery contract that may grow, not as a frozen copy of this full reference.
+Show the command index or one command's machine-readable contract.
 
-## Output, errors, and pagination
+Does not load notes or refresh the library. Targeted details include registered
+arguments, options, defaults, bounds, global options, and usage notes.
 
-Successful commands that return data write one JSON value to stdout. `watch` emits a sequence of event objects. Compact JSON is the default; `--text` indents it. Help and version output are plain text. Expected runtime errors write `{"error":{"code":"...","message":"..."}}` to stderr and exit `1`; watcher retry errors are events on stdout. Errors may include `details` with recovery context; unavailable-index search errors include scoped coverage and PDF fallback guidance. Invalid command syntax or parser-checked option bounds exit `2` with `invalid_arguments`; application-checked values such as an invalid page expression are runtime errors and exit `1`. Keyboard interruption or a broken pipe exits `130`.
+**Arguments**
 
-Cache-backed commands include the read-view generation ID as `snapshot`. For `ls`, `tree`, `pages`, and `search`, pass `next_offset` as the next `--offset`. For `scan-pdfs`, pass `next_page_offset` as the next `--page-offset`. Include the same generation ID with global `--expect-snapshot ID` on every request in a multi-call sequence. If the command returns `stale_snapshot`, restart the sequence against the new view; do not combine results from different generations. The `snapshot` field from `sync` is a filesystem path; use its `snapshot_id` field for the generation ID. The standalone `snapshot` command's `snapshot` field is also a destination path.
+| Name | Type | Default | Description and bounds |
+| --- | --- | --- | --- |
+| `COMMAND-NAME` | Text | Unset | Command to describe in detail. |
+
+Example:
+
+```sh
+goodnotes schema read
+```
+
+## Artifact retention
+
+Temporary render and bundle artifacts follow bounded cache retention; explicit output paths are persistent. See [temporary and saved files](output.md#temporary-and-saved-files) for cleanup and output-path details.
