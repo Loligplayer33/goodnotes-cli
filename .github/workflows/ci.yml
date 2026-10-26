@@ -62,9 +62,6 @@ jobs:
       - name: Install locked docs dependencies
         run: uv sync --locked --group docs
 
-      - name: Check generated reference, links, and nav
-        run: uv run --locked --group docs python scripts/docs.py --check
-
       - name: Build documentation site
         run: uv run --locked --group docs mkdocs build --strict
 

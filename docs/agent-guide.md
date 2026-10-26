@@ -1,73 +1,53 @@
 # Agent guide
 
-Use the installed `goodnotes` executable, or `uv run --locked goodnotes` from the
-checkout. Global options go before the command. Use `schema COMMAND` for unfamiliar
-options; skip discovery calls when you already know the notebook and page.
+Use the installed `goodnotes` executable or `uv run --locked goodnotes` from the
+checkout. Consult `schema COMMAND` for unfamiliar options. Global options go first.
 
-## Inspect a recent page
+## Request page evidence
 
-1. Refresh once at the start of the request if you have source access:
+With source access, sync once at the start of the request, then request only needed pages:
 
-   ```sh
-   goodnotes --data-dir /path/to/cli-cache sync --library /path/to/Library
-   ```
+```sh
+goodnotes sync --library /path/to/Library
+goodnotes bundle "Course Notes" --pages 3
+```
 
-2. Request just the needed page evidence:
+Bundle defaults to native images and PDF text. Uncached native pages need the
+[native runtime](pdf-and-handwriting.md#native-setup) and writable scratch. Add `--source all` for stored recognition and typed text. Read inline
+`page_evidence`, then open each absolute `image` path; the full manifest is only
+needed for deeper diagnostics. Use a new `--output` for persistent evidence.
 
-   ```sh
-   goodnotes --data-dir /path/to/cli-cache bundle "Course Notes" --pages 3
-   ```
+For known selectors/pages, skip discovery. Otherwise list the smallest known folder
+and follow cursors. A cache-only reader uses a copy maintained by another process;
+see [access setup](usage.md#set-up-a-restricted-agent-or-refresh-continuously).
+Report refresh failures instead of presenting an old copy as current.
 
-3. Read inline text and warnings, then open `page_evidence[].image`. Full diagnostics
-   are available at `manifest`; a separate manifest read is usually unnecessary.
-
-Bundle defaults to native images and PDF text. It needs the [native runtime](pdf-and-handwriting.md#native-ink-without-manual-pdf-exports)
-when rendering uncached native pages. Add `--source all` to include stored recognition
-and typed text. A cache-only agent uses a copy maintained by another process;
-see [access setup](access.md). A refresh failure must be reported, not presented as current data.
-
-| Situation | Next step |
-| --- | --- |
-| Unknown location | `ls --folder FOLDER --limit 20` in the smallest known folder; follow cursors. |
-| Ambiguous name | Use an exact full path or ID. |
-| Later reads must match | Pass bundle's `snapshot` with global `--expect-snapshot ID`; do not sync again mid-sequence. |
-| `stale_snapshot` | Restart against the new generation. |
-| Need a persistent image or bundle | Supply a new `--output` path. Temporary paths may expire after their five-minute protection period. |
-| Read-only cache | Use explicit writable output; native reconstruction also needs writable scratch. |
-
-Sync sees files already on the Mac. Capture time does not prove an expected iPad
-edit is present. Compare the image with the edit. Reuse known document/page IDs
-across ordinary refreshes; a snapshot generation ID changes on a new capture.
-
-## Interpret page evidence
-
-Use the image to assess visible handwriting. Native reconstruction remains approximate.
-Keep these distinctions in your answer:
+## Interpret the evidence
 
 | Evidence | Interpretation |
 | --- | --- |
-| Native `coverage`, unsupported reasons, warnings, `full_fidelity_verified` | Preserve limits. Zero unsupported objects does not prove completeness; opaque fields and drawing order may remain unverified. |
-| `rendered_strokes`, `rendered_paths`, `rendered_images` | Counts differ. Strokes include supported pen marks and filled paths; images do not establish handwriting. |
-| Missing native data | Availability is unknown. Do not describe a background as complete notes. |
-| Native image field 6 absent or decoder-unverified JPEG | Keep the appearance/integrity warning and partial coverage. |
-| Text `source: handwriting` | Raw stored recognition candidates. Quote exact substrings only; label cleaned wording as interpretation. |
-| Text `source: pdf` / `textbox` | Copied or indexed PDF text / stored typed text. Preserve source labels and truncation. |
+| Native coverage, unsupported reasons, warnings, `full_fidelity_verified` | Preserve limits. Native output is approximate; zero unsupported objects does not prove completeness. |
+| `rendered_strokes`, `rendered_paths`, `rendered_images` | Strokes include supported pen marks and filled paths. Images do not establish handwriting. |
+| Missing native data | Availability is unknown. A background is not complete note evidence. |
+| Image body field 6 absent or decoder-unverified JPEG | Keep the appearance/integrity warning and partial coverage. |
+| Text `source` and `truncated` | Preserve PDF/handwriting/textbox labels and budget limits. Handwriting is stored candidate text, not a verified visual transcription. |
+| Recognition or `annotation_count` | Stored-index state/projected note-item counts, not proof of visible ink. |
 
-For `status: "partial"`, check `failed_pages`. A failed row retains text fields, which may be empty, but has
-`image: null` and `render_error`. It is not evidence of a clean page. Successful
-rows retain their own warnings. Single-page/all-page failures remain errors;
-no background fallback occurs.
+For a partial native bundle, inspect `failed_pages`. Failed rows retain text fields,
+which may be empty, but have `image: null` and `render_error`. Keep successful-page
+warnings too. Single-page/all-page image failures remain errors. Global engine,
+snapshot-integrity, safety, and publication failures are fatal; individual unavailable
+image objects may instead produce partial coverage. No background fallback occurs.
 
-## Keep requests small and complete
+## Keep reads consistent and bounded
 
-| Task | Rule |
-| --- | --- |
-| Read or bundle | Request only needed pages and use `--max-chars`; check `truncated`. |
-| Search | `search` uses the stored index; `scan-pdfs` separately extracts copied PDF backgrounds. Check coverage before concluding no text exists. |
-| Recognition status | `pages --with-recognition` reports stored text/index state, not ink; `annotation_count` counts projected note items. |
-| Pagination | Follow `next_offset` or `next_page_offset` with unchanged query, scope, and snapshot. |
-| More diagnostics | Use `--verbose` or the full manifest. `--fields` selects from the full contract. |
-| Empty stdout | Inspect stderr and exit status. Operation errors exit 1, parser errors 2, interruptions 130. |
+Reuse known document/page IDs across ordinary refreshes. Page positions can change.
+Use the returned generation with `--expect-snapshot ID` for later matching reads
+or pagination; restart on `stale_snapshot`. Do not sync mid-sequence.
+A bundle already holds one read view. See [cursors and output](commands.md).
 
-See [results and output](output.md) for response shapes, retention, and cursors;
-[troubleshooting](troubleshooting.md) for recovery steps.
+Sync sees files already on the Mac. Capture time cannot prove an expected iPad edit
+arrived; inspect the image. Search covers the stored index; scan copied PDF
+backgrounds separately when needed. Check coverage before concluding no text exists.
+Request only needed pages, set `--max-chars`, and check truncation. For extra metadata,
+use `--verbose` or `--fields`. Read stderr when stdout is empty.

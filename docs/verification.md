@@ -1,7 +1,5 @@
 # Development verification
 
-`scripts/verify.py` runs generated study journeys and image-reference checks. It is a development tool, not a production CLI feature, and adds no runtime dependency.
-
 ## Run verification
 
 | Goal | Command |
@@ -13,7 +11,7 @@
 
 The runner requires `tests/test_study_journeys.py` and `tests/test_verification_reference.py` to pass with zero skips. Generated fixtures do not read a private Library. A required skip, including unavailable native support, is `blocked` and makes the command fail.
 
-This focused runner does not replace the full test, Ruff, and `ty` checks in [Contributing](../CONTRIBUTING.md). CI runs the journeys from source and through a wheel installed outside the checkout on macOS.
+This focused runner does not replace full tests, Ruff, or `ty` ([Contributing](../CONTRIBUTING.md)). CI runs generated journeys from source and an installed macOS wheel; its separate `goodnotes schema` smoke check is not a substitute. CI uses generated PDFs only.
 
 ## Receipt status and provenance
 
@@ -28,8 +26,6 @@ The receipt records the source commit, dirty state, content fingerprint, target,
 
 With `--cli`, the runner invokes an absolute executable outside the checkout and removes `PYTHONPATH`. It resolves the console script's interpreter and verifies that the imported package is outside the checkout and matches the current source package. The receipt records version and package fingerprints, not local executable or import paths.
 
-CI's macOS job runs generated journeys through an installed wheel, including schema-matrix cases and failure controls. The package job's `goodnotes schema` smoke check is separate and does not replace those journeys. CI uses generated PDFs; private lecture exports and snapshots are not included.
-
 ## Receipt path restrictions
 
 `--report` may target the default `.local/verification/report.json`, an untracked path under repository `.local/`, or a path outside the repository. The runner rejects tracked repository paths and repository paths outside `.local/`.
@@ -38,7 +34,7 @@ It also rejects a destination inside or below an ancestor containing `goodnotes-
 
 An existing destination is replaced only if it is a receipt with schema `goodnotes-verification/v1`. Unrelated files remain untouched. Report-path protections are covered by [`tests/test_verification_runner.py`](../tests/test_verification_runner.py).
 
-## Private reference manifest
+## Private manifest and comparison rules
 
 Keep the manifest, marked snapshot, and independently exported Goodnotes PDFs outside the repository. Manifest paths can be absolute or relative to the manifest directory. The runner does not capture or sync a live Library.
 
@@ -67,11 +63,9 @@ Each `box` is exactly four finite fractions `[x0, y0, x1, y1]` in the normalized
 
 The whole-page check uses the strictest regional limits: the minimum `max_mean_error`, minimum `max_changed_fraction`, and maximum `min_foreground_retention`. Each region must contain foreground under the selected background rule.
 
-## Comparison rules and limits
-
 For every private case, the runner renders one clean background, one native page image, and one native bundle image. It compares both native images with the declared reference page. Dimensions must match exactly; the comparator does not align or resize images.
 
-The clean background excludes printed page content only from regional foreground-retention measurements. Whole-page measurements include all pixels. Direct `compare_reference` calls may provide `background` and `background_page`; without a background, regional foreground uses a white-background rule. Raster inputs are limited to 8,000,000 pixels.
+The clean background excludes printed content only from regional foreground-retention measurements. Whole-page checks include all pixels. Raster inputs are limited to 8,000,000 pixels.
 
 Give each required annotation its own region, especially each small mark. A large stroke or highlight can hide a missing mark in a broad region. Keep the whole-page check and require every mark's region to reject its omission.
 
@@ -83,12 +77,8 @@ The corpus fingerprint covers the manifest, reference PDFs, and snapshot-marker 
 
 ## What the evidence establishes
 
-Generated journeys exercise annotated export, selected-page discussion, a generated edit and sync, and retrieval of selected current pages. They also cover page identity after insertion, reordering, rename, or move; missing and deleted pages; stale snapshots; artifact expiry; and unavailable native or annotated evidence. Page positions are not durable identities.
+Generated journeys test selected-page retrieval across edits, page movement/deletion, stale snapshots, artifact expiry, and unavailable native evidence. The schema matrix compares observed object layouts with independent references; omission controls must fail their region. See [study journeys](../tests/test_study_journeys.py) and [reference checks](../tests/test_verification_reference.py).
 
-The schema matrix compares observed generated pen, highlighter, path, ellipse, brush, open-line, and image cases with independent references. Omission controls must fail their region. Cache invalidation, native counts and warnings, and partial bundles are also checked.
-
-Generated references test geometry against independent drawings. They do not establish support for every Goodnotes format, full native fidelity, general study-answer accuracy, or fresh iPad/TCC acceptance. iPad/TCC acceptance remains manual and `unverified`.
+Generated references test geometry against independent drawings. They do not establish universal Goodnotes compatibility, full native fidelity, general study-answer accuracy, or fresh iPad/TCC acceptance. iPad/TCC remains manual and `unverified`.
 
 Journey metrics include numbered journeys, duration, call counts, stdout byte counts, and sanitized command/page selections. Receipts omit raw CLI responses, private names, and generated images. Preserve `annotation_status`, `image_source`, coverage, object counts, warnings, source labels, one-based pages, and unknown values when interpreting results.
-
-For the scenario-to-test map, see [Verification tests](verification-tests.md).

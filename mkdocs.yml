@@ -1,33 +1,24 @@
 site_name: Goodnotes CLI
-site_description: Read-only access to a copied Goodnotes library.
 repo_url: https://github.com/Loligplayer33/goodnotes-cli
-edit_uri: edit/main/docs/
-docs_dir: docs
 site_dir: .local/docs-site
 strict: true
-theme:
-  name: mkdocs
-plugins:
-  - search
-hooks:
-  - scripts/docs.py
+plugins: [search]
+hooks: [scripts/docs_hooks.py]
+watch: [README.md, CONTRIBUTING.md]
+validation:
+  nav:
+    omitted_files: warn
+  links:
+    anchors: warn
 nav:
   - Home: index.md
-  - Getting started: getting-started.md
-  - Guides:
-      - Everyday tasks: usage.md
-      - Images, PDFs, and handwriting: pdf-and-handwriting.md
-      - Access and refresh: access.md
-      - Agent guide: agent-guide.md
-      - Troubleshooting: troubleshooting.md
-  - Reference:
-      - Commands: commands.md
-      - Results and output: output.md
-  - Develop:
+  - Everyday tasks: usage.md
+  - Images and handwriting: pdf-and-handwriting.md
+  - Agent guide: agent-guide.md
+  - Commands and results: commands.md
+  - Development:
       - Contributing: contributing.md
       - Architecture: architecture.md
-      - Robustness: robustness.md
+      - Failure behavior: robustness.md
       - Verification: verification.md
-      - Verification test map: verification-tests.md
       - Releases: releases.md
-      - Documentation maintenance: documentation.md
