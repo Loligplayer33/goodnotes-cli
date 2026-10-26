@@ -43,8 +43,9 @@ Run the checks relevant to the change:
 
 ```sh
 uv run pytest
-uv run ruff check .
-uv run ty check --error-on-warning src/goodnotes_cli tests
+uv run ruff format --check src tests scripts
+uv run ruff check src tests scripts
+uv run ty check --error-on-warning src/goodnotes_cli tests scripts
 ```
 
 For faster local test runs, use `uv run pytest -n 4` to distribute tests across
@@ -61,6 +62,15 @@ CI command treats warnings as failures so new and existing diagnostics remain
 visible during the migration.
 
 Tests must use generated fixtures. Before submitting, review the diff and `git status` for private data, generated output, and machine-specific paths.
+
+For the generated study-session and rendering-reference acceptance checks, run
+`uv run python scripts/verify.py`. It writes a compact receipt to
+`.local/verification/report.json`; every required test must execute with zero
+skips. Required skips or unavailable native support are reported as blocked and
+return a nonzero status. This focused runner does not replace the full test,
+lint, or type-check commands above. For the optional installed executable or
+copied-snapshot reference checks, use the flags and safety rules in
+[development verification](docs/verification.md).
 
 ## Submit a change
 

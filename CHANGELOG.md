@@ -11,6 +11,9 @@ Notable changes to the project are recorded here. Versions follow Semantic Versi
 - Read-only artifact-directory access hints in `doctor --access-only`.
 - Notebook-scoped search and PDF scans, source-coverage diagnostics, metadata-only handwriting discovery, and selected-page PDF export.
 - Repository agent guidance in `AGENTS.md`, shared with Claude through a `CLAUDE.md` symlink.
+- A project-local verification skill and development runner for generated study
+  journeys, independent render references, and optional installed-wheel or
+  copied-snapshot checks.
 
 ### Changed
 
