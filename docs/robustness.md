@@ -7,7 +7,7 @@ Tests use generated databases, PDFs, and attachments, not a live Goodnotes Libra
 | Scenario | Result |
 | --- | --- |
 | Source changes during capture | Try at most three captures; if none succeeds, fail and keep the previous active pointer. |
-| Final inventory differs | Publish the validated copy with `source_changed_during_refresh: true` and `captured_at`; next sync captures again. Matching inventories do not guarantee freshness at return. |
+| Final inventory differs during this refresh | Publish the validated copy with `source_changed_during_refresh: true` and `captured_at`; next sync captures again. `false` means no change was detected during this refresh, not that no edits happened since the prior sync. Matching inventories do not guarantee freshness at return. |
 | Interrupt during capture | Ctrl-C removes staging and preserves the pointer. Next sync removes staging left by a killed process. |
 | Reader overlaps refresh | Shared `.view.lock` retains its snapshot through the last read. Sync captures without it and waits for exclusive access to publish/prune. |
 
@@ -23,7 +23,7 @@ The app does not participate in locks. A changing source can exhaust retries. Te
 
 RocksDB opens only on disposable scratch copied from a validated snapshot. Fresh options keep writes in scratch; copied `OPTIONS` files are not loaded. Scratch is removed after extraction, and byte-copy fallback is limited to 64 MiB per extraction.
 
-Unknown visibility, geometry, transforms, versions, and records remain unknown or reduce coverage. Missing native data is unavailable, not empty; native rendering never silently falls back to the background. Pencil texture is approximate. Generated tests do not establish full Goodnotes compatibility or rendering fidelity.
+Unknown visibility, geometry, transforms, versions, and records remain unknown or reduce coverage. A successful lookup that finds no records reports `native-no-records-observed` / `no-native-records-observed` and an unverified-absence warning; it does not prove a blank page. Missing stores, runtime failures, and read errors remain errors. Native rendering never silently falls back to the background. Pencil texture is approximate. Generated tests do not establish full Goodnotes compatibility or rendering fidelity.
 
 | Tests | Coverage |
 | --- | --- |
@@ -35,12 +35,13 @@ Unknown visibility, geometry, transforms, versions, and records remain unknown o
 
 | Input or operation | Behavior |
 | --- | --- |
-| Text index | Optional. Missing tables do not block navigation; text commands report unavailable sources and coverage. |
+| Text index and doctor counts | Optional. Missing tables do not block navigation; text commands report unavailable sources and coverage. Counts describe the selected copy and do not establish source-index completeness or data loss. |
 | `search` | Literal, case-insensitive substring; SQL-looking input is bound as data. |
 | Notebook selector | Exact ID, exact full path, or unique name. Ambiguity fails instead of guessing. |
 | Attachment path | Basename remapping requires a unique name. Traversal and symlink escapes fail. |
 | Registered annotated PDF | Recheck signature and page count before annotated output. Page order and annotation inclusion remain unverified; never fall back to background. |
 | Bundle page-local error | Multi-page output may be partial if any image succeeds. Failed rows have `image: null` and `render_error`, without success metadata or a background substitute. If all images fail, publish nothing. |
+| Full PDF export error | All-or-nothing. Any selected-page failure prevents publication of a partial PDF and keeps the page context in the error. |
 | Output destination | Must be outside snapshot and production Library paths. Existing paths are never overwritten; bundle manifest publishes last. |
 
 Filesystem containment uses identity checks for aliases. Cleanup checks parent directories and unlinks symlinks without changing targets. See [test_safety.py](../tests/test_safety.py), [test_library.py](../tests/test_library.py), [test_documents.py](../tests/test_documents.py), and [test_agent_output.py](../tests/test_agent_output.py).

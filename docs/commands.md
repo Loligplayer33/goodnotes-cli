@@ -1,83 +1,65 @@
 # Command reference
 
-The CLI owns its option, default, bound, and output-field reference. Look them up
-without loading notes:
+The main help lists everyday commands. The schema index exposes advanced commands
+in its `advanced_commands` field; each remains available through targeted
+`goodnotes COMMAND --help` and `goodnotes schema COMMAND`. The annotated-PDF path
+remains available for Goodnotes exports that native reconstruction cannot reproduce.
+
+## Output and sources
+
+Compact JSON is the default; `--text` indents it for inspection. `--verbose`
+includes full metadata, and `--fields` selects response keys or row fields from the
+schema. Warnings, source labels, unknown values, and pagination metadata remain
+available unless the selected fields omit them.
+
+`read`, `search`, and `bundle` default to `--source text` (PDF text and typed
+textboxes). `--source all` or `--source handwriting` explicitly requests stored
+handwriting-recognition candidates. The CLI does not run image OCR. `pages` always
+includes stored-recognition counts and index state; the hidden `--with-recognition`
+option remains accepted as a compatibility alias.
+
+`bundle` returns images and text, defaults to native images, and accepts up to 10
+pages. `read` accepts up to 20 pages. Both use a shared default 12,000-character
+budget across their selected pages. Use `--pages` for one or more pages; `read
+--page` remains a hidden compatibility alias. Text parts keep their `source` and
+`truncated` fields.
+
+`render` and `export` default to the native layer to include supported ink. Use
+`--layer background` for an ink-free background. `--layer annotated` uses a
+registered Goodnotes PDF. Native output is approximate and may fail when the native
+runtime or copied data is unavailable. Check page-level coverage and warnings.
+
+## Pagination and refresh status
+
+Use `next_offset` as `--offset` for listings and search. PDF scans use
+`next_page_offset` with `--page-offset`. Keep the other query and scope options
+unchanged. Pin the first response's `snapshot` on subsequent calls:
 
 ```sh
-uv run --locked goodnotes --help
-uv run --locked goodnotes read --help
-uv run --locked goodnotes schema read
+goodnotes ls --limit 20
+goodnotes --expect-snapshot SNAPSHOT_ID ls --limit 20 --offset NEXT_OFFSET
 ```
 
-## Commands
+On `stale_snapshot`, restart against the new generation. A bundle already holds
+one read view. Sync returns `snapshot_id`, `checked_at`, and `captured_at`.
+`source_changed_during_refresh` describes only whether the source inventory changed
+during that refresh; `false` does not mean there were no edits since the previous
+sync. An `unchanged` status means the prior snapshot was reused, so its
+`captured_at` can precede `checked_at`.
 
-| Command | Purpose |
-| --- | --- |
-| `sync` | Create or refresh the managed copy. `--force` bypasses unchanged-file reuse. |
-| `watch` | Refresh continuously in the foreground. |
-| `snapshot LIBRARY DESTINATION` | Create a separate marked copy at a new destination. |
-| `ls`, `tree` | List direct children or descendants of a folder. |
-| `info NOTEBOOK` | Resolve an exact ID, full path, or unique exact name. |
-| `pages NOTEBOOK` | List pages in current order; `--with-recognition` adds stored-index metadata. |
-| `read NOTEBOOK` | Return source-labelled text. |
-| `search QUERY` | Search the stored text index. |
-| `scan-pdfs QUERY` | Search copied PDF backgrounds. |
-| `render NOTEBOOK` | Save one page as PNG. |
-| `export NOTEBOOK` | Export all or selected pages as PDF; `--output` is required. |
-| `bundle NOTEBOOK` | Return page images and text together. |
-| `attach-pdf NOTEBOOK PDF` | Register a full-notebook Goodnotes PDF export. |
-| `doctor` | Inspect the selected copy; `--access-only` checks paths without database opens or writes. |
-| `schema [COMMAND]` | Print the machine-readable command contract. |
+## Saved files and errors
 
-## Results
+Render and bundle without `--output` use temporary artifact storage. Entries expire
+after 24 hours since last use, subject to the 100,000,000-byte logical limit; a
+five-minute lease protects returned paths. Explicit outputs are caller-owned and
+are never overwritten or pruned. Keep them outside the source Library and
+snapshots.
 
-Global options go before the command. Compact JSON is the default;
-`--text` indents it and explicit `--json` takes precedence.
-`--verbose` includes full metadata. `--fields` selects from the full contract;
-for row arrays it preserves sibling warnings, pagination, and snapshot metadata.
-Use `schema COMMAND` for valid keys and conditional fields.
+Bundle may return partial page images when some pages succeed; failed rows have
+`image: null` and `render_error`. Full PDF export is atomic: if any selected page
+fails, no partial PDF is published and the error retains page context. Native
+failures do not silently fall back to the background.
 
-Text parts keep `source: pdf`, `handwriting`, or `textbox`. Preserve warnings and
-unknown/null values. `truncated` means the character budget cut requested text.
-Read accepts up to 20 pages and bundle up to 10, each with a shared default
-12,000-character budget. Export has no 20-page cap. See [image layers](pdf-and-handwriting.md).
-
-## Pagination
-
-Use `next_offset` as `--offset` for listings/search; use `next_page_offset` as
-`--page-offset` for PDF scans. Keep query, scope, and other options unchanged.
-Pin the first read's `snapshot` on subsequent calls:
-
-```sh
-uv run --locked goodnotes ls --limit 20
-uv run --locked goodnotes --expect-snapshot SNAPSHOT_ID ls --limit 20 --offset NEXT_OFFSET
-```
-
-Replace the placeholders with returned values. On `stale_snapshot`, restart against
-the new generation. One bundle already holds one view across images and text.
-Sync returns the generation as `snapshot_id`; its verbose `snapshot` is a path.
-The standalone snapshot command also returns a path in `snapshot`.
-
-PDF scans check at most 200 pages by default, up to 250 per call. Their cursor counts
-pages scanned, not hits. `scan_complete` means the page sequence ended;
-`coverage_complete` also requires starting at offset 0 with no extraction gaps.
-
-## Temporary and saved files
-
-Render and bundle without `--output` use temporary storage under `artifacts/` in
-the selected data directory. It retains up to 100,000,000 logical bytes, counting
-identical PNGs once. Entries expire after 24 hours since last use; cleanup runs on
-later artifact operations. A five-minute lease protects returned paths. Capacity
-cleanup can remove older entries before 24 hours; protected entries can cause
-`artifact_cache_capacity`. Repeating a request uses the current copy.
-
-Explicit outputs are caller-owned, persistent, and never pruned. Use a new path
-outside the source Library and snapshots. Existing files/directories are not overwritten.
-
-## Errors
-
-Operation errors are complete JSON on stderr with exit 1. Invalid syntax or parser
-bounds exit 2; application-checked values such as invalid page expressions exit 1.
-Interruption or a closed pipe exits 130. Successful completion still requires checking
-warnings, coverage, and partial status. Watch emits JSON events, including retry errors,
-on stdout. Help and version output are plain text.
+Operation errors are JSON on stderr with exit 1. Invalid syntax or parser bounds
+exit 2; interruption or a closed pipe exits 130. Check warnings and coverage even
+after successful completion.

@@ -4,6 +4,15 @@ Notable changes to the project are recorded here. Versions follow Semantic Versi
 
 ## [Unreleased]
 
+### 0.2.0 interface and rendering updates
+
+- Native rendering and full-notebook PDF export now include pages whose copied store query returns no records. Their status and warnings preserve uncertainty about annotation absence; unavailable stores and failed reads remain errors.
+- The main help focuses on ten everyday commands. Specialist commands, including `attach-pdf`, remain available through targeted help and schema. The schema command index now comes from registered commands.
+- Read, search, and bundle default to PDF and typed text. Stored handwriting candidates require `--source handwriting` or `--source all`. Pages include recognition metadata without an extra switch.
+- Render and export default to native output. Use `--layer background` explicitly to omit reconstructed ink. Existing `--page`, `--with-recognition`, and `--json` aliases remain accepted but are hidden from normal help.
+- Folder listings can filter item kind before pagination. Notebook-scoped diagnostics separate local page-index coverage from library-wide catalog issues, without treating index gaps as lost notes.
+- Version and schema identify installed source content. New snapshot markers record the CLI producer, copied SQLite format values, and installed-app metadata when known. Historical provenance remains unknown.
+
 ### Added
 
 - Native rendering of observed filled paths, outlined ellipses, variable-width pencil strokes, and copied PNG/JPEG image attachments, with separate path and image counts.

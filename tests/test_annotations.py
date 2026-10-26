@@ -657,11 +657,34 @@ def test_invalid_page_mapping_fails_before_native_read(
         )
 
 
-def test_missing_native_records_is_unknown_not_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_successful_empty_native_lookup_renders_with_unverified_absence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setattr(annotation_module, "read_page_records", lambda *_: [])
-    with pytest.raises(NativeError, match="does not establish.*no ink") as result:
+    result = render_native_overlay(_FixtureSnapshot(), page(), width_points=72, height_points=72)
+    assert result.svg == b""
+    assert result.metadata["annotation_status"] == "native-no-records-observed"
+    assert result.metadata["coverage"] == "no-native-records-observed"
+    assert result.metadata["native_records"] == result.metadata["rendered_objects"] == 0
+    assert result.metadata["full_fidelity_verified"] is False
+    assert "absence of annotations in Goodnotes is unverified" in str(result.metadata["warnings"])
+
+
+@pytest.mark.parametrize("operation", ["read_native_copy", "inspect_native_store"])
+def test_failed_native_read_never_becomes_an_empty_overlay(
+    monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    expected = NativeError(
+        "native_data_unavailable", "Generated read failure.", operation=operation
+    )
+
+    def fail(*_args: Any) -> Any:
+        raise expected
+
+    monkeypatch.setattr(annotation_module, "read_page_records", fail)
+    with pytest.raises(NativeError) as result:
         render_native_overlay(_FixtureSnapshot(), page(), width_points=72, height_points=72)
-    assert result.value.code == "native_data_unavailable"
+    assert result.value is expected
 
 
 def test_unknown_objects_only_fail_instead_of_rendering_a_blank(

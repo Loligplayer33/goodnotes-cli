@@ -1463,12 +1463,19 @@ def render_native_overlay(
         read_page_records(sandbox, root_uuid) if record_reader is None else record_reader(root_uuid)
     )
     if not records:
-        raise NativeError(
-            "native_data_unavailable",
-            "No matching native page records are available "
-            "in this copy. This does not establish that the page has no ink.",
-            operation="read_native_page",
+        # A successful lookup is distinct from an unavailable store or failed read.
+        # Empty pages can legitimately have no object records in the observed namespace.
+        # Preserve that observation without claiming that the app page has no annotations.
+        _, metadata = decode_native_objects(records, root_uuid)
+        metadata.update(
+            annotation_status="native-no-records-observed",
+            coverage="no-native-records-observed",
+            warnings=[
+                "No native records matched this page in the copied store. The image contains "
+                "its copied background; absence of annotations in Goodnotes is unverified."
+            ],
         )
+        return NativeOverlay(b"", metadata)
     objects, metadata = decode_native_objects(records, root_uuid)
     objects, image_data, image_failures = _resolve_native_images(
         cast(AttachmentSandbox, sandbox), page, objects

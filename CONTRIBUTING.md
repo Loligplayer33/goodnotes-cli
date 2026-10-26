@@ -7,12 +7,28 @@ Use generated fixtures. Never develop against a live Goodnotes Library or add re
 Install `uv`, then run from the repository root:
 
 ```sh
+# Optional: set a writable cache path when UV's default is unavailable.
+# export UV_CACHE_DIR=/path/to/writable/uv-cache
 uv sync --locked --all-groups
 uv run --locked goodnotes --help
+uv run --locked goodnotes --version
 uv run --locked goodnotes schema
 ```
 
-Use `uv run` for project commands. Python 3.11 or newer is required; do not install dependencies globally.
+`uv sync` prepares the project-local `.venv` by default; `UV_PROJECT_ENVIRONMENT` can select another
+path. Use `uv run` for project commands. Python 3.11 or newer is required; do not install
+dependencies globally. If UV's default cache is unavailable, export `UV_CACHE_DIR` to a writable
+directory before running these commands. It stores packages separately from the project environment
+and Goodnotes CLI data.
+`goodnotes --version` prints `VERSION (source FIRST12SHA)`. The schema index and targeted schema
+include `build.version` and the full `build.source_sha256`; `doctor` includes corresponding CLI and
+snapshot provenance. Choose a separate writable Goodnotes data directory with `--data-dir` or
+`GOODNOTES_DATA_DIR`. Native rendering also needs a compatible RocksDB runtime and writable scratch;
+set `GOODNOTES_SCRATCH_DIR` to an existing writable directory if system temporary storage is
+unavailable. Text browsing and background images do not need RocksDB.
+
+`uv run --locked --no-sync` is only for commands in an already prepared environment. It skips
+dependency synchronization and therefore does not install or verify the environment.
 
 ## Changes and checks
 

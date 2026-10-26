@@ -11,6 +11,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -129,6 +130,7 @@ class StudyCLI:
         snapshot: str,
         *,
         layer: str = "native",
+        source: str | None = None,
         output: Path | None = None,
         verbose: bool = False,
     ) -> dict[str, Any]:
@@ -142,6 +144,8 @@ class StudyCLI:
             "--layer",
             layer,
         ]
+        if source is not None:
+            arguments.extend(["--source", source])
         if verbose:
             arguments.insert(0, "--verbose")
         if output is not None:
@@ -587,19 +591,25 @@ def test_study_export_discuss_edit_refresh_selected_pages(
     after_edit = _preserved(source, second)
     current = cli.bundle([1], second_id)
     assert current["pages"] == [1]
-    assert current["text_source"] == "pdf"
+    assert current["text_source"] == "text"
     assert current["truncated"] is False
     assert current["snapshot"] == second_id
     evidence = current["page_evidence"][0]
     _assert_evidence(evidence, PAGE_IDS[0], strokes=1, images=1)
     assert "Generated background 1" in evidence["parts"][0]["text"]
+    pdf_only = cli.bundle([1], second_id, source="pdf")
+    assert pdf_only["text_source"] == "pdf"
+    assert pdf_only["page_evidence"][0]["parts"] == evidence["parts"]
     assert _pixel(evidence, 45, 30) == (255, 255, 255)
     assert _pixel(evidence, 45, 90) == (255, 0, 0)
     assert _pixel(evidence, 75, 45) == (0, 240, 0)
     assert hashlib.sha256(exported.read_bytes()).hexdigest() == export_hash
     exports = [request for request in cli.requests if request["command"] == "export"]
     assert exports == [{"command": "export", "pages": [1, 2]}]
-    assert cli.requests[-1] == {"command": "bundle", "pages": [1]}
+    assert cli.requests[-2:] == [
+        {"command": "bundle", "pages": [1]},
+        {"command": "bundle", "pages": [1]},
+    ]
     _assert_preserved(cli, source, second, after_edit)
 
 
@@ -1101,7 +1111,7 @@ def test_study_unsupported_only_native_variants_fail_with_page_context_and_clean
     assert partial["pages"] == pages
     assert partial["failed_pages"] == [3]
     assert partial["layer"] == "native"
-    assert partial["text_source"] == "pdf"
+    assert partial["text_source"] == "text"
     expected_warning = (
         "Native rendering failed for page 3; source-labelled text evidence remains available, "
         "but no image was produced."
@@ -1228,6 +1238,31 @@ def test_study_visual_evidence_never_silently_falls_back(
                 "?, 'generated-template-1', '3', '', 0)",
                 (NOTEBOOK,),
             )
+        captured = cli.sync(source)
+        snapshot = captured["snapshot_id"]
+        before = _preserved(source, captured)
+
+        observed = cli.bundle([3], snapshot)
+        evidence = observed["page_evidence"][0]
+        native = evidence["native_annotations"]
+        assert observed["pages"] == [3]
+        assert evidence["image"] and Path(evidence["image"]).is_file()
+        assert evidence["image_source"] == "copied-native-records-and-background"
+        assert evidence["annotation_status"] == "native-no-records-observed"
+        assert native["annotation_status"] == "native-no-records-observed"
+        assert native["coverage"] == "no-native-records-observed"
+        assert native["full_fidelity_verified"] is False
+        assert any(
+            "absence of annotations in Goodnotes is unverified" in warning
+            for warning in evidence["warnings"]
+        )
+        assert all(part["source"] == "pdf" for part in evidence["parts"])
+        assert _pixel(evidence, 60, 30) == (255, 255, 255)
+        _assert_preserved(cli, source, captured, before)
+
+        # A negative lookup is distinct from an unavailable store. Removing this
+        # generated store exercises the latter after the no-records result.
+        shutil.rmtree(source / "Databases" / "notes_main.db")
         captured = cli.sync(source)
         snapshot = captured["snapshot_id"]
         before = _preserved(source, captured)

@@ -54,15 +54,14 @@ _PROJECTIONS: dict[str, _ProjectionSpec] = {
         (*_ITEM_FIELDS, "snapshot"), example='goodnotes --fields id,name,path info "Course Notes"'
     ),
     "pages": _ProjectionSpec(
-        _model_fields(Page),
+        (*_model_fields(Page), "recognition"),
         row_key="pages",
-        conditional_fields=(("recognition", "with_recognition"),),
-        example='goodnotes --fields number,recognition pages "Course Notes" --with-recognition',
+        example='goodnotes --fields number,recognition pages "Course Notes"',
     ),
     "read": _ProjectionSpec(
         _model_fields(PageText),
         row_key="pages",
-        example='goodnotes --fields page,parts,warnings,truncated read "Course Notes" --page 1',
+        example='goodnotes --fields page,parts,warnings,truncated read "Course Notes" --pages 1',
     ),
     "search": _ProjectionSpec(
         (*_model_fields(SearchHit), "snippet"),
@@ -146,10 +145,13 @@ _PROJECTIONS: dict[str, _ProjectionSpec] = {
             "active_folders",
             "active_notebooks",
             "active_pages",
+            "pages_outside_active_notebooks",
             "deleted_folders",
             "deleted_notebooks",
             "visible_folders",
             "visible_notebooks",
+            "orphaned_folders",
+            "orphaned_notebooks",
             "orphaned_items",
             "broken_links",
             "deleted_link_rows",
@@ -160,9 +162,12 @@ _PROJECTIONS: dict[str, _ProjectionSpec] = {
             "index_metadata_without_active_pages",
             "search_index_available",
             "search_content_tables",
+            "catalog_reference_counts",
+            "diagnostic_notes",
             "warnings",
             "storage",
             "native_runtime",
+            "provenance",
         ),
         field_variants=(
             (
@@ -182,6 +187,18 @@ _PROJECTIONS: dict[str, _ProjectionSpec] = {
                     "native_runtime",
                 ),
             ),
+            (
+                "notebook",
+                (
+                    "scope",
+                    "page_index",
+                    "library",
+                    "warnings",
+                    "storage",
+                    "native_runtime",
+                    "provenance",
+                ),
+            ),
         ),
         example="goodnotes --fields active_pages,warnings doctor",
     ),
@@ -194,6 +211,7 @@ _BRIEF_ITEM_FIELDS = ("id", "name", "kind", "path", "page_count")
 _BRIEF_NATIVE_FIELDS = (
     "page",
     "page_id",
+    "annotation_status",
     "coverage",
     "full_fidelity_verified",
     "page_mapping",
@@ -257,6 +275,16 @@ def output_contract(command_name: str) -> dict[str, Any] | None:
                     for option, variant_fields in spec.field_variants
                 },
             }
+        if command_name in {"sync", "watch"}:
+            result["semantics"] = {
+                "status": "ready creates a new capture; unchanged reuses the existing capture.",
+                "checked_at": "Time the source inventory was checked for this request.",
+                "captured_at": "Time the selected copy was captured, not last note edit time.",
+                "source_changed_during_refresh": (
+                    "Compares source inventories during this refresh only. False does not mean "
+                    "no edits since the previous capture, or that remote edits reached this Mac."
+                ),
+            }
         _describe_default(result, command_name)
         return result
 
@@ -306,7 +334,13 @@ def _describe_default(contract: dict[str, Any], command_name: str) -> None:
         }
         profile["metadata"] = "Sibling metadata and complete text-part source labels are retained."
         if command_name == "pages":
-            profile["optional_fields"] = {"recognition": "Requires --with-recognition"}
+            profile["recognition"] = (
+                "Always includes stored-index counts and state, never candidate text. "
+                "No recognition does not mean no visible ink or diagrams."
+            )
+            profile["annotation_count"] = (
+                "Projected note-item rows, not native ink objects. Null means unavailable."
+            )
     elif command_name in {"render", "export"}:
         profile["omitted_fields"] = ["dpi"]
         profile["native_annotations"] = {

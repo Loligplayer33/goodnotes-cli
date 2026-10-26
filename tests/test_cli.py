@@ -6,6 +6,7 @@ import errno
 import hashlib
 import json
 import os
+import re
 import shutil
 import sqlite3
 import stat
@@ -19,6 +20,7 @@ from helpers import invoke_in_process
 from test_library import _add_repeated_fallback_pages, _create_snapshot
 
 import goodnotes_cli.cache as cache_module
+from goodnotes_cli import __version__, build_info
 from goodnotes_cli.config import Settings
 from goodnotes_cli.errors import CacheAccessError
 
@@ -115,6 +117,13 @@ def test_doctor_access_only_reports_uninitialized_cache_without_creating_it(tmp_
     response = successful(invoke(["doctor", "--access-only"], tmp_path))
     assert response["scope"] == "filesystem-access"
     assert response["status"] == "issues"
+    assert not (tmp_path / "state").exists()
+
+
+def test_version_includes_the_installed_source_fingerprint(tmp_path: Path) -> None:
+    result = invoke_in_process(["--version"], tmp_path, verbose=False)
+    assert result.returncode == 0
+    assert result.stdout == (f"{__version__} (source {build_info()['source_sha256'][:12]})\n")
     assert not (tmp_path / "state").exists()
 
 
@@ -261,7 +270,8 @@ def test_schema_explains_field_projection_without_loading_notes(tmp_path: Path) 
     assert "page_id" in reading["output"]["fields"]
     pages = successful(invoke_in_process(["schema", "pages"], tmp_path))
     assert "number" in pages["output"]["fields"]
-    assert "recognition" in pages["output"]["optional_fields"]
+    assert "recognition" in pages["output"]["fields"]
+    assert "optional_fields" not in pages["output"]
     assert not (tmp_path / "state").exists()
 
 
@@ -399,7 +409,14 @@ def test_document_sqlite_failure_is_not_classified_as_cache_access(
 
     monkeypatch.setattr(documents, "export_pdf", fail)
     result = invoke_in_process(
-        ["export", "doc-hostile", "--output", str(tmp_path / "output.pdf")],
+        [
+            "export",
+            "doc-hostile",
+            "--layer",
+            "background",
+            "--output",
+            str(tmp_path / "output.pdf"),
+        ],
         tmp_path,
         sandbox=library_copy,
     )
@@ -501,9 +518,23 @@ def test_top_level_writers_can_project_snapshot(
     assert "snapshot" in schema["output"]["fields"]
 
     if writer == "export":
-        arguments = ["export", "doc-hostile", "--output", str(tmp_path / "out.pdf")]
+        arguments = [
+            "export",
+            "doc-hostile",
+            "--layer",
+            "background",
+            "--output",
+            str(tmp_path / "out.pdf"),
+        ]
     elif writer == "render":
-        arguments = ["render", "doc-hostile", "--output", str(tmp_path / "out.png")]
+        arguments = [
+            "render",
+            "doc-hostile",
+            "--layer",
+            "background",
+            "--output",
+            str(tmp_path / "out.png"),
+        ]
     elif writer == "attach-pdf":
         arguments = ["attach-pdf", "doc-hostile", str(annotated_pdf)]
     else:
@@ -562,6 +593,7 @@ def test_unavailable_search_index_returns_scoped_coverage_and_pdf_fallback(
     assert error["details"]["coverage"] == "stored-index"
     details = error["details"]["coverage_detail"]
     assert details["scope"]["notebook_id"] == "doc-hostile"
+    assert set(details["sources"]) == {"pdf", "textbox"}
     assert any("scan-pdfs" in step for step in details["next_steps"])
     assert error["details"]["warnings"]
 
@@ -619,7 +651,16 @@ def test_export_selects_pages_in_listed_order(library_copy: Path, tmp_path: Path
     target = tmp_path / "selected.pdf"
     data = successful(
         invoke(
-            ["export", "doc-hostile", "--pages", "3,1", "--output", str(target)],
+            [
+                "export",
+                "doc-hostile",
+                "--pages",
+                "3,1",
+                "--layer",
+                "background",
+                "--output",
+                str(target),
+            ],
             tmp_path,
             sandbox=library_copy,
         )
@@ -639,7 +680,16 @@ def test_export_rejects_invalid_page_selections_without_creating_output(
 ) -> None:
     target = tmp_path / "invalid.pdf"
     result = invoke(
-        ["export", "doc-hostile", "--pages", expression, "--output", str(target)],
+        [
+            "export",
+            "doc-hostile",
+            "--pages",
+            expression,
+            "--layer",
+            "background",
+            "--output",
+            str(target),
+        ],
         tmp_path,
         sandbox=library_copy,
     )
@@ -664,12 +714,25 @@ def test_notebook_search_does_not_confuse_metadata_with_text_coverage(
     assert data["coverage"] == "stored-index"
     details = data["coverage_detail"]
     assert details["scope"]["notebook_id"] == "doc-hostile"
+    assert set(details["sources"]) == {"pdf"}
     assert details["active_pages"] == 3
     assert details["page_meta"]["mapped_active_pages"] == 3
     assert details["sources"]["pdf"]["pages_with_stored_nonempty_text"] == 0
     assert details["sources"]["pdf"]["metadata_without_nonempty_text_pages"] == 2
     assert details["completeness"] == "unknown"
     assert "scan-pdfs" in json.dumps(details["next_steps"])
+
+
+def test_search_defaults_to_pdf_and_typed_text(library_copy: Path, tmp_path: Path) -> None:
+    data = successful(
+        invoke(
+            ["search", "phrase", "--notebook", "doc-hostile"],
+            tmp_path,
+            sandbox=library_copy,
+        )
+    )
+    assert {hit["source"] for hit in data["hits"]} == {"pdf", "textbox"}
+    assert set(data["coverage_detail"]["sources"]) == {"pdf", "textbox"}
 
 
 def test_notebook_pdf_scan_distinguishes_window_end_from_complete_coverage(
@@ -709,13 +772,23 @@ def test_recognition_discovery_is_metadata_only_and_marks_pending_empty_pages(
     with sqlite3.connect(library_copy / "Library/Databases/projection.sqlite") as db:
         db.execute("ALTER TABLE pages ADD COLUMN needs_index INTEGER")
         db.execute("UPDATE pages SET needs_index = 1 WHERE id = 'page-30'")
+    default_pages = successful(invoke(["pages", "doc-hostile"], tmp_path, sandbox=library_copy))
+    assert all("recognition" in page for page in default_pages["pages"])
     data = successful(
+        invoke(
+            ["--fields", "number,recognition", "pages", "doc-hostile"],
+            tmp_path,
+            sandbox=library_copy,
+        )
+    )
+    legacy = successful(
         invoke(
             ["--fields", "number,recognition", "pages", "doc-hostile", "--with-recognition"],
             tmp_path,
             sandbox=library_copy,
         )
     )
+    assert legacy == data
     assert data["annotation_count_source"] == "projection.notes_items"
     assert data["snapshot"] == library_copy.name
     assert [page["recognition"]["text_rows"] for page in data["pages"]] == [2, 1, 0]
@@ -742,7 +815,12 @@ def test_schema_covers_every_registered_command(tmp_path: Path) -> None:
     data = successful(invoke_in_process(["schema"], tmp_path))
     group = get_command(app)
     assert isinstance(group, TyperGroup)
-    assert set(data["commands"]) == set(group.commands)
+    core = {name for name, target in group.commands.items() if not target.hidden}
+    advanced = {name for name, target in group.commands.items() if target.hidden}
+    assert set(data["commands"]) == core
+    assert set(data["advanced_commands"]) == advanced
+    assert set(data["commands"]).isdisjoint(data["advanced_commands"])
+    assert set(data["commands"]) | set(data["advanced_commands"]) == set(group.commands)
     assert "--version" in data["global_options"]
     assert "--help" in data["global_options"]
     assert not (tmp_path / "state").exists()
@@ -783,6 +861,10 @@ def test_targeted_schema_describes_actual_bounds_and_parameter_kinds(tmp_path: P
     read = successful(invoke_in_process(["schema", "read"], tmp_path))
     budget = next(p for p in read["options"] if p["name"] == "max_chars")
     assert (budget["default"], budget["min"], budget["max"]) == (12000, 1, 1000000)
+    page = next(p for p in read["options"] if p["name"] == "page")
+    assert page["advanced"] is True
+    read_help = invoke_in_process(["read", "--help"], tmp_path).stdout
+    assert re.search(r"(?<![\w-])--page(?![\w-])", read_help) is None
     assert read["arguments"][0]["name"] == "notebook"
     listing = successful(invoke_in_process(["schema", "ls"], tmp_path))
     assert listing["arguments"] == []
@@ -794,6 +876,11 @@ def test_targeted_schema_describes_actual_bounds_and_parameter_kinds(tmp_path: P
     sync = successful(invoke_in_process(["schema", "sync"], tmp_path))
     force = next(p for p in sync["options"] if p["name"] == "force")
     assert force["flags"] == ["--force", "--no-force"]
+    pages = successful(invoke_in_process(["schema", "pages"], tmp_path))
+    recognition = next(p for p in pages["options"] if p["name"] == "with_recognition")
+    assert recognition["advanced"] is True
+    pages_help = invoke_in_process(["pages", "--help"], tmp_path).stdout
+    assert re.search(r"(?<![\w-])--with-recognition(?![\w-])", pages_help) is None
 
 
 def test_unknown_schema_target_is_structured_argument_error(tmp_path: Path) -> None:
@@ -1007,7 +1094,16 @@ def test_bad_page_ranges_fail(library_copy: Path, tmp_path: Path, expression: st
 def test_background_render_and_bundle(library_copy: Path, tmp_path: Path) -> None:
     result = successful(
         invoke(
-            ["render", "doc-hostile", "--page", "1", "--output", str(tmp_path / "page.png")],
+            [
+                "render",
+                "doc-hostile",
+                "--page",
+                "1",
+                "--layer",
+                "background",
+                "--output",
+                str(tmp_path / "page.png"),
+            ],
             tmp_path,
             sandbox=library_copy,
         )
@@ -1075,7 +1171,16 @@ def test_attach_export_annotated_and_no_overwrite(library_copy: Path, tmp_path: 
         assert pdf.page_count == 3
         assert "User annotation page 2" in pdf[1].get_text()
     duplicate = invoke(
-        ["export", "doc-hostile", "--output", str(output)], tmp_path, sandbox=library_copy
+        [
+            "export",
+            "doc-hostile",
+            "--layer",
+            "annotated",
+            "--output",
+            str(output),
+        ],
+        tmp_path,
+        sandbox=library_copy,
     )
     assert duplicate.returncode == 1
 
@@ -1104,7 +1209,16 @@ def test_managed_read_commands_work_with_a_readonly_cache(
         ["search", "generated query", "--notebook", "doc-hostile"],
         ["scan-pdfs", "Synthetic PDF page", "--notebook", "doc-hostile", "--page-limit", "1"],
         ["doctor"],
-        ["export", "doc-hostile", "--pages", "1", "--output", str(export_path)],
+        [
+            "export",
+            "doc-hostile",
+            "--pages",
+            "1",
+            "--layer",
+            "background",
+            "--output",
+            str(export_path),
+        ],
     ]
 
     try:
@@ -1348,6 +1462,8 @@ def test_render_loads_read_view_only_once(
             str(library_copy),
             "render",
             "doc-hostile",
+            "--layer",
+            "background",
             "--output",
             str(tmp_path / "pinned.png"),
         ],

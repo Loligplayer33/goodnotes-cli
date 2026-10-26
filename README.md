@@ -13,9 +13,18 @@ git clone https://github.com/Loligplayer33/goodnotes-cli.git
 cd goodnotes-cli
 uv sync --locked
 uv run --locked goodnotes --help
+uv run --locked goodnotes --version
+uv run --locked goodnotes schema
 ```
 
-Help and `goodnotes schema` work without loading notes. Run examples from the checkout.
+`uv sync` prepares the project-local `.venv`. Help, version, and schema work without loading notes.
+Version prints the package release and the first 12 characters of its source fingerprint. Schema
+includes the full build identity. Run examples from the checkout.
+
+If UV cannot write its default package cache in a restricted shell, export `UV_CACHE_DIR` to a
+writable path before running the setup commands. This is separate from the project environment and
+Goodnotes CLI snapshot storage; use `--data-dir` or `GOODNOTES_DATA_DIR` to select a writable CLI
+data directory.
 
 ## Read your first page
 
@@ -24,7 +33,7 @@ For your Goodnotes library on this Mac:
 ```sh
 uv run --locked goodnotes sync
 uv run --locked goodnotes --text ls
-uv run --locked goodnotes --text read "Course Notes" --page 1
+uv run --locked goodnotes --text read "Course Notes" --pages 1
 ```
 
 Replace `"Course Notes"` with a returned notebook name, full path, or ID.
@@ -34,7 +43,9 @@ the copy. On macOS, respond to any system privacy prompt for your terminal or ag
 Development checks use generated fixtures or a pre-existing private copy, never the default live sync.
 
 Page numbers start at 1. `--text` indents JSON; global options go before the command.
-`read` labels PDF text, stored handwriting candidates, and typed text separately.
+`read`, `search`, and `bundle` default to indexed PDF text and typed textboxes. Add
+`--source handwriting` or `--source all` to include unverified stored handwriting recognition
+candidates. Use `read --pages` to select pages; `--page` remains a hidden compatibility option.
 The CLI does not run OCR on images.
 
 ## Choose a task
@@ -48,9 +59,10 @@ The CLI does not run OCR on images.
 | Contribute or preview the searchable docs | [Contributing](CONTRIBUTING.md) |
 | Understand storage and safety | [Architecture](docs/architecture.md) and [failure behavior](docs/robustness.md) |
 
-Native reconstruction is approximate and needs an optional RocksDB runtime.
-Standalone render/export default to backgrounds without native ink; bundle defaults
-to native images and PDF text. See [layer choices](docs/pdf-and-handwriting.md#choose-a-layer).
+Render, export, and bundle default to native reconstruction, which needs a compatible RocksDB
+runtime and writable scratch storage; coverage is approximate and full visual fidelity is
+unverified. Pass `--layer background` to request the background without reconstructed ink. See
+[layer choices](docs/pdf-and-handwriting.md#choose-a-layer).
 
 Report problems in [GitHub Issues](https://github.com/Loligplayer33/goodnotes-cli/issues)
 with a synthetic example and redacted private data. [MIT license](LICENSE).

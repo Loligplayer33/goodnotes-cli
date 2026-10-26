@@ -26,6 +26,47 @@ The receipt records the source commit, dirty state, content fingerprint, target,
 
 With `--cli`, the runner invokes an absolute executable outside the checkout and removes `PYTHONPATH`. It resolves the console script's interpreter and verifies that the imported package is outside the checkout and matches the current source package. The receipt records version and package fingerprints, not local executable or import paths.
 
+## Installed build and snapshot provenance
+
+`goodnotes --version` prints `VERSION (source FIRST12SHA)`. The schema index and targeted schema
+include `build.version` and the full `build.source_sha256`; `doctor` includes `provenance.cli` with
+the same build identity. The fingerprint covers sorted package-relative Python source files,
+including vendored modules, so two builds with the same package version can still be distinguished
+without exposing an installation path.
+
+New snapshots keep marker `format_version: 1` and add a producer identity, optional installed-app
+metadata, and SQLite projection format values. `source_app` is populated only when capture uses
+the default Goodnotes Library path and a matching installed app `Info.plist` is available. Its
+`basis` is `installed-app-at-capture`; it describes installed bundle metadata and does not claim
+which app version originally wrote every Library file. Explicit source copies and unavailable app
+metadata record `source_app: null`. The SQLite `user_version` and `application_id` values are read
+from the copied projection database; they are SQLite format identifiers, not the Goodnotes app
+version. `doctor.provenance` reports `snapshot_format`, `producer`, `source_app`, and
+`library_format` from the active snapshot marker. Historical format-1 markers without these optional
+fields remain valid; `doctor` reports those unknown values as `null`.
+
+For a fresh wheel check, build and install into a new environment outside the checkout, then pass
+that environment's executable to the runner:
+
+```sh
+uv build --wheel --out-dir /absolute/path/outside/repository/wheelhouse
+uv venv /absolute/path/outside/repository/install-venv
+uv pip install --python /absolute/path/outside/repository/install-venv/bin/python \
+  /absolute/path/outside/repository/wheelhouse/*.whl
+uv run --locked python scripts/verify.py \
+  --cli /absolute/path/outside/repository/install-venv/bin/goodnotes \
+  --report /absolute/path/outside/repository/installed-report.json
+```
+
+The runner requires that installed executable to resolve its package outside the checkout and
+match the current source. A basic setup smoke check is `goodnotes --version` and `goodnotes schema`
+from that installed environment. `uv sync --locked` prepares the project-local `.venv` by default;
+`UV_PROJECT_ENVIRONMENT` can select another environment path. Set `UV_CACHE_DIR` to a writable
+package-cache path when needed; it is separate from the project environment, Goodnotes CLI's
+`--data-dir` or `GOODNOTES_DATA_DIR`, and native rendering's `GOODNOTES_SCRATCH_DIR`.
+`uv run --locked --no-sync` is only for checks in an already prepared environment. It skips
+dependency synchronization and does not install or verify dependencies.
+
 ## Receipt path restrictions
 
 `--report` may target the default `.local/verification/report.json`, an untracked path under repository `.local/`, or a path outside the repository. The runner rejects tracked repository paths and repository paths outside `.local/`.

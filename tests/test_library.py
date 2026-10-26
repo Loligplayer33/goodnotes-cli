@@ -346,6 +346,16 @@ def test_full_path_collisions_and_kind_mismatches_are_reported(tmp_path: Path) -
             library.resolve("doc-a", kind="folder")
 
 
+def test_missing_notes_items_keeps_annotation_count_unknown(tmp_path: Path) -> None:
+    sandbox = _create_snapshot(tmp_path / "snapshot")
+    with sqlite3.connect(sandbox.projection_path) as db:
+        db.execute("DROP TABLE notes_items")
+
+    with Library(sandbox) as library:
+        pages = library.pages("doc-hostile")
+        assert all(page.annotation_count is None for page in pages)
+
+
 def test_required_catalog_names_and_numbers_reject_malformed_values(tmp_path: Path) -> None:
     bad_name = _create_snapshot(tmp_path / "bad-name")
     with sqlite3.connect(bad_name.projection_path) as db:
@@ -409,6 +419,10 @@ def test_pages_are_one_based_ordered_and_text_candidates_keep_provenance(
         assert page_text.parts[0].priority == "primary"
         assert page_text.parts[-1].text == "direct PDF phrase"
         assert any("machine-recognized" in warning for warning in page_text.warnings)
+        text_only = library.read_page("doc-hostile", 1, source="text")
+        assert [part.source for part in text_only.parts] == ["textbox", "pdf"]
+        assert text_only.parts[-1].text == "direct PDF phrase"
+        assert not any("machine-recognized" in warning for warning in text_only.warnings)
         assert library.read_page("doc-hostile", 2).parts[-1].text == "mapped PDF phrase"
         fallback = library.read_page("doc-hostile", 3)
         assert len(fallback.parts) == 1
@@ -907,8 +921,12 @@ def test_search_uses_literal_casefolded_terms_scope_and_source_labels(tmp_path: 
         assert [hit.source for hit in typed] == ["textbox"]
         direct_pdf = library.search("direct PDF phrase", source="pdf")
         mapped_pdf = library.search("mapped PDF phrase", source="pdf")
+        text_hits = library.search("typed textbox phrase", source="text")
+        text_pdf_hits = library.search("direct PDF phrase", source="text")
         assert direct_pdf[0].page == 1
         assert mapped_pdf[0].page == 2
+        assert [hit.source for hit in text_hits] == ["textbox"]
+        assert [hit.source for hit in text_pdf_hits] == ["pdf"]
         assert library.search("recognized", folder="Shared B") == []
 
 
@@ -1193,6 +1211,9 @@ def test_search_coverage_does_not_count_pdf_metadata_without_content(tmp_path: P
         db.execute("DELETE FROM pdf_text_content WHERE text_id = 101")
 
     with Library(sandbox) as library:
+        text_details = library.search_coverage(source="text", notebook="doc-hostile")
+        assert set(text_details["sources"]) == {"pdf", "textbox"}
+        assert not any("Handwriting" in warning for warning in text_details["warnings"])
         details = library.search_coverage(source="pdf", notebook="doc-hostile")
         pdf = details["sources"]["pdf"]
         assert pdf["availability"] == "available"
@@ -1358,6 +1379,11 @@ def test_source_specific_coverage_skips_irrelevant_metadata_queries_and_warnings
         assert not any("Handwriting text is unavailable" in warning for warning in pdf["warnings"])
         assert not any("Textbox text is unavailable" in warning for warning in pdf["warnings"])
 
+        text = library.search_coverage(source="text", notebook="doc-hostile")
+        assert set(text["sources"]) == {"pdf", "textbox"}
+        assert text["sources"]["textbox"]["availability"] == "unavailable"
+        assert not any("Handwriting" in warning for warning in text["warnings"])
+
         all_sources = library.search_coverage(source="all", notebook="doc-hostile")
         assert set(all_sources["sources"]) == {"handwriting", "textbox", "pdf"}
         assert any(
@@ -1413,6 +1439,68 @@ def test_recognition_status_marks_missing_store_or_table_unavailable(tmp_path: P
         status = no_table.recognition_status("doc-hostile")["page-02"]
         assert status.availability == "unavailable"
         assert status.text_rows is None
+
+
+def test_stats_scope_index_counts_and_label_library_references_as_context(tmp_path: Path) -> None:
+    sandbox = _create_snapshot(tmp_path / "snapshot")
+    with sqlite3.connect(sandbox.projection_path) as db:
+        db.execute("ALTER TABLE templates ADD COLUMN template_library_document_id TEXT")
+        db.execute(
+            "UPDATE templates SET template_library_document_id = ? WHERE id = ?",
+            ("doc-hostile", "template-02"),
+        )
+        db.execute("CREATE TABLE patterns (pattern_library_document_id TEXT)")
+        db.executemany(
+            "INSERT INTO patterns VALUES (?)",
+            [("doc-root",), ("unmatched-reference",)],
+        )
+    assert sandbox.fts_path is not None
+    with sqlite3.connect(sandbox.fts_path) as db:
+        db.execute(
+            "INSERT INTO page_meta VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("unmatched-page", "doc-root", "99", None, None, 0, 0),
+        )
+
+    with Library(sandbox) as library:
+        global_stats = library.stats()
+        template_refs = global_stats["catalog_reference_counts"]["template_library_document_id"]
+        pattern_refs = global_stats["catalog_reference_counts"]["pattern_library_document_id"]
+        assert template_refs["distinct_document_ids"] == 1
+        assert template_refs["active_document_matches"] == 1
+        assert template_refs["visible_active_document_matches"] == 1
+        assert pattern_refs["distinct_document_ids"] == 2
+        assert pattern_refs["active_document_matches"] == 1
+        assert pattern_refs["not_active_document_references"] == 1
+        assert global_stats["index_metadata_without_active_pages"] == 3
+        assert "do not establish system ownership" in global_stats["diagnostic_notes"][2]
+
+        scoped = library.stats("doc-hostile")
+        assert scoped["scope"] == {
+            "type": "notebook",
+            "notebook_id": "doc-hostile",
+            "path": "Shared A/Nested/quote ' ; DROP TABLE documents;--",
+        }
+        assert scoped["page_index"]["active_pages"] == 3
+        assert scoped["page_index"]["pages_without_index_metadata"] == 0
+        assert scoped["page_index"]["index_metadata_without_active_pages"] == 1
+        assert scoped["library"]["index_metadata_without_active_pages"] == 3
+        assert len(library.list_items("/")) == 3
+
+
+def test_diagnostics_distinguish_page_rows_from_pages_of_active_notebooks(tmp_path: Path) -> None:
+    sandbox = _create_snapshot(tmp_path / "snapshot")
+    with Library(sandbox) as library:
+        before = library.stats()
+    with sqlite3.connect(sandbox.projection_path) as db:
+        db.execute("UPDATE documents SET deleted = 1 WHERE id = 'doc-hostile'")
+    with Library(sandbox) as library:
+        after = library.stats()
+    assert after["active_pages"] == before["active_pages"]
+    assert after["pages_outside_active_notebooks"] == before["pages_outside_active_notebooks"] + 3
+    assert (
+        after["index_metadata_without_active_pages"]
+        == before["index_metadata_without_active_pages"] + 3
+    )
 
 
 def test_partial_page_metadata_is_safe_for_pdf_read_and_doctor(tmp_path: Path) -> None:
