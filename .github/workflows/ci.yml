@@ -35,13 +35,13 @@ jobs:
         run: uv sync --locked --all-groups
 
       - name: Check formatting
-        run: uv run --locked ruff format --check src tests
+        run: uv run --locked ruff format --check src tests scripts
 
       - name: Lint
-        run: uv run --locked ruff check src tests
+        run: uv run --locked ruff check src tests scripts
 
       - name: Check types
-        run: uv run --locked ty check --error-on-warning src/goodnotes_cli tests
+        run: uv run --locked ty check --error-on-warning src/goodnotes_cli tests scripts
 
   tests:
     name: Tests (${{ matrix.os }}, Python ${{ matrix.python-version }})
@@ -82,6 +82,30 @@ jobs:
         env:
           GOODNOTES_REQUIRE_NATIVE_TESTS: ${{ runner.os == 'macOS' && '1' || '0' }}
         run: uv run --locked pytest
+
+      - name: Build the installed-journey wheel
+        if: runner.os == 'macOS'
+        run: uv build --wheel --out-dir "$RUNNER_TEMP/verification-dist"
+
+      - name: Install the journey target outside the checkout
+        if: runner.os == 'macOS'
+        run: |
+          uv export --locked --no-dev --no-emit-project --no-hashes --output-file "$RUNNER_TEMP/verification-constraints.txt"
+          uv venv --python 3.12 "$RUNNER_TEMP/verification-wheel"
+          uv pip install --python "$RUNNER_TEMP/verification-wheel/bin/python" --constraint "$RUNNER_TEMP/verification-constraints.txt" "$RUNNER_TEMP"/verification-dist/*.whl
+
+      - name: Verify installed study journeys
+        if: runner.os == 'macOS'
+        run: uv run --locked python scripts/verify.py --cli "$RUNNER_TEMP/verification-wheel/bin/goodnotes" --report "$RUNNER_TEMP/verification-report.json"
+
+      - name: Upload the generated verification receipt
+        if: always() && runner.os == 'macOS'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: verification-receipt
+          path: ${{ runner.temp }}/verification-report.json
+          if-no-files-found: ignore
+          retention-days: 1
 
   package:
     name: Build and verify distributions

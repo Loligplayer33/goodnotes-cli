@@ -58,6 +58,27 @@ def test_bundle_numeric_pages_are_top_level_and_snapshot_is_retained(
     }
 
 
+def test_bundle_partial_fields_can_be_selected(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    settings = Settings(fields="status,failed_pages,warnings", projection=Projection("bundle"))
+
+    emit(
+        {
+            "status": "partial",
+            "failed_pages": [2],
+            "warnings": ["A page image is unavailable."],
+        },
+        settings,
+    )
+
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "partial",
+        "failed_pages": [2],
+        "warnings": ["A page image is unavailable."],
+    }
+
+
 def test_row_projection_retains_sibling_pagination_and_snapshot(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

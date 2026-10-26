@@ -15,7 +15,7 @@ from test_cli import invoke as invoke_full
 from test_library import _create_snapshot
 
 from goodnotes_cli.config import Settings
-from goodnotes_cli.output import Projection, emit
+from goodnotes_cli.output import Projection, emit, output_contract
 
 
 def invoke(
@@ -57,9 +57,15 @@ def _native_metadata() -> dict[str, Any]:
         "deleted_objects": 1,
         "unsupported_objects": 2,
         "unsupported_reasons": {"unknown-schema": 2},
+        "native_image_body_field_6_absent_records": 1,
         "categories": {"pen": 7},
         "descriptor_variants": {"synthetic": 3},
-        "warnings": ["Approximate ink.", "Unverified format."],
+        "warnings": [
+            "Approximate ink.",
+            "Unverified format.",
+            "Some decoded native image records omit body field 6; "
+            "its effect on application appearance or visibility is unverified.",
+        ],
     }
 
 
@@ -200,7 +206,7 @@ def test_brief_render_preserves_partial_coverage_and_distinct_warnings(
             "native_annotations": native,
         },
     )
-    assert result["warnings"] == ["Approximate ink.", "Unverified format."]
+    assert result["warnings"] == native["warnings"]
     assert result["captured_at"] is None
     assert result["source_page"] is None
     assert result["native_annotations"] == {
@@ -212,6 +218,7 @@ def test_brief_render_preserves_partial_coverage_and_distinct_warnings(
     assert result["native_annotations"]["rendered_strokes"] == 4
     assert result["native_annotations"]["rendered_paths"] == 1
     assert result["native_annotations"]["rendered_images"] == 2
+    assert result["native_annotations"]["native_image_body_field_6_absent_records"] == 1
     assert "dpi" not in result
 
 
@@ -350,14 +357,126 @@ def test_brief_inline_native_coverage_preserves_unknown_values_and_all_warnings(
     assert page["warnings"] == [
         "Approximate ink.",
         "Unverified format.",
+        "Some decoded native image records omit body field 6; "
+        "its effect on application appearance or visibility is unverified.",
         "Stored recognition is unavailable.",
     ]
     assert page["native_annotations"]["coverage"] == "partial"
     assert page["native_annotations"]["full_fidelity_verified"] is False
     assert page["native_annotations"]["unsupported_reasons"] == {"unknown-schema": 2}
     assert page["native_annotations"]["native_objects"] == 7
+    assert page["native_annotations"]["native_image_body_field_6_absent_records"] == 1
     assert result["captured_at"] is None
     assert result["document_id"] == "synthetic-doc"
+
+
+def test_brief_partial_bundle_preserves_page_error_and_unknown_image_metadata(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    warning = (
+        "Native rendering failed for page 2; source-labelled text evidence remains "
+        "available, but no image was produced."
+    )
+    render_error = {
+        "code": "native_data_unavailable",
+        "message": "The copied page has native records, but none could be rendered.",
+        "details": {
+            "operation": "decode_native_page",
+            "page": 2,
+            "path": "",
+            "remedy": "Inspect the reported coverage before evaluating handwritten notes.",
+        },
+    }
+    result = _emit_brief(
+        capsys,
+        "bundle",
+        {
+            "manifest": "/synthetic/bundle/text.json",
+            "pages": [1, 2],
+            "layer": "native",
+            "text_source": "pdf",
+            "truncated": False,
+            "snapshot": "generation",
+            "captured_at": None,
+            "status": "partial",
+            "failed_pages": [2],
+            "warnings": [warning],
+            "page_evidence": [
+                {
+                    "page": 1,
+                    "image": "/synthetic/bundle/page-0001.png",
+                    "render": {
+                        "source": "copied-native-records-and-background",
+                        "includes_handwriting": True,
+                        "annotation_status": "native-reconstructed-approximate",
+                        "warnings": ["Approximate ink."],
+                        "native_annotations": _native_metadata(),
+                    },
+                    "text": {
+                        "document_id": "synthetic-doc",
+                        "page_id": "synthetic-page-1",
+                        "parts": [],
+                        "warnings": [],
+                        "truncated": False,
+                    },
+                },
+                {
+                    "page": 2,
+                    "image": None,
+                    "render_error": render_error,
+                    "warnings": [
+                        "Native image rendering failed for page 2; no image is available."
+                    ],
+                    "text": {
+                        "document_id": "synthetic-doc",
+                        "page_id": "synthetic-page-2",
+                        "parts": [{"source": "pdf", "text": "Page text remains available."}],
+                        "warnings": ["Stored recognition is unavailable."],
+                        "truncated": False,
+                    },
+                },
+            ],
+        },
+    )
+
+    failed_page = result["page_evidence"][1]
+    assert result["status"] == "partial"
+    assert result["failed_pages"] == [2]
+    assert result["warnings"] == [warning]
+    assert failed_page["image"] is None
+    assert failed_page["render_error"] == render_error
+    assert failed_page["parts"] == [{"source": "pdf", "text": "Page text remains available."}]
+    assert failed_page["warnings"] == [
+        "Native image rendering failed for page 2; no image is available.",
+        "Stored recognition is unavailable.",
+    ]
+    assert "image_source" not in failed_page
+    assert "annotation_status" not in failed_page
+    assert "includes_handwriting" not in failed_page
+    assert result["document_id"] == "synthetic-doc"
+
+
+def test_bundle_schema_documents_partial_page_evidence() -> None:
+    contract = output_contract("bundle")
+    assert contract is not None
+    assert contract["optional_fields"]["status"].startswith("Present as 'partial'")
+    assert "failed_pages" in contract["optional_fields"]
+    profile = contract["default_output"]
+    assert "render_error" in profile["page_evidence"]["fields"]
+    assert "null" in profile["page_evidence"]["image"]
+    assert "Structured native rendering error" in profile["page_evidence"]["render_error"]
+
+
+def test_brief_render_export_and_bundle_schemas_include_image_field_6_absence() -> None:
+    for command in ("render", "export", "bundle"):
+        contract = output_contract(command)
+        assert contract is not None
+        profile = contract["default_output"]
+        if command == "bundle":
+            fields = profile["page_evidence"]["native_annotations"]["fields"]
+        else:
+            fields = profile["native_annotations"]["fields"]
+        assert "native_image_body_field_6_absent_records" in fields
 
 
 def test_default_bundle_requires_native_data_without_background_fallback(
