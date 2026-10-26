@@ -39,6 +39,8 @@ Notable changes to the project are recorded here. Versions follow Semantic Versi
 
 ### Fixed
 
+- Separate catalog root namespaces before navigation and search. A cache-local root selection keeps unrelated libraries out of normal browsing, preserves exact selectors, and avoids cross-library path collisions without folder-name rules.
+
 - Missing native handwriting and drawing forms now decode with bounded geometry validation. Renderer upgrades and changed copied image attachments invalidate cached page renders.
 - Added the observed two-point open-line shape with bounded line translation, exact direct image-resource binding, and an explicit count and warning for image records that omit body field 6. Generated installed-CLI journeys now compare supported schema combinations against independent per-object references and reject stale renderer-cache entries.
 - Multi-page native bundles can now retain successful page images and all selected pages' text when a page-local native render fails; failed rows carry structured errors and no image, while single-page and all-page failures remain errors.

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import os
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -34,6 +36,52 @@ class Settings:
     projection: Projection | None = None
     cache_dir: Path | None = None
     brief: bool = False
+    library_root: str | None = None
+
+    def load_library_root(self) -> str | None:
+        """Read an explicit library namespace without changing the cache or snapshot."""
+        selected = self.library_root
+        if selected is None and self.sandbox is None and self.cache_dir is not None:
+            path = self.cache_dir / "library-root.json"
+            try:
+                descriptor = os.open(
+                    path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
+                )
+            except FileNotFoundError:
+                return None
+            except OSError as exc:
+                raise CacheAccessError.from_exception(
+                    exc,
+                    "Could not read the library root selection.",
+                    operation="read_library_selection",
+                    path=path,
+                    cache_dir=self.cache_dir,
+                ) from exc
+            try:
+                with os.fdopen(descriptor, "rb") as stream:
+                    info = os.fstat(stream.fileno())
+                    if not stat.S_ISREG(info.st_mode) or info.st_size > 4096:
+                        raise ValueError("Invalid selection file.")
+                    raw = stream.read(4097)
+                    if len(raw) > 4096:
+                        raise ValueError("Selection file is too large.")
+                    data = json.loads(raw)
+                if not isinstance(data, dict) or set(data) != {"root_folder_id"}:
+                    raise ValueError("Invalid selection fields.")
+                selected = data["root_folder_id"]
+                if not isinstance(selected, str) or not selected.strip():
+                    raise ValueError("Invalid root ID.")
+            except (OSError, ValueError, TypeError) as exc:
+                raise CacheAccessError(
+                    "cache_invalid",
+                    "The library root selection is invalid.",
+                    operation="read_library_selection",
+                    path=path,
+                    cache_dir=self.cache_dir,
+                ) from exc
+        if selected is not None and (not isinstance(selected, str) or not selected.strip()):
+            raise GoodnotesError("Library root selection must be a nonempty root ID or all.")
+        return None if selected == "all" else selected
 
     def load_sandbox(self) -> Sandbox:
         if self.sandbox is not None:

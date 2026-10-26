@@ -14,6 +14,20 @@ uv run --locked goodnotes --text read "Course Notes" --pages 1-3
 
 Use `ls --kind folder` or `ls --kind notebook` to filter before pagination.
 
+The copied catalog can contain several library roots. To use one library by default,
+find the root ID of a folder you recognize:
+
+```sh
+goodnotes --fields root_folder_id info "Courses"
+```
+
+Save `{"root_folder_id":"ROOT_ID"}` in `library-root.json` in the selected data
+directory. Browsing, resolution, searches, and reads then use that root. This filters
+the graph before resolving names, rather than hiding folders by name. Advanced
+`--library-root ROOT_ID` or `GOODNOTES_LIBRARY_ROOT` overrides the cache selection;
+`--library-root all` restores the combined view. Global options go before the command.
+An explicit `--sandbox` does not inherit another cache's saved selection.
+
 `read` defaults to `--source text`: indexed PDF text plus typed textboxes, without
 stored handwriting-recognition candidates. Use `--source all` to include all
 sources or `--source handwriting` to read candidates alone. Page numbers follow

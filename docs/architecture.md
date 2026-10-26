@@ -67,6 +67,15 @@ Render reuse checks snapshot, background/native inputs, page, layer, DPI, and re
 
 ## Native and output limits
 
+Library root selection is reader configuration outside immutable snapshots. A managed
+cache can store `library-root.json`; explicit snapshots only use an explicit root
+override. Readers validate this bounded regular file without creating or changing it.
+The selected root filters catalog links and records before graph construction and
+scopes text queries and page-index diagnostics. Template/pattern reference totals
+remain labelled as covering the entire copied catalog. Historical links establish
+scope membership; moved or deleted items may remain diagnostic records without
+becoming reachable notes.
+
 Native rendering uses disposable scratch copied from a validated snapshot. Fresh engine options keep writes in scratch; copied `OPTIONS` files are not loaded. Byte-copy fallback is limited to 64 MiB per extraction. The RocksDB runtime is optional for the CLI, but required by the default native image layer; `GOODNOTES_ROCKSDB_LIBRARY` and `GOODNOTES_SCRATCH_DIR` select runtime and scratch paths.
 
 Observed support includes pen/highlighter records, filled paths, one ellipse form, variable-width pencil, one open-line form, and some linked PNG/JPEG images. Pencil texture is approximate. Unknown visibility, geometry, transforms, and records stay unknown or reduce coverage. A successful lookup with no page records reports `native-no-records-observed` / `no-native-records-observed` and warns that absence is unverified. Missing stores, runtime failures, and record-read errors remain errors. Generated tests do not prove Goodnotes compatibility or full rendering fidelity.

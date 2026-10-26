@@ -88,8 +88,10 @@ class _SearchCandidate:
 class Library:
     """Read a sandboxed Goodnotes snapshot without changing either database."""
 
-    def __init__(self, sandbox: Sandbox) -> None:
+    def __init__(self, sandbox: Sandbox, *, root_folder_id: str | None = None) -> None:
         self.sandbox = sandbox
+        self.root_folder_id = root_folder_id
+        self._root_item_ids: dict[str, set[str]] | None = None
         self._stack: ExitStack | None = None
         self._projection: sqlite3.Connection | None = None
         self._fts: sqlite3.Connection | None = None
@@ -1337,6 +1339,7 @@ class Library:
             )
         warnings.extend(page_index["warnings"])
         result = {
+            "library_root": self.root_folder_id,
             "active_folders": active_folders,
             "active_notebooks": active_notebooks,
             "active_pages": page_count,
@@ -1410,6 +1413,8 @@ class Library:
                     "SELECT document_id, page_id FROM page_meta" + meta_filter,
                     params,
                 )
+                if self._root_item_ids is None
+                or row["document_id"] in self._root_item_ids["documents"]
             }
             pages_without_metadata: int | None = len(active_pages - metadata_pages)
             metadata_without_active_pages: int | None = len(metadata_pages - active_pages)
@@ -1446,7 +1451,7 @@ class Library:
         active_document_ids = {
             item_id for kind, item_id in self._active_items if kind == "notebook"
         }
-        result: dict[str, Any] = {}
+        result: dict[str, Any] = {"scope": "all-catalog-references"}
         for key, table, column in (
             ("template_library_document_id", "templates", "template_library_document_id"),
             ("pattern_library_document_id", "patterns", "pattern_library_document_id"),
@@ -1571,6 +1576,21 @@ class Library:
                     f"{', '.join(sorted(missing))}."
                 )
 
+        self._root_item_ids = None
+        if self.root_folder_id is not None:
+            if not isinstance(self.root_folder_id, str) or not self.root_folder_id.strip():
+                raise GoodnotesError("Library root selection must be a nonempty root ID.")
+            root_links = projection.execute(
+                "SELECT item_type, item_id FROM folder_to_folder_items WHERE root_folder_id = ?",
+                (self.root_folder_id,),
+            ).fetchall()
+            if not root_links:
+                raise GoodnotesError("The selected library root is not present in this copy.")
+            self._root_item_ids = {
+                table: {row["item_id"] for row in root_links if row["item_type"] == item_type}
+                for table, item_type in (("folders", _FOLDER), ("documents", _NOTEBOOK))
+            }
+
         folder_rows = projection.execute(
             "SELECT id, name, updated_at, deleted, position FROM folders"
         ).fetchall()
@@ -1586,6 +1606,8 @@ class Library:
             ("documents", document_rows, document_ids, live_documents),
         ):
             for row in rows:
+                if self._root_item_ids is not None and row["id"] not in self._root_item_ids[kind]:
+                    continue
                 item_id = self._required_text(row["id"], f"{kind}.id")
                 identifiers.add(item_id)
                 if self._deleted_flag(row["deleted"], f"{kind}.deleted"):
@@ -1612,13 +1634,16 @@ class Library:
         }
         self._page_numbers = None
 
+        root_filter = " AND root_folder_id = ?" if self.root_folder_id is not None else ""
         active_rows = projection.execute(
             """
             SELECT item_type, item_id, parent_folder_id, root_folder_id, item_position
             FROM folder_to_folder_items
             WHERE COALESCE(deleted, 0) = 0
-            ORDER BY item_position, id
             """
+            + root_filter
+            + " ORDER BY item_position, id",
+            (self.root_folder_id,) if self.root_folder_id is not None else (),
         ).fetchall()
         self._links = {}
         self._children = {}
@@ -1822,6 +1847,7 @@ class Library:
             parent_id=entry.parent_id,
             page_count=entry.page_count,
             updated_at=entry.updated_at,
+            root_folder_id=self._links[key][0]["root_folder_id"],
         )
 
     @staticmethod
@@ -2464,7 +2490,23 @@ class Library:
     def _count(self, connection: sqlite3.Connection, table: str, where: str) -> int:
         if not self._table_exists(connection, table):
             return 0
-        return int(connection.execute(f"SELECT count(*) FROM {table} WHERE {where}").fetchone()[0])
+        params: tuple[str, ...] = ()
+        if self.root_folder_id is not None:
+            if table in {"folders", "documents", "pages"}:
+                item_type = _FOLDER if table == "folders" else _NOTEBOOK
+                column = "document_id" if table == "pages" else "id"
+                where += (
+                    f" AND {column} IN (SELECT item_id FROM folder_to_folder_items "
+                    f"WHERE root_folder_id = ? AND item_type = {item_type})"
+                )
+            elif table == "folder_to_folder_items":
+                where += " AND root_folder_id = ?"
+            else:
+                raise GoodnotesError("Unsupported count table for a selected library root.")
+            params = (self.root_folder_id,)
+        return int(
+            connection.execute(f"SELECT count(*) FROM {table} WHERE {where}", params).fetchone()[0]
+        )
 
 
 def parent_id_key(parent_id: str | None, is_root: bool) -> tuple[str, str] | None:

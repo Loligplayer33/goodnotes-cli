@@ -142,6 +142,7 @@ _PROJECTIONS: dict[str, _ProjectionSpec] = {
     ),
     "doctor": _ProjectionSpec(
         (
+            "library_root",
             "active_folders",
             "active_notebooks",
             "active_pages",

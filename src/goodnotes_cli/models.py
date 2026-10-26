@@ -13,6 +13,7 @@ class Item:
     parent_id: str | None = None
     page_count: int = 0
     updated_at: float = 0
+    root_folder_id: str | None = None
 
 
 @dataclass(frozen=True)

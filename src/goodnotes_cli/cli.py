@@ -154,6 +154,14 @@ def configure(
             help="Managed cache directory; use the same selection for sync and reads.",
         ),
     ] = None,
+    library_root: Annotated[
+        str | None,
+        typer.Option(
+            hidden=True,
+            envvar="GOODNOTES_LIBRARY_ROOT",
+            help="Library root ID; all restores the combined view. Overrides cache selection.",
+        ),
+    ] = None,
     text: Annotated[bool, typer.Option("--text", help="Indent JSON for inspection.")] = False,
     json_output: Annotated[
         bool, typer.Option("--json", hidden=True, help="Compact JSON, the default.")
@@ -182,6 +190,7 @@ def configure(
         fields,
         expect_snapshot,
         brief=not verbose and fields is None,
+        library_root=library_root,
     )
 
 
@@ -198,7 +207,7 @@ def repository(ctx: typer.Context) -> Generator[Library, None, None]:
             try:
                 from .library import Library
 
-                lib = stack.enter_context(Library(sandbox))
+                lib = stack.enter_context(Library(sandbox, root_folder_id=cfg.load_library_root()))
             except sqlite3.Error as exc:
                 raise CacheAccessError(
                     "cache_invalid",
@@ -1154,6 +1163,10 @@ def schema(
             ],
             "usage_notes": [
                 "Global options go before the command. schema COMMAND gives targeted details.",
+                "A managed cache can select a default root in library-root.json "
+                "with root_folder_id. --library-root ID or all overrides it; "
+                "info exposes root_folder_id with --fields. Explicit --sandbox reads "
+                "do not inherit the managed cache selection.",
                 "schema COMMAND includes output field hints for row-based responses.",
                 "Notebook selectors accept an exact UUID, full path, or unique exact name.",
                 "Follow next_offset or next_page_offset; pin snapshot with --expect-snapshot.",
