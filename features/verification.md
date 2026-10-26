@@ -19,9 +19,25 @@ evidence.
 - `test_study_export_discuss_edit_refresh_selected_pages`
 - `test_study_stable_identity_stale_snapshot_deleted_page_and_expired_artifact`
 - `test_study_visual_evidence_never_silently_falls_back`
+- `test_study_supported_native_schema_matrix_matches_independent_references`
+- `test_study_omitted_image_field_6_metadata_survives_render_export_and_cached_bundle`
+- `test_study_unsupported_native_variants_keep_partial_mixed_page_output`
+- `test_study_unsupported_only_native_variants_fail_with_page_context_and_cleanup`
 
-All three run with `uv run pytest tests/test_study_journeys.py` in
+These run with `uv run pytest tests/test_study_journeys.py` in
 [`test_study_journeys.py`](../tests/test_study_journeys.py).
+
+The installed-CLI matrix covers supported pen and highlighter encodings,
+identity layouts, filled paths, an outlined ellipse, variable-width brush
+geometry, two-point open lines and bounded line translation, and three exact
+image binding layouts, including a clipped page-edge image, with body field 6
+present or absent. Every generated mark
+has an independent PDF reference and an omission control for its own pixel
+region. The omitted-image-field case preserves its count and warning through
+render, export, cached bundle reuse, and persistent bundle manifests. A stale
+renderer-version cache seeded with a background-only image must be rejected.
+Separate controls retain partial output beside unknown records and fail
+unsupported-only pages with page context and clean output state.
 
 ### Independent rendering references
 

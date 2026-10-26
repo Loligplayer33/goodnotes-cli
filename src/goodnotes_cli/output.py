@@ -206,6 +206,7 @@ _BRIEF_NATIVE_FIELDS = (
     "deleted_objects",
     "unsupported_objects",
     "unsupported_reasons",
+    "native_image_body_field_6_absent_records",
 )
 
 

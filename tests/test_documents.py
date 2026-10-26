@@ -17,6 +17,7 @@ import goodnotes_cli.documents as documents
 from goodnotes_cli.documents import export_pdf, register_annotated_pdf, render_page, render_pages
 from goodnotes_cli.errors import FilesystemAccessError, GoodnotesError
 from goodnotes_cli.models import Page
+from goodnotes_cli.native import NativeError
 from goodnotes_cli.safety import Sandbox
 
 
@@ -738,6 +739,54 @@ def test_native_nonstroke_overlay_is_composited(
     with fitz.open(result["path"]) as rendered:
         assert rendered[0].get_pixmap(dpi=72).pixel(80, 80) == (255, 0, 0)
     assert result["includes_handwriting"] is False
+
+
+def test_native_page_error_has_public_page_context_and_leaves_no_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sandbox = FakeSandbox(tmp_path / "sandbox")
+    _make_pdf(sandbox.attachments_dir / "background.pdf", ["background"])
+    page = _page(str(uuid4()), 2, "background.pdf", pdf_page=1)
+    session_counts = {"opened": 0, "closed": 0}
+    expected_error = NativeError(
+        "native_data_unavailable",
+        "The copied page has native records, but none could be rendered by the supported renderer.",
+        operation="decode_native_page",
+        context={"native_annotations": {"unsupported_reasons": {"decode-failed": 1}}},
+    )
+    original_details = dict(expected_error.details)
+
+    class FakeSession:
+        def __init__(self, _sandbox: Any) -> None:
+            session_counts["opened"] += 1
+
+        def __enter__(self) -> FakeSession:
+            return self
+
+        def __exit__(self, *_args: object) -> Literal[False]:
+            session_counts["closed"] += 1
+            return False
+
+        def read_page_records(self, _root_uuid: str) -> list[tuple[bytes, bytes]]:
+            return []
+
+    def fail_overlay(*_args: Any, **_kwargs: Any) -> Any:
+        raise expected_error
+
+    monkeypatch.setattr("goodnotes_cli.native.NativeStoreSession", FakeSession)
+    monkeypatch.setattr("goodnotes_cli.annotations.render_native_overlay", fail_overlay)
+    output = Path("native-failed.png")
+    with pytest.raises(NativeError) as captured:
+        render_page(sandbox, page, output, layer="native", dpi=72)
+
+    assert captured.value is expected_error
+    assert captured.value.code == "native_data_unavailable"
+    assert captured.value.details["page"] == 2
+    assert {key: value for key, value in captured.value.details.items() if key != "page"} == (
+        original_details
+    )
+    assert session_counts == {"opened": 1, "closed": 1}
+    assert not (sandbox.outputs_dir / output).exists()
 
 
 def test_render_pages_uses_one_native_store_session(

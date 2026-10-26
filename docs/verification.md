@@ -67,10 +67,12 @@ package origin outside the checkout, and records the version, external-origin
 result, and installed/source package fingerprints. It blocks a target whose
 package origin is inside the checkout or whose installed package content does
 not match the current source package. The receipt does not store local executable
-or import paths. The macOS CI job
-builds the wheel, installs it outside the checkout, and runs representative
-generated study journeys through that executable. The separate package job's
-`goodnotes schema` smoke check does not replace these journeys.
+or import paths. The macOS CI job builds the wheel, installs it outside the
+checkout, and runs the required generated study journeys through that
+executable, including the schema matrix and failure controls. Its small
+synthetic PDFs exercise the CLI's PDF handling; private lecture exports and
+snapshots stay outside public CI. The separate package job's `goodnotes schema`
+smoke check does not replace these journeys.
 
 ## Use a copied private reference corpus
 
@@ -148,6 +150,28 @@ reordering, and notebook rename or move; explicit missing and deleted identities
 stale snapshot errors; expired image recovery; and errors when native or
 annotated evidence is unavailable. Numeric page positions are not durable
 identities.
+
+`test_study_supported_native_schema_matrix_matches_independent_references`
+also runs the installed CLI against generated pen and highlighter records,
+identity variants, filled paths, an outlined ellipse, two-point open lines with
+and without a bounded translation, variable-width brush geometry, and exact
+image attachment layouts. Image cases cover explicit attachment binding, direct
+body-resource lookup, descriptor-resource lookup, a page-edge clipped image, and
+body field 6 present or absent. The omitted-field case keeps an explicit count
+and warning; its effect on application appearance or visibility remains
+unverified. Every candidate
+object has an independently drawn reference region, and a reference with that
+object omitted must fail the same comparison. Managed cache hits and persistent
+bundle manifests retain native counts and warnings. A deliberately seeded
+renderer-version cache entry contains a background-only image, so the current
+renderer must regenerate it before the installed CLI can pass.
+
+Mixed-page and unsupported-only journeys keep genuinely unknown geometry and
+object types fail-closed. They check that supported marks remain visible beside
+an unknown record, and that a failing selected second page reports its public
+one-based page number without publishing partial managed or persistent output.
+The suite also verifies that selection and cache/output modes do not change the
+supported-schema expectations.
 
 Generated reference pages are drawn independently of the production decoder and
 renderer. The comparator checks dimensions, the whole page, and declared regions

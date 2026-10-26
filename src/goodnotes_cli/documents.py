@@ -25,7 +25,7 @@ from .safety import _require_not_production, open_database, resolve_confined_fil
 if TYPE_CHECKING:
     from .artifacts import ArtifactCache
 
-_RENDER_CACHE_VERSION = 3
+_RENDER_CACHE_VERSION = 4
 
 
 class SandboxProtocol(Protocol):
@@ -804,13 +804,19 @@ def _append_native_page(
         raise GoodnotesError(
             "Native annotation rendering does not yet support rotated or cropped backgrounds."
         )
-    overlay = render_native_overlay(
-        sandbox,
-        page,
-        width_points=target.rect.width,
-        height_points=target.rect.height,
-        record_reader=record_reader,
-    )
+    from .native import NativeError
+
+    try:
+        overlay = render_native_overlay(
+            sandbox,
+            page,
+            width_points=target.rect.width,
+            height_points=target.rect.height,
+            record_reader=record_reader,
+        )
+    except NativeError as exc:
+        exc.details["page"] = page.number
+        raise
     if overlay.svg and (
         overlay.metadata.get("rendered_objects") or overlay.metadata.get("rendered_strokes")
     ):

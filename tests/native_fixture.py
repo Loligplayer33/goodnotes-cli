@@ -33,6 +33,19 @@ LOGICAL_IDS = (
 IMAGE_LOGICAL_ID = "00000000-0000-4000-8000-000000000700"
 IMAGE_RESOURCE_ID = "00000000-0000-4000-8000-000000000800"
 IMAGE_ATTACHMENT_ID = "00000000-0000-4000-8000-000000000900"
+VARIANT_LOGICAL_ID = "00000000-0000-4000-8000-000000000a01"
+VARIANT_STORAGE_ID = "00000000-0000-4000-8000-000000000a02"
+VARIANT_RESOURCE_ID = "00000000-0000-4000-8000-000000000a03"
+VARIANT_ATTACHMENT_ID = "00000000-0000-4000-8000-000000000a04"
+UNSUPPORTED_PAGE_ID = "00000000-0000-4000-8000-000000000a10"
+
+UNSUPPORTED_NATIVE_VARIANTS = {
+    "image-body-missing-field-6": "unsupported-native-image-field-6",
+    "descriptor-resource-without-attachment": "image-binding-incomplete",
+    "observed-combined-image-shape": "unsupported-native-image-field-6",
+    "alternate-shape-envelope": "unsupported-native-geometry-envelope",
+    "shape-with-transform": "unsupported-native-geometry-field-6",
+}
 
 
 def _varint(value: int) -> bytes:
@@ -52,6 +65,388 @@ def _field(number: int, value: bytes | int) -> bytes:
 
 def _fixed(number: int, value: float) -> bytes:
     return _varint(number * 8 + 5) + struct.pack("<f", value)
+
+
+def _float_bits(value: float) -> int:
+    return struct.unpack("<I", struct.pack("<f", value))[0]
+
+
+def _rgba(red: float, green: float, blue: float, alpha: float) -> bytes:
+    return b"".join(
+        _fixed(number, value) for number, value in enumerate((red, green, blue, alpha), 1)
+    )
+
+
+def _native_record_pair(
+    page_id: str,
+    body: bytes,
+    *,
+    object_type: int = 24,
+    logical_id: str = VARIANT_LOGICAL_ID,
+    storage_id: str = VARIANT_STORAGE_ID,
+    storage_alias: bool = True,
+    descriptor_extra: bytes = b"",
+    sequence: int = 2,
+) -> dict[bytes, bytes]:
+    root = str(UUID(int=UUID(page_id).int + 1)).upper()
+    key_storage_id = storage_id if storage_alias else logical_id
+    descriptor = (
+        _field(1, logical_id.encode())
+        + (_field(6, storage_id.encode()) if storage_alias else b"")
+        + _field(8, 1)
+        + _field(9, sequence)
+        + _field(16, object_type)
+        + descriptor_extra
+    )
+    prefix = f"{root}.normal.{key_storage_id}.".encode()
+    return {prefix + b"descriptor": descriptor, prefix + b"item": _field(7, body)}
+
+
+def _native_ink_records(
+    page_id: str,
+    *,
+    points: tuple[tuple[float, float], ...],
+    width: float,
+    color: tuple[float, float, float, float],
+    translation: tuple[float, float] = (0.0, 0.0),
+    highlighter_style: bool = False,
+    direct_identity: bool = False,
+) -> dict[bytes, bytes]:
+    """Encode a generated pen/highlighter body from known point and style values."""
+    if len(points) < 2:
+        raise ValueError("Generated native ink requires at least two points")
+    schema = b"vuA(v)A(S(uu))A(S(uuuu))\0"
+    values = struct.pack("<HfI", 0, width, 0)
+    values += struct.pack("<Iff", 1, *points[0])
+    segments = tuple(zip(points[:-1], points[1:], strict=True))
+    values += struct.pack("<I", len(segments))
+    values += b"".join(struct.pack("<ffff", *start, *end) for start, end in segments)
+    tpl = b"tpl\0" + struct.pack("<I", 8 + len(schema) + len(values)) + schema + values
+    frame = b"bv4-" + struct.pack("<II", len(tpl), len(tpl)) + tpl + b"bv4$"
+    body = _field(1, VARIANT_LOGICAL_ID.encode()) + _field(2, frame) + _field(4, _rgba(*color))
+    if highlighter_style:
+        body += _field(3, 5) + _field(5, 1)
+    if translation != (0.0, 0.0):
+        body += _field(6, _fixed(1, translation[0]) + _fixed(2, translation[1]))
+    if direct_identity:
+        body += _field(20, b"")
+    return _native_record_pair(
+        page_id,
+        body,
+        storage_alias=not direct_identity,
+        logical_id=VARIANT_LOGICAL_ID,
+        storage_id=VARIANT_STORAGE_ID,
+        descriptor_extra=_field(14, 123) if direct_identity else b"",
+    )
+
+
+def _native_filled_path_records(page_id: str) -> dict[bytes, bytes]:
+    """Encode an independent filled-path fixture with four straight cubic edges."""
+    format_string = b"vA(v)A(u)A(u)A(v)A(v)A(u)A(u)A(u)A(u)A(v)"
+
+    def array_u(values: tuple[int, ...]) -> bytes:
+        return struct.pack("<I", len(values)) + b"".join(
+            struct.pack("<I", value) for value in values
+        )
+
+    def array_v(values: tuple[int, ...]) -> bytes:
+        return struct.pack("<I", len(values)) + b"".join(
+            struct.pack("<H", value) for value in values
+        )
+
+    cubic_values = (
+        160,
+        90,
+        170,
+        90,
+        180,
+        90,
+        180,
+        100,
+        180,
+        110,
+        180,
+        120,
+        170,
+        120,
+        160,
+        120,
+        150,
+        120,
+        150,
+        110,
+        150,
+        100,
+        150,
+        90,
+    )
+    values = struct.pack("<H", 2)
+    values += array_v((0, 1))
+    values += array_u(tuple(_float_bits(value) for value in (10.0, 11.0, 1.0)))
+    values += array_u((0, 0, 0, 0, 0, 0))
+    values += array_v((5,))
+    values += array_v((0, 2, 2, 2, 2))
+    values += array_u(tuple(_float_bits(value) for value in (150.0, 90.0)))
+    values += array_u(())
+    values += array_u(tuple(_float_bits(value) for value in cubic_values))
+    values += array_u(())
+    values += array_v(())
+    contents = format_string + b"\0" + values
+    tpl = b"tpl\0" + struct.pack("<I", 8 + len(contents)) + contents
+    frame = b"bv4-" + struct.pack("<II", len(tpl), len(tpl)) + tpl + b"bv4$"
+    body = (
+        _field(1, VARIANT_LOGICAL_ID.encode())
+        + _field(2, frame)
+        + _field(3, 1)
+        + _field(4, _rgba(0.1, 0.7, 0.2, 0.8))
+        + _field(20, b"")
+        + _field(21, 24)
+    )
+    return _native_record_pair(page_id, body)
+
+
+def _native_variable_brush_records(page_id: str) -> dict[bytes, bytes]:
+    """Encode one supported variable-width brush with a wider terminal sample."""
+    format_string = b"vuA(v)A(S(uuuuu))A(S(uuuuuuuuuuu))A(S(uu))A(v)A(S(uu))A(S(uuuu))A(u)"
+    flags = (0, 1)
+    start = (100.0, 130.0, 0.0, -1.0, 1.0)
+    sample = (0.0, 120.0, 130.0, 0.0, 1.0, 2.0, 160.0, 130.0, 0.0, 1.0, 4.0)
+    values = struct.pack("<HII", 1, _float_bits(2.0), len(flags))
+    values += b"".join(struct.pack("<H", flag) for flag in flags)
+    values += struct.pack("<I", 1) + struct.pack("<5I", *(_float_bits(value) for value in start))
+    values += struct.pack("<I", 1) + struct.pack("<11I", *(_float_bits(value) for value in sample))
+    values += struct.pack("<I", 0) * 5
+    contents = format_string + b"\0" + values
+    tpl = b"tpl\0" + struct.pack("<I", 8 + len(contents)) + contents
+    frame = b"bv4-" + struct.pack("<II", len(tpl), len(tpl)) + tpl + b"bv4$"
+    body = (
+        _field(1, VARIANT_LOGICAL_ID.encode())
+        + _field(2, frame)
+        + _field(3, 5)
+        + _field(4, _rgba(0.2, 0.4, 0.6, 0.5))
+        + _field(21, 25)
+    )
+    return _native_record_pair(page_id, body, object_type=25)
+
+
+def _native_open_two_point_shape_records(
+    page_id: str,
+    *,
+    points: tuple[tuple[float, float], tuple[float, float]],
+    width: float = 3.0,
+    color: tuple[float, float, float, float] = (0.4, 0.2, 0.8, 0.75),
+    translation: tuple[float, float] = (0.0, 0.0),
+) -> dict[bytes, bytes]:
+    """Encode the observed open two-point line shape, including optional dx/dy."""
+    format_string = b"vuA(v)A(S(uu))A(S(uuuu))vA(f)"
+    values = (
+        struct.pack("<HfI", 2, width, 0)
+        + struct.pack("<I", 0)
+        + struct.pack("<I", 0)
+        + struct.pack("<H", 1)
+        + struct.pack("<I", 0)
+    )
+    contents = format_string + b"\0" + values
+    tpl = b"tpl\0" + struct.pack("<I", 8 + len(contents)) + contents
+    frame = b"bv4-" + struct.pack("<II", len(tpl), len(tpl)) + tpl + b"bv4$"
+    body = (
+        _field(1, VARIANT_LOGICAL_ID.encode())
+        + _field(2, frame)
+        + _field(4, _rgba(*color))
+        + _field(
+            9,
+            _field(
+                1,
+                _field(1, _fixed(1, points[0][0]) + _fixed(2, points[0][1]))
+                + _field(1, _fixed(1, points[1][0]) + _fixed(2, points[1][1])),
+            )
+            + _field(5, b"\x10\x01")
+            + _fixed(15, width),
+        )
+        + _field(20, b"")
+        + _field(21, 24)
+    )
+    if translation != (0.0, 0.0):
+        body += _field(6, _fixed(1, translation[0]) + _fixed(2, translation[1]))
+    return _native_record_pair(page_id, body)
+
+
+def _native_image_layout_records(
+    page_id: str,
+    *,
+    descriptor_layout: str = "explicit-attachment",
+    body_field_6: int | None = 1,
+    bounds: tuple[float, float, float, float] = (110.0, 55.0, 55.0, 55.0),
+) -> dict[bytes, bytes]:
+    """Encode an image with one of the generated exact-resource binding layouts."""
+    if descriptor_layout not in {
+        "explicit-attachment",
+        "body-resource",
+        "descriptor-resource",
+    }:
+        raise ValueError(f"Unknown generated image binding layout: {descriptor_layout}")
+    x, y, width, height = bounds
+    logical_id = VARIANT_LOGICAL_ID
+    resource_id = VARIANT_RESOURCE_ID
+    attachment_id = VARIANT_ATTACHMENT_ID
+
+    def point(first: float, second: float) -> bytes:
+        return _fixed(1, first) + _fixed(2, second)
+
+    def rectangle(first: float, second: float) -> bytes:
+        return _field(1, point(first, second)) + _field(2, point(width, height))
+
+    body = (
+        _field(1, logical_id.encode())
+        + _field(2, rectangle(x, y))
+        + _field(3, rectangle(x + width / 2, y + height / 2))
+        + _field(4, resource_id.encode())
+        + _field(5, b"generated")
+        + (_field(6, body_field_6) if body_field_6 is not None else b"")
+        + _field(15, b"generated")
+        + _field(18, 24)
+    )
+    descriptor = _field(1, logical_id.encode())
+    if descriptor_layout == "body-resource":
+        # With neither descriptor resource nor attachment, the exact body
+        # resource ID selects the projection attachment.
+        key_storage_id = VARIANT_STORAGE_ID
+        descriptor += _field(6, key_storage_id.encode())
+    elif descriptor_layout == "descriptor-resource":
+        key_storage_id = VARIANT_STORAGE_ID
+        descriptor += _field(4, resource_id.encode()) + _field(6, key_storage_id.encode())
+    else:
+        key_storage_id = VARIANT_STORAGE_ID
+        descriptor += (
+            _field(4, resource_id.encode())
+            + _field(6, key_storage_id.encode())
+            + _field(7, attachment_id.encode())
+        )
+    descriptor += _field(8, 1) + _field(9, 2) + _field(16, 24)
+    root = str(UUID(int=UUID(page_id).int + 1)).upper()
+    prefix = f"{root}.normal.{key_storage_id}.".encode()
+    return {prefix + b"descriptor": descriptor, prefix + b"item": _field(1, body)}
+
+
+def _native_variant_records(page_id: str, variant: str) -> dict[bytes, bytes]:
+    """Encode one supported control or intentionally unsupported native object."""
+    if variant not in {*UNSUPPORTED_NATIVE_VARIANTS, "supported-ellipse-control"}:
+        raise ValueError(f"Unknown generated native variant: {variant}")
+
+    root = str(UUID(int=UUID(page_id).int + 1)).upper()
+    logical_id = VARIANT_LOGICAL_ID
+    storage_id = VARIANT_STORAGE_ID
+    descriptor_prefix = _field(1, logical_id.encode())
+    actor_sequence = _field(8, 1) + _field(9, 2) + _field(16, 24)
+
+    if variant in {
+        "image-body-missing-field-6",
+        "descriptor-resource-without-attachment",
+        "observed-combined-image-shape",
+    }:
+
+        def point(x: float, y: float) -> bytes:
+            return _fixed(1, x) + _fixed(2, y)
+
+        def rectangle(x: float, y: float, width: float, height: float) -> bytes:
+            return _field(1, point(x, y)) + _field(2, point(width, height))
+
+        x, y, width, height = 110.0, 55.0, 55.0, 55.0
+        body = (
+            _field(1, logical_id.encode())
+            + _field(2, rectangle(x, y, width, height))
+            + _field(3, rectangle(x + width / 2, y + height / 2, width, height))
+            + _field(4, VARIANT_RESOURCE_ID.encode())
+            + _field(5, b"")
+            + (
+                b""
+                if variant in {"image-body-missing-field-6", "observed-combined-image-shape"}
+                else _field(6, 1)
+            )
+            + _field(15, b"")
+            + _field(18, 24)
+        )
+        descriptor = descriptor_prefix + _field(4, VARIANT_RESOURCE_ID.encode())
+        if variant == "observed-combined-image-shape":
+            descriptor += _field(2, b"generated") + _field(14, 1)
+            record_storage_id = logical_id
+        else:
+            descriptor += _field(6, storage_id.encode())
+            record_storage_id = storage_id
+        if variant != "descriptor-resource-without-attachment":
+            descriptor += _field(7, VARIANT_ATTACHMENT_ID.encode())
+        descriptor += actor_sequence
+        item = _field(1, body)
+    else:
+        # A generated, known observed ellipse control. The two unsupported
+        # geometry cases mutate only the auxiliary envelope or opaque field 6.
+        format_string = b"vuA(v)A(S(uu))A(S(uuuu))vA(f)"
+        values = (
+            struct.pack("<HfI", 2, 2.0, 0)
+            + struct.pack("<I", 0)
+            + struct.pack("<I", 0)
+            + struct.pack("<H", 1)
+            + struct.pack("<I", 0)
+        )
+        contents = format_string + b"\0" + values
+        tpl = b"tpl\0" + struct.pack("<I", 8 + len(contents)) + contents
+        frame = b"bv4-" + struct.pack("<II", len(tpl), len(tpl)) + tpl + b"bv4$"
+
+        def point(x: float, y: float) -> bytes:
+            return _fixed(1, x) + _fixed(2, y)
+
+        shape = (
+            _field(1, point(170.0, 115.0))
+            + _field(2, point(25.0, 15.0))
+            + _fixed(3, 1.5707963267948966)
+        )
+        auxiliary = (
+            _field(4, shape) + _field(5, b"\x10\x01") + _fixed(15, 2.0)
+            if variant != "alternate-shape-envelope"
+            else _field(1, _field(1, point(1.0, 2.0)) + _field(2, point(10.0, 20.0)))
+            + _field(5, b"\x10\x01")
+            + _fixed(15, 2.0)
+        )
+        body = (
+            _field(1, logical_id.encode())
+            + _field(2, frame)
+            + _field(4, _fixed(1, 0.1) + _fixed(2, 0.3) + _fixed(3, 0.5) + _fixed(4, 0.75))
+            + _field(9, auxiliary)
+            + _field(21, 24)
+        )
+        if variant == "shape-with-transform":
+            body += _field(6, _fixed(1, 1.0) + _fixed(2, 2.0))
+        descriptor = descriptor_prefix + _field(6, storage_id.encode()) + actor_sequence
+        record_storage_id = storage_id
+        item = _field(7, body)
+
+    prefix = f"{root}.normal.{record_storage_id}.".encode()
+    return {prefix + b"descriptor": descriptor, prefix + b"item": item}
+
+
+def _add_generated_page(source: Path, page_id: str = UNSUPPORTED_PAGE_ID) -> None:
+    """Add a generated page with a valid PDF binding and no native records."""
+    with sqlite3.connect(source / "Databases" / "projection.sqlite") as database:
+        database.execute(
+            "INSERT INTO pages VALUES (?, ?, 'generated-template-1', '3', '', 0)",
+            (page_id, NOTEBOOK),
+        )
+
+
+def _native_unknown_object_type_records(page_id: str) -> dict[bytes, bytes]:
+    """Encode a generated object type the current reader does not recognize."""
+    root = str(UUID(int=UUID(page_id).int + 1)).upper()
+    logical_id = "00000000-0000-4000-8000-000000000a20"
+    storage_id = "00000000-0000-4000-8000-000000000a21"
+    descriptor = (
+        _field(1, logical_id.encode())
+        + _field(6, storage_id.encode())
+        + _field(8, 1)
+        + _field(9, 2)
+        + _field(16, 99)
+    )
+    prefix = f"{root}.normal.{storage_id}.".encode()
+    return {prefix + b"descriptor": descriptor, prefix + b"item": _field(7, b"")}
 
 
 def _native_image(page: int, *, sequence: int = 2) -> dict[bytes, bytes]:
@@ -111,6 +506,21 @@ def _add_image_attachment(source: Path, data: bytes) -> None:
         database.execute(
             "INSERT INTO attachments VALUES (?, ?, ?, 1)",
             (IMAGE_ATTACHMENT_ID, "generated-image.png", NOTEBOOK),
+        )
+
+
+def _add_variant_attachments(source: Path) -> None:
+    """Add exact generated bindings used by the Issue 8 image records."""
+    values = (
+        (VARIANT_ATTACHMENT_ID, "generated-variant-bound.png"),
+        (VARIANT_RESOURCE_ID, "generated-variant-direct.png"),
+    )
+    for _, name in values:
+        (source / "Attachments" / name).write_bytes(_solid_png((0, 240, 0)))
+    with sqlite3.connect(source / "Databases" / "projection.sqlite") as database:
+        database.executemany(
+            "INSERT INTO attachments VALUES (?, ?, ?, 1)",
+            ((attachment_id.upper(), name, NOTEBOOK) for attachment_id, name in values),
         )
 
 

@@ -30,6 +30,21 @@ _VARIABLE_BRUSH_FORMAT = "vuA(v)A(S(uuuuu))A(S(uuuuuuuuuuu))A(S(uu))A(v)A(S(uu))
 _COORDINATE_SCALE = 72 / 132
 _MAX_PAGE_IMAGE_BYTES = 16 * 1024 * 1024
 _MAX_PAGE_IMAGE_PIXELS = 25_000_000
+_UnsupportedReason = Literal[
+    "unsupported-native-image-field-6",
+    "image-binding-incomplete",
+    "unsupported-native-geometry-envelope",
+    "unsupported-native-geometry-field-6",
+    "unsupported-native-geometry-point-count",
+]
+
+
+class _UnsupportedNativeVariant(ValueError):
+    """A recognized but unsupported variant with a static public reason code."""
+
+    def __init__(self, reason: _UnsupportedReason) -> None:
+        super().__init__()
+        self.reason = reason
 
 
 @dataclass(frozen=True)
@@ -143,6 +158,32 @@ def _fixed(message: Message, number: int, default: float) -> float:
     if value is None or not math.isfinite(value):
         raise ValueError("Nonfinite native color or translation")
     return value
+
+
+def _native_translation(
+    body: Message,
+    *,
+    unsupported_reason: _UnsupportedReason | None = None,
+    unsupported_message: str = "Unsupported native translation field",
+    require_pair: bool = False,
+) -> tuple[float, float]:
+    offset = _one(body, 6, bytes, required=False)
+    if offset in {None, b""}:
+        return 0.0, 0.0
+    offset_message = decode_message(cast(bytes, offset))
+    if any(item.number not in {1, 2} for item in offset_message.fields):
+        if unsupported_reason is not None:
+            raise _UnsupportedNativeVariant(unsupported_reason)
+        raise ValueError(unsupported_message)
+    if require_pair and {item.number for item in offset_message.fields} != {1, 2}:
+        if unsupported_reason is not None:
+            raise _UnsupportedNativeVariant(unsupported_reason)
+        raise ValueError(unsupported_message)
+    dx = _fixed(offset_message, 1, 0.0)
+    dy = _fixed(offset_message, 2, 0.0)
+    if abs(dx) > 100_000 or abs(dy) > 100_000:
+        raise ValueError("Native translation exceeds coordinate bounds")
+    return dx, dy
 
 
 def _decode_tpl_payload(
@@ -486,35 +527,47 @@ def _fixed_point(payload: bytes) -> tuple[float, float]:
     return x, y
 
 
-def _decode_native_ellipse(body: Message, budget: _DecodeBudget) -> NativePath:
-    """Decode the observed outlined ellipse stored beside an empty ink TPL."""
-    if any(item.number not in {1, 2, 4, 6, 7, 9, 15, 20, 21} for item in body.fields):
-        raise ValueError("Unsupported native ellipse body field")
+def _native_shape_style(body: Message, budget: _DecodeBudget) -> tuple[float, str, float]:
     if _one(body, 21, int) != 24:
-        raise ValueError("Unsupported native ellipse body type")
-    for number in (6, 20):
-        if _one(body, number, bytes, required=False) not in {None, b""}:
-            raise ValueError("Unsupported native ellipse transform or metadata")
+        raise ValueError("Unsupported native shape body type")
     for number in (7, 15):
         _one(body, number, bytes, required=False)
     image = _decode_tpl_payload(
         body,
         budget,
         expected_format="vuA(v)A(S(uu))A(S(uuuu))vA(f)",
-        schema_error="Unsupported native ellipse TPL schema",
+        schema_error="Unsupported native shape TPL schema",
     )
     values = image.values
     if len(values) != 7 or values[0] != 2 or values[5] != 1:
-        raise ValueError("Unsupported native ellipse TPL version")
+        raise ValueError("Unsupported native shape TPL version")
     if any(values[index] for index in (2, 3, 4, 6)):
-        raise ValueError("Native ellipse has additional ink or dash geometry")
+        raise ValueError("Native shape has additional ink or dash geometry")
     width = _tpl_float(cast(int, values[1]), label="ellipse width")
     if not 0.05 <= width <= 100:
-        raise ValueError("Invalid native ellipse width")
+        raise ValueError("Invalid native shape width")
+    color, alpha = _rgb_alpha(body, required=True)
+    return width, color, alpha
 
-    auxiliary = decode_message(cast(bytes, _one(body, 9, bytes)))
+
+def _decode_native_ellipse(
+    body: Message,
+    budget: _DecodeBudget,
+    *,
+    auxiliary: Message | None = None,
+) -> NativePath:
+    """Decode the observed outlined ellipse stored beside an empty ink TPL."""
+    if any(item.number not in {1, 2, 4, 6, 7, 9, 15, 20, 21} for item in body.fields):
+        raise ValueError("Unsupported native ellipse body field")
+    if _one(body, 6, bytes, required=False) not in {None, b""}:
+        raise _UnsupportedNativeVariant("unsupported-native-geometry-field-6")
+    if _one(body, 20, bytes, required=False) not in {None, b""}:
+        raise ValueError("Unsupported native ellipse transform or metadata")
+    width, color, alpha = _native_shape_style(body, budget)
+
+    auxiliary = auxiliary or decode_message(cast(bytes, _one(body, 9, bytes)))
     if len(auxiliary.fields) != 3 or {f.number for f in auxiliary.fields} != {4, 5, 15}:
-        raise ValueError("Unsupported native ellipse geometry envelope")
+        raise _UnsupportedNativeVariant("unsupported-native-geometry-envelope")
     if _one(auxiliary, 5, bytes) != b"\x10\x01":
         raise ValueError("Uncertain native ellipse visibility or style")
     shape = decode_message(cast(bytes, _one(auxiliary, 4, bytes)))
@@ -528,7 +581,6 @@ def _decode_native_ellipse(body: Message, budget: _DecodeBudget) -> NativePath:
     auxiliary_width = _fixed(auxiliary, 15, 0.0)
     if not math.isclose(auxiliary_width, width, rel_tol=1e-6, abs_tol=1e-6):
         raise ValueError("Native ellipse width fields disagree")
-    color, alpha = _rgb_alpha(body, required=True)
     budget.charge(point_count=13)
     cosine, sine = math.cos(rotation), math.sin(rotation)
 
@@ -562,6 +614,80 @@ def _decode_native_ellipse(body: Message, budget: _DecodeBudget) -> NativePath:
     )
 
 
+def _decode_native_two_point_shape(
+    body: Message, auxiliary: Message, budget: _DecodeBudget
+) -> NativePath:
+    """Decode an observed open two-point shape path without closing or filling it."""
+    if any(item.number not in {1, 2, 4, 6, 7, 9, 15, 20, 21} for item in body.fields):
+        raise ValueError("Unsupported native shape body field")
+    dx, dy = _native_translation(
+        body,
+        unsupported_reason="unsupported-native-geometry-field-6",
+        require_pair=True,
+    )
+    if _one(body, 20, bytes, required=False) not in {None, b""}:
+        raise ValueError("Unsupported native shape transform or metadata")
+    width, color, alpha = _native_shape_style(body, budget)
+    if len(auxiliary.fields) != 3 or {item.number for item in auxiliary.fields} != {1, 5, 15}:
+        raise _UnsupportedNativeVariant("unsupported-native-geometry-envelope")
+    if _one(auxiliary, 5, bytes) != b"\x10\x01":
+        raise ValueError("Uncertain native shape visibility or style")
+    auxiliary_width = _fixed(auxiliary, 15, 0.0)
+    if not math.isclose(auxiliary_width, width, rel_tol=1e-6, abs_tol=1e-6):
+        raise ValueError("Native shape width fields disagree")
+
+    point_stream = decode_message(cast(bytes, _one(auxiliary, 1, bytes)))
+    if any(item.number != 1 or not isinstance(item.value, bytes) for item in point_stream.fields):
+        raise _UnsupportedNativeVariant("unsupported-native-geometry-envelope")
+    if len(point_stream.fields) != 2:
+        raise _UnsupportedNativeVariant("unsupported-native-geometry-point-count")
+    points = [_fixed_point(cast(bytes, item.value)) for item in point_stream.fields]
+    budget.charge(point_count=len(points))
+    translated = [
+        (
+            _native_float(x + dx, label="native shape coordinate"),
+            _native_float(y + dy, label="native shape coordinate"),
+        )
+        for x, y in points
+    ]
+    start, end = translated
+    delta_x = end[0] - start[0]
+    delta_y = end[1] - start[1]
+    commands = (
+        NativePathCommand("M", start),
+        NativePathCommand(
+            "C",
+            (
+                start[0] + delta_x / 3,
+                start[1] + delta_y / 3,
+                start[0] + 2 * delta_x / 3,
+                start[1] + 2 * delta_y / 3,
+                end[0],
+                end[1],
+            ),
+        ),
+    )
+    return NativePath(
+        commands,
+        fill_color=None,
+        fill_alpha=0.0,
+        stroke_color=color,
+        stroke_width=width,
+        stroke_alpha=alpha,
+    )
+
+
+def _decode_native_shape(body: Message, budget: _DecodeBudget) -> NativePath:
+    """Dispatch only observed shape geometry envelopes."""
+    auxiliary = decode_message(cast(bytes, _one(body, 9, bytes)))
+    numbers = {item.number for item in auxiliary.fields}
+    if len(auxiliary.fields) == 3 and numbers == {1, 5, 15}:
+        return _decode_native_two_point_shape(body, auxiliary, budget)
+    if len(auxiliary.fields) == 3 and numbers == {4, 5, 15}:
+        return _decode_native_ellipse(body, budget, auxiliary=auxiliary)
+    raise _UnsupportedNativeVariant("unsupported-native-geometry-envelope")
+
+
 def _native_image_rect(payload: bytes) -> tuple[float, float, float, float]:
     message = decode_message(payload)
     if len(message.fields) != 2 or {item.number for item in message.fields} != {1, 2}:
@@ -588,7 +714,15 @@ def _decode_native_image(descriptor: Message, item: Message, logical_id: str) ->
     if _uuid(_one(body, 1, bytes)) != logical_id:
         raise ValueError("Native image logical identity mismatch")
     original_resource = _uuid(_one(body, 4, bytes))
-    if _one(body, 6, int) != 1 or _one(body, 18, int) != 24:
+    field_6 = body.by_number(6)
+    if field_6 and (
+        len(field_6) != 1
+        or field_6[0].wire_type != WireType.VARINT
+        or not isinstance(field_6[0].value, int)
+        or field_6[0].value != 1
+    ):
+        raise _UnsupportedNativeVariant("unsupported-native-image-field-6")
+    if _one(body, 18, int) != 24:
         raise ValueError("Unsupported native image version or transform")
     for number in (5, 15):
         opaque = cast(bytes, _one(body, number, bytes))
@@ -612,12 +746,16 @@ def _decode_native_image(descriptor: Message, item: Message, logical_id: str) ->
     descriptor_attachment = _one(descriptor, 7, bytes, required=False)
     if descriptor_resource is None and descriptor_attachment is None:
         attachment_id = original_resource
+    elif descriptor_resource is not None and descriptor_attachment is None:
+        if _uuid(descriptor_resource) != original_resource:
+            raise ValueError("Native image resource identity mismatch")
+        attachment_id = original_resource
     elif descriptor_resource is not None and descriptor_attachment is not None:
         if _uuid(descriptor_resource) != original_resource:
             raise ValueError("Native image resource identity mismatch")
         attachment_id = _uuid(descriptor_attachment)
     else:
-        raise ValueError("Incomplete native image attachment binding")
+        raise _UnsupportedNativeVariant("image-binding-incomplete")
     return NativeImage(attachment_id, x, y, width, height)
 
 
@@ -708,14 +846,7 @@ def decode_ink(body: Message, budget: _DecodeBudget | None = None) -> list[Ink]:
     if any(value == 0 for value in flags[1:]):
         raise ValueError("Uncertain native ink visibility pattern")
     color, alpha = _rgb_alpha(body)
-    offset = _one(body, 6, bytes, required=False)
-    offset_message = decode_message(offset) if isinstance(offset, bytes) and offset else None
-    if offset_message and any(item.number not in {1, 2} for item in offset_message.fields):
-        raise ValueError("Unsupported ink transform field")
-    dx = _fixed(offset_message, 1, 0.0) if offset_message else 0.0
-    dy = _fixed(offset_message, 2, 0.0) if offset_message else 0.0
-    if abs(dx) > 100_000 or abs(dy) > 100_000:
-        raise ValueError("Native translation exceeds coordinate bounds")
+    dx, dy = _native_translation(body, unsupported_message="Unsupported ink transform field")
     start_points = [_point(*start) for start in starts]
     segment_points = [
         (_point(segment[0], segment[1]), _point(segment[2], segment[3])) for segment in segments
@@ -936,6 +1067,8 @@ def _svg(
 
 
 def _unsupported_reason(error: Exception) -> str:
+    if isinstance(error, _UnsupportedNativeVariant):
+        return error.reason
     message = str(error)
     if "TPL schema" in message or "TPL version" in message:
         return "unsupported-annotation-schema"
@@ -976,6 +1109,7 @@ def decode_native_objects(
     unmodeled_body_fields: set[int] = set()
     unmodeled_image_fields: set[int] = set()
     unmodeled_tpl_fields: dict[str, set[int]] = defaultdict(set)
+    image_body_field_6_absent = 0
     erased = deleted = 0
     for (category, storage_id), pair in objects.items():
         if category == "deleted":
@@ -1029,8 +1163,13 @@ def decode_native_objects(
             if item_numbers == {1}:
                 if object_type != 24:
                     raise ValueError("Unsupported non-ink native image type")
+                image_body = decode_message(cast(bytes, _one(item, 1, bytes)))
                 image = _decode_native_image(descriptor, item, logical_id)
                 unmodeled_image_fields.update({5, 15})
+                if image_body.by_number(6):
+                    unmodeled_image_fields.add(6)
+                else:
+                    image_body_field_6_absent += 1
                 descriptor_variants[
                     "image-attachment-alias" if descriptor.by_number(7) else "direct-image-resource"
                 ] += 1
@@ -1055,7 +1194,7 @@ def decode_native_objects(
                     unmodeled_empty_body_fields.add(20)
                     unmodeled_tpl_fields["native-path"].update({2, 3})
                 elif _one(body, 9, bytes, required=False) not in {None, b""}:
-                    payloads = [_decode_native_ellipse(body, budget)]
+                    payloads = [_decode_native_shape(body, budget)]
                     unmodeled_body_fields.add(9)
                 else:
                     payloads = [*decode_ink(body, budget)]
@@ -1106,12 +1245,19 @@ def decode_native_objects(
         warnings.append(
             "Observed native body fields "
             + ", ".join(str(number) for number in sorted(unmodeled_body_fields))
-            + " contain opaque markers whose independent rendering effect is unverified."
+            + " include values whose independent rendering effect is unverified."
         )
     if unmodeled_image_fields:
         warnings.append(
-            "Image timestamp fields are preserved as opaque metadata. Image "
-            "bytes are resolved separately from the copied attachment store."
+            "Native image body fields "
+            + ", ".join(str(number) for number in sorted(unmodeled_image_fields))
+            + " are preserved as opaque metadata. Image bytes are resolved separately from "
+            "the copied attachment store."
+        )
+    if image_body_field_6_absent:
+        warnings.append(
+            "Some decoded native image records omit body field 6; its effect on "
+            "application appearance or visibility is unverified."
         )
     if unmodeled_tpl_fields:
         warnings.append(
@@ -1154,6 +1300,7 @@ def decode_native_objects(
             or unmodeled_descriptor_fields
             or unmodeled_body_fields
             or unmodeled_image_fields
+            or image_body_field_6_absent
             or unmodeled_tpl_fields
             else "supported-native-records"
             if image_count or path_count
@@ -1177,6 +1324,7 @@ def decode_native_objects(
         "unmodeled_empty_body_fields": sorted(unmodeled_empty_body_fields),
         "unmodeled_body_fields": sorted(unmodeled_body_fields),
         "unmodeled_image_fields": sorted(unmodeled_image_fields),
+        "native_image_body_field_6_absent_records": image_body_field_6_absent,
         "unmodeled_tpl_fields": {
             name: sorted(field_numbers)
             for name, field_numbers in sorted(unmodeled_tpl_fields.items())
