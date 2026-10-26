@@ -39,13 +39,15 @@ VARIANT_RESOURCE_ID = "00000000-0000-4000-8000-000000000a03"
 VARIANT_ATTACHMENT_ID = "00000000-0000-4000-8000-000000000a04"
 UNSUPPORTED_PAGE_ID = "00000000-0000-4000-8000-000000000a10"
 
-UNSUPPORTED_NATIVE_VARIANTS = {
-    "image-body-missing-field-6": "unsupported-native-image-field-6",
-    "descriptor-resource-without-attachment": "image-binding-incomplete",
-    "observed-combined-image-shape": "unsupported-native-image-field-6",
-    "alternate-shape-envelope": "unsupported-native-geometry-envelope",
-    "shape-with-transform": "unsupported-native-geometry-field-6",
-}
+GENERATED_NATIVE_VARIANT_CASES = frozenset(
+    {
+        "image-body-missing-field-6",
+        "descriptor-resource-without-attachment",
+        "observed-combined-image-shape",
+        "alternate-shape-envelope",
+        "shape-with-transform",
+    }
+)
 
 
 def _varint(value: int) -> bytes:
@@ -329,8 +331,8 @@ def _native_image_layout_records(
 
 
 def _native_variant_records(page_id: str, variant: str) -> dict[bytes, bytes]:
-    """Encode one supported control or intentionally unsupported native object."""
-    if variant not in {*UNSUPPORTED_NATIVE_VARIANTS, "supported-ellipse-control"}:
+    """Encode one named generated native variant or the ellipse control."""
+    if variant not in {*GENERATED_NATIVE_VARIANT_CASES, "supported-ellipse-control"}:
         raise ValueError(f"Unknown generated native variant: {variant}")
 
     root = str(UUID(int=UUID(page_id).int + 1)).upper()
