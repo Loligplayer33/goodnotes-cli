@@ -23,6 +23,9 @@ dev = [
     "pytest-xdist>=3.8,<4",
     "hypothesis>=6,<7",
 ]
+docs = [
+    "mkdocs>=1.6.1,<2",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/goodnotes_cli"]

@@ -1,0 +1,24 @@
+site_name: Goodnotes CLI
+repo_url: https://github.com/Loligplayer33/goodnotes-cli
+site_dir: .local/docs-site
+strict: true
+plugins: [search]
+hooks: [scripts/docs_hooks.py]
+watch: [README.md, CONTRIBUTING.md]
+validation:
+  nav:
+    omitted_files: warn
+  links:
+    anchors: warn
+nav:
+  - Home: index.md
+  - Everyday tasks: usage.md
+  - Images and handwriting: pdf-and-handwriting.md
+  - Agent guide: agent-guide.md
+  - Commands and results: commands.md
+  - Development:
+      - Contributing: contributing.md
+      - Architecture: architecture.md
+      - Failure behavior: robustness.md
+      - Verification: verification.md
+      - Releases: releases.md
