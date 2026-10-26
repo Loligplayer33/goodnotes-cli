@@ -36,6 +36,10 @@ def _project(tmp_path: Path) -> tuple[Path, Path]:
     cli.write_text(f"#!{python}\n")
     cli.chmod(0o755)
     subprocess.run(["git", "init", "-q", str(root)], check=True)
+    # Git 2.56 can detach automatic maintenance after the fixture commit.
+    # Keep that background writer out of filesystem immutability checks.
+    subprocess.run(["git", "-C", str(root), "config", "maintenance.auto", "false"], check=True)
+    subprocess.run(["git", "-C", str(root), "config", "gc.auto", "0"], check=True)
     subprocess.run(
         ["git", "-C", str(root), "config", "user.email", "tests@example.invalid"], check=True
     )
