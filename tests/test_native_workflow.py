@@ -195,7 +195,7 @@ def test_native_png_pdf_bundle_preserve_sources_and_readonly_cache(
         assert inline["document_id"] == NOTEBOOK
         assert inline["snapshot"] == full_inline["snapshot"] == captured["snapshot_id"]
         assert inline["captured_at"] == full_inline["captured_at"]
-        assert inline["text_source"] == full_inline["text_source"] == "pdf"
+        assert inline["text_source"] == full_inline["text_source"] == "text"
         assert inline["truncated"] is full_inline["truncated"] is True
         assert inline["pages"] == [2, 1]
         assert [page["page_id"] for page in inline["page_evidence"]] == [

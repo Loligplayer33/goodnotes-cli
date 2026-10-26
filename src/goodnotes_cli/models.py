@@ -13,6 +13,7 @@ class Item:
     parent_id: str | None = None
     page_count: int = 0
     updated_at: float = 0
+    root_folder_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -25,7 +26,7 @@ class Page:
     pdf_page: int | None = None
     width: float | None = None
     height: float | None = None
-    annotation_count: int = 0
+    annotation_count: int | None = 0
     rotation: int = 0
 
 

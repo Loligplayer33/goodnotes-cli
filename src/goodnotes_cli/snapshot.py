@@ -7,6 +7,7 @@ import errno
 import hashlib
 import json
 import os
+import plistlib
 import sqlite3
 import stat
 import sys
@@ -19,6 +20,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from . import build_info
 from .errors import FilesystemAccessError, GoodnotesError, _permission_denied
 from .safety import (
     SNAPSHOT_MARKER,
@@ -47,6 +49,7 @@ _PROJECTION_COLUMNS = {
     "pages": {"id", "document_id", "template_id", "position", "group_id", "deleted"},
 }
 _PROJECTION_VALIDATION_ID = "quick-check-and-schema-v1"
+_GOODNOTES_BUNDLE_IDENTIFIER = "com.goodnotesapp.x"
 _CLONE_FALLBACK_ERRNOS = {
     errno.EXDEV,
     errno.ENOTSUP,
@@ -600,7 +603,32 @@ def _consolidate_copied_databases(library_copy: Path) -> None:
             sidecar.unlink(missing_ok=True)
 
 
-def _validate_projection_database(database_path: Path) -> None:
+def _projection_library_format(connection: sqlite3.Connection) -> dict[str, int]:
+    """Read SQLite format identifiers from a copied projection database."""
+
+    user_version = connection.execute("PRAGMA user_version").fetchone()
+    application_id = connection.execute("PRAGMA application_id").fetchone()
+    if user_version is None or application_id is None:
+        raise GoodnotesError("Copied projection database did not report SQLite format metadata.")
+    return {
+        "sqlite_user_version": int(user_version[0]),
+        "sqlite_application_id": int(application_id[0]),
+    }
+
+
+def _read_projection_library_format(database_path: Path) -> dict[str, int]:
+    """Read format identifiers from an already-validated copied projection."""
+
+    try:
+        with open_database(database_path) as connection:
+            return _projection_library_format(connection)
+    except sqlite3.Error as exc:
+        raise GoodnotesError(
+            "Could not read SQLite format metadata from the copied projection database."
+        ) from exc
+
+
+def _validate_projection_database(database_path: Path) -> dict[str, int]:
     """Check the copied projection's SQLite integrity and reader-facing schema."""
 
     try:
@@ -633,10 +661,74 @@ def _validate_projection_database(database_path: Path) -> None:
                     raise GoodnotesError(
                         f"Copied projection table {table} is missing columns: {missing}"
                     )
+            return _projection_library_format(connection)
     except sqlite3.Error as exc:
         raise GoodnotesError(
             "Copied projection database failed SQLite integrity or schema validation."
         ) from exc
+
+
+def _goodnotes_info_plist_candidates() -> tuple[Path, ...]:
+    return (
+        Path("/Applications/Goodnotes.app/Contents/Info.plist"),
+        Path.home() / "Applications/Goodnotes.app/Contents/Info.plist",
+    )
+
+
+def _read_installed_goodnotes_info() -> dict[str, str | None] | None:
+    """Read installed app identity from Info.plist only; never launch or query the app."""
+
+    for info_path in _goodnotes_info_plist_candidates():
+        try:
+            descriptor = os.open(
+                info_path,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            )
+            try:
+                info = os.fstat(descriptor)
+                if not stat.S_ISREG(info.st_mode):
+                    continue
+                with os.fdopen(os.dup(descriptor), "rb") as stream:
+                    raw_metadata = stream.read(1_000_001)
+            finally:
+                os.close(descriptor)
+            if len(raw_metadata) > 1_000_000:
+                continue
+            metadata = plistlib.loads(raw_metadata)
+        except (OSError, EOFError, ValueError, plistlib.InvalidFileException):
+            continue
+        if not isinstance(metadata, dict):
+            continue
+        if metadata.get("CFBundleIdentifier") != _GOODNOTES_BUNDLE_IDENTIFIER:
+            continue
+
+        fields = {
+            key: value.strip() or None if isinstance(value, str) else None
+            for key, value in metadata.items()
+        }
+        return {
+            "name": fields.get("CFBundleDisplayName") or fields.get("CFBundleName") or "Goodnotes",
+            "bundle_id": _GOODNOTES_BUNDLE_IDENTIFIER,
+            "version": fields.get("CFBundleShortVersionString"),
+            "build": fields.get("CFBundleVersion"),
+            "basis": "installed-app-at-capture",
+        }
+    return None
+
+
+def _source_application_info(source: Path) -> dict[str, str | None] | None:
+    """Probe app metadata only for the configured live Goodnotes Library path."""
+
+    from .config import default_library
+
+    try:
+        default_source = default_library().resolve(strict=False)
+        resolved_source = source.resolve(strict=False)
+    except (OSError, RuntimeError):
+        return None
+    if resolved_source != default_source:
+        return None
+    return _read_installed_goodnotes_info()
 
 
 def _valid_relative(value: object) -> Path | None:
@@ -893,6 +985,7 @@ def _write_marker(
     source: Path | None = None,
     source_entries: Iterable[_Entry] = (),
     capture_stats: dict[str, Any] | None = None,
+    projection_library_format: dict[str, int] | None = None,
 ) -> None:
     entries = list(entries)
     # Freeze files before recording their metadata, so subsequent refreshes can
@@ -905,6 +998,8 @@ def _write_marker(
     marker_data: dict[str, Any] = {
         "format_version": 1,
         "created_at_utc": datetime.now(UTC).isoformat(),
+        "producer": {"distribution": "goodnotes-local-cli", **build_info()},
+        "source_app": _source_application_info(source) if source is not None else None,
         "files": [
             {
                 "path": (Path("Library") / entry.relative).as_posix(),
@@ -937,6 +1032,7 @@ def _write_marker(
         marker_data["projection_validation"] = {
             "validation_id": _PROJECTION_VALIDATION_ID,
             "sha256": projection.sha256,
+            "library_format": projection_library_format,
         }
     marker = destination / SNAPSHOT_MARKER
     fd, temporary_name = tempfile.mkstemp(prefix=".snapshot-marker-", dir=destination)
@@ -1048,14 +1144,17 @@ def create_snapshot(
                     if not entry.is_directory
                     and entry.relative == Path("Databases/projection.sqlite")
                 )
+                projection_copy_path = library_destination / "Databases" / "projection.sqlite"
                 # This attestation can only accompany a reused projection after
                 # the entire source SQLite family matched its saved fingerprints
                 # and the previous copy's stat key and digest record were valid.
                 # A COW clone preserves those bytes; changed families and damaged
                 # cache members take the normal integrity and schema check path.
                 if not (projection_copy.reused and projection_copy.projection_validated):
-                    _validate_projection_database(
-                        library_destination / "Databases" / "projection.sqlite"
+                    projection_library_format = _validate_projection_database(projection_copy_path)
+                else:
+                    projection_library_format = _read_projection_library_format(
+                        projection_copy_path
                     )
                 final_manifest = _final_manifest(library_destination, planned)
                 capture_stats = _capture_stats(planned, copy_metrics)
@@ -1067,6 +1166,7 @@ def create_snapshot(
                     source=source,
                     source_entries=source_files,
                     capture_stats=capture_stats,
+                    projection_library_format=projection_library_format,
                 )
                 _make_read_only(target, final_manifest)
                 return target

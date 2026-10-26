@@ -54,11 +54,30 @@ class NativeError(GoodnotesError):
                 "Grant write/search access to the temporary directory or set "
                 "GOODNOTES_SCRATCH_DIR to a writable private directory outside the snapshot."
             )
+        elif operation == "map_native_page":
+            remedy = (
+                "The copied page mapping or geometry is unsupported. Inspect this page's "
+                "details, or use a Goodnotes-exported annotated PDF. Refreshing an unchanged "
+                "copy does not add renderer support."
+            )
+        elif operation in {"decode_native_page", "render_native_page"}:
+            remedy = (
+                "The copied page's native records could not be reconstructed safely. Inspect "
+                "the reported coverage, or use a Goodnotes-exported annotated PDF. Refreshing "
+                "an unchanged copy does not add renderer support."
+            )
+        elif operation == "inspect_native_options":
+            remedy = (
+                "The copied native store uses unsupported or invalid engine options. Inspect "
+                "the reported compatibility details; refreshing an unchanged copy does not "
+                "add native format support."
+            )
         else:
             remedy = (
-                "Refresh the copied library with sync. Native records may be unavailable or use "
-                "an unsupported Goodnotes format. Inspect the reported coverage before "
-                "evaluating handwritten notes."
+                "The copied native store could not be read reliably. Inspect the reported "
+                "operation and path. If the copied data is missing or damaged, refresh it "
+                "with sync; otherwise resolve the reported native-store compatibility or "
+                "read failure before evaluating annotations."
             )
         self.details: dict[str, object] = {
             "operation": operation,
@@ -524,7 +543,11 @@ class NativeStoreSession:
             raise
 
     def read_page_records(self, root_uuid: str) -> list[tuple[bytes, bytes]]:
-        """Return one page's bounded raw records from this session's engine."""
+        """Return bounded page records; an empty list means a successful negative lookup.
+
+        Store availability and iterator failures raise instead of returning no records.
+        This observation is limited to the requested namespace in the copied store.
+        """
         if not self._active or self._runtime is None or self._iterator is None:
             raise RuntimeError("NativeStoreSession must be active to read page records.")
         runtime = self._runtime

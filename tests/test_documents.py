@@ -6,8 +6,9 @@ import os
 import sqlite3
 import struct
 import zlib
+from dataclasses import replace
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from uuid import uuid4
 
 import pymupdf as fitz
@@ -787,6 +788,140 @@ def test_native_page_error_has_public_page_context_and_leaves_no_output(
     )
     assert session_counts == {"opened": 1, "closed": 1}
     assert not (sandbox.outputs_dir / output).exists()
+
+
+@pytest.mark.parametrize("operation", ["render", "export"])
+@pytest.mark.parametrize("with_ink", [False, True])
+def test_native_outputs_include_pages_with_successful_empty_lookups(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str, with_ink: bool
+) -> None:
+    from test_annotations import ROOT_ID, native_records
+
+    sandbox = FakeSandbox(tmp_path / "sandbox")
+    _make_pdf(sandbox.attachments_dir / "background.pdf", ["one", "two"], width=144, height=144)
+    # The public page UUID maps to the generated annotation root by adding one.
+    from uuid import UUID
+
+    pages = [
+        replace(
+            _page(
+                str(uuid4()) if number == 1 else str(UUID(int=UUID(ROOT_ID).int - 1)),
+                number,
+                "background.pdf",
+                pdf_page=number,
+            ),
+            width=264,
+            height=264,
+        )
+        for number in (1, 2)
+    ]
+    counts = {"opened": 0, "closed": 0, "reads": 0}
+
+    class FakeSession:
+        def __init__(self, _sandbox: Any) -> None:
+            counts["opened"] += 1
+
+        def __enter__(self) -> FakeSession:
+            return self
+
+        def __exit__(self, *_args: object) -> Literal[False]:
+            counts["closed"] += 1
+            return False
+
+        def read_page_records(self, root: str) -> list[tuple[bytes, bytes]]:
+            counts["reads"] += 1
+            return native_records() if root == ROOT_ID and with_ink else []
+
+    monkeypatch.setattr("goodnotes_cli.native.NativeStoreSession", FakeSession)
+    if operation == "render":
+        results = render_pages(
+            sandbox, pages, [Path("one.png"), Path("two.png")], layer="native", dpi=72
+        )
+        metadata = [cast(dict[str, Any], result["native_annotations"]) for result in results]
+        assert results[0]["annotation_status"] == "native-no-records-observed"
+        with fitz.open(sandbox.attachments_dir / "background.pdf") as background:
+            for index, result in enumerate(results):
+                with fitz.open(result["path"]) as rendered:
+                    matches_background = rendered[0].get_pixmap().samples == (
+                        background[index].get_pixmap().samples
+                    )
+                    assert matches_background is (index == 0 or not with_ink)
+    else:
+        result = export_pdf(sandbox, pages, Path("native.pdf"), layer="native")
+        metadata = cast(list[dict[str, Any]], result["native_annotations"])
+        assert result["annotation_status"] == (
+            "native-reconstructed-approximate" if with_ink else "native-no-records-observed"
+        )
+        with (
+            fitz.open(result["path"]) as exported,
+            fitz.open(sandbox.attachments_dir / "background.pdf") as background,
+        ):
+            assert exported.page_count == 2
+            for index in range(2):
+                matches_background = exported[index].get_pixmap().samples == (
+                    background[index].get_pixmap().samples
+                )
+                assert matches_background is (index == 0 or not with_ink)
+    assert metadata[0]["coverage"] == "no-native-records-observed"
+    assert metadata[0]["full_fidelity_verified"] is False
+    assert metadata[1]["rendered_strokes"] == (1 if with_ink else 0)
+    assert counts == {"opened": 1, "closed": 1, "reads": 2}
+
+
+@pytest.mark.parametrize("failure", ["unsupported", "read"])
+def test_native_export_remains_atomic_after_empty_page_and_real_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    from uuid import UUID
+
+    from test_annotations import ROOT_ID, native_records
+
+    sandbox = FakeSandbox(tmp_path / "sandbox")
+    _make_pdf(sandbox.attachments_dir / "background.pdf", ["one", "two"], width=144, height=144)
+    pages = [
+        replace(
+            _page(
+                str(uuid4()) if number == 1 else str(UUID(int=UUID(ROOT_ID).int - 1)),
+                number,
+                "background.pdf",
+                pdf_page=number,
+            ),
+            width=264,
+            height=264,
+        )
+        for number in (1, 2)
+    ]
+
+    class FakeSession:
+        def __init__(self, _sandbox: Any) -> None:
+            pass
+
+        def __enter__(self) -> FakeSession:
+            return self
+
+        def __exit__(self, *_args: object) -> Literal[False]:
+            return False
+
+        def read_page_records(self, root: str) -> list[tuple[bytes, bytes]]:
+            if root != ROOT_ID:
+                return []
+            if failure == "read":
+                raise NativeError(
+                    "native_data_unavailable",
+                    "Generated read failure.",
+                    operation="read_native_copy",
+                )
+            return native_records(type_code=99)
+
+    monkeypatch.setattr("goodnotes_cli.native.NativeStoreSession", FakeSession)
+    with pytest.raises(NativeError) as result:
+        export_pdf(sandbox, pages, Path("failed.pdf"), layer="native")
+    assert result.value.details["page"] == 2
+    assert result.value.details["operation"] == (
+        "read_native_copy" if failure == "read" else "decode_native_page"
+    )
+    assert not (sandbox.outputs_dir / "failed.pdf").exists()
+    assert not list(sandbox.outputs_dir.iterdir())
 
 
 def test_render_pages_uses_one_native_store_session(

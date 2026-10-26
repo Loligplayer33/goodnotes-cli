@@ -17,7 +17,11 @@ source -> inventory -> independent staging -> validate -> active snapshot
 | Copy | Changed files go to independent inodes. macOS tries APFS clones; otherwise copy bytes. Never hardlink source or snapshot files. Reuse prior verified digests only when metadata matches; SQLite reuse requires the complete original database/sidecar family to match. |
 | Validate | Consolidate copied SQLite sidecars only in unpublished staging. Validate the copied projection and write the marker last. Source and completed-copy fingerprints stay separate. |
 | Retry | Allow at most three capture attempts after detected source changes. If none succeeds, fail and preserve the prior active pointer. |
-| Publish | Compare initial and final inventories. A mismatch may publish the valid copy with `source_changed_during_refresh: true`; the next sync captures again. Matching checks do not promise latest source state at return. |
+| Publish | Compare initial and final inventories. A mismatch may publish the valid copy with `source_changed_during_refresh: true`; the next sync captures again. The flag covers this refresh window only; `false` does not mean no edits occurred since the previous sync. Matching checks do not promise latest source state at return. |
+
+`checked_at` records the latest check. `captured_at` records when the active
+snapshot was created; with `status: unchanged`, the prior snapshot is reused, so
+`captured_at` can be older than `checked_at`.
 
 If a WAL changes while the main database stat signature stays the same, capture may reuse its saved source digest but still copies and checks the current main file. It never reuses the prior consolidated database for a changed SQLite family.
 
@@ -55,7 +59,7 @@ Render reuse checks snapshot, background/native inputs, page, layer, DPI, and re
 | `models`, `errors` | Shared records and expected CLI failures. |
 | `safety`, `snapshot`, `cache` | Path validation, independent capture, active pointers, locks, and pruning. |
 | `library`, `text_index` | Read-only database sessions, page/text mapping, source labels, and batched index queries. `library` owns connections and result mapping. |
-| `documents` | PDF backgrounds, rendering, export, and bundles. Standalone render/export default to background; study bundles default to native. |
+| `documents` | PDF backgrounds, rendering, export, and bundles. Bundle, render, and export default to the native layer; `background` is explicit. |
 | `annotations`, `native`, `native_assets`, `native_render` | Bounded decoders, disposable native-store reads, copied image validation, drawing, and coverage. |
 | `artifacts` | Generated-output retention, deduplication, leases, and cleanup; no database reads or fidelity decisions. |
 | `watch`, `diagnostics` | Metadata polling and access/runtime reporting without permission changes. |
@@ -63,9 +67,18 @@ Render reuse checks snapshot, background/native inputs, page, layer, DPI, and re
 
 ## Native and output limits
 
-Native rendering uses disposable scratch copied from a validated snapshot. Fresh engine options keep writes in scratch; copied `OPTIONS` files are not loaded. Byte-copy fallback is limited to 64 MiB per extraction. A compatible RocksDB runtime is optional; `GOODNOTES_ROCKSDB_LIBRARY` and `GOODNOTES_SCRATCH_DIR` select runtime and scratch paths.
+Library root selection is reader configuration outside immutable snapshots. A managed
+cache can store `library-root.json`; explicit snapshots only use an explicit root
+override. Readers validate this bounded regular file without creating or changing it.
+The selected root filters catalog links and records before graph construction and
+scopes text queries and page-index diagnostics. Template/pattern reference totals
+remain labelled as covering the entire copied catalog. Historical links establish
+scope membership; moved or deleted items may remain diagnostic records without
+becoming reachable notes.
 
-Observed support includes pen/highlighter records, filled paths, one ellipse form, variable-width pencil, one open-line form, and some linked PNG/JPEG images. Pencil texture is approximate. Unknown visibility, geometry, transforms, and records stay unknown or reduce coverage. Missing native data is unavailable, not empty. Generated tests do not prove Goodnotes compatibility or full rendering fidelity.
+Native rendering uses disposable scratch copied from a validated snapshot. Fresh engine options keep writes in scratch; copied `OPTIONS` files are not loaded. Byte-copy fallback is limited to 64 MiB per extraction. The RocksDB runtime is optional for the CLI, but required by the default native image layer; `GOODNOTES_ROCKSDB_LIBRARY` and `GOODNOTES_SCRATCH_DIR` select runtime and scratch paths.
+
+Observed support includes pen/highlighter records, filled paths, one ellipse form, variable-width pencil, one open-line form, and some linked PNG/JPEG images. Pencil texture is approximate. Unknown visibility, geometry, transforms, and records stay unknown or reduce coverage. A successful lookup with no page records reports `native-no-records-observed` / `no-native-records-observed` and warns that absence is unverified. Missing stores, runtime failures, and record-read errors remain errors. Generated tests do not prove Goodnotes compatibility or full rendering fidelity.
 
 Public page numbers are one-based. Keep unknown/unavailable distinct from absent, false, or zero; preserve source labels, warnings, coverage, and annotation status. Annotated-PDF registration checks path, digest, and page count, but not page order or annotation inclusion; it adds no text ingestion.
 

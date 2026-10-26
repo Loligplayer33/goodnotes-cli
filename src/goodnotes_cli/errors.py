@@ -136,6 +136,12 @@ class CacheAccessError(GoodnotesError):
                 f"'goodnotes sync' with {same_cache}. Never replace the lock while readers may be "
                 "active."
             )
+        elif operation == "read_library_selection":
+            remedy = (
+                "Correct library-root.json to contain a root_folder_id string, "
+                "or override it with --library-root ID or --library-root all. "
+                "Keep the snapshot unchanged; another sync does not repair this setting."
+            )
         else:
             remedy = (
                 f"Inspect or restore this cache entry, then run 'goodnotes sync' with "

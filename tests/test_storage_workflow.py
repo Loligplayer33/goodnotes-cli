@@ -101,7 +101,9 @@ def test_render_and_bundle_share_generated_png_storage(
 
     monkeypatch.setattr(documents, "_render_page_with_resources", traced)
     image = successful(
-        invoke_in_process(["render", "doc-hostile"], tmp_path, sandbox=visual_snapshot)
+        invoke_in_process(
+            ["render", "doc-hostile", "--layer", "background"], tmp_path, sandbox=visual_snapshot
+        )
     )
     bundle = _bundle(visual_snapshot, tmp_path)
     bundle_image = Path(bundle["page_evidence"][0]["image"])
@@ -206,7 +208,7 @@ def test_temporary_output_fields_and_optional_output_are_in_schema(
         assert "temporary" in schema["output"]["optional_fields"]
     projected = successful(
         invoke_in_process(
-            ["--fields", "path,temporary", "render", "doc-hostile"],
+            ["--fields", "path,temporary", "render", "doc-hostile", "--layer", "background"],
             tmp_path,
             sandbox=visual_snapshot,
         )

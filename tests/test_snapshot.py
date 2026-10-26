@@ -2,6 +2,7 @@ import errno
 import hashlib
 import json
 import os
+import plistlib
 import sqlite3
 import subprocess
 import sys
@@ -12,7 +13,9 @@ from typing import Any
 
 import pytest
 
+import goodnotes_cli.config as config_module
 import goodnotes_cli.snapshot as snapshot_module
+from goodnotes_cli import build_info
 from goodnotes_cli.errors import GoodnotesError
 from goodnotes_cli.safety import Sandbox, open_database
 from goodnotes_cli.snapshot import create_snapshot
@@ -607,6 +610,11 @@ def test_snapshot_copies_core_files_and_writes_marker_last(tmp_path: Path) -> No
 
     manifest = json.loads((destination / "goodnotes-snapshot.json").read_text(encoding="utf-8"))
     assert manifest["format_version"] == 1
+    assert manifest["producer"] == {
+        "distribution": "goodnotes-local-cli",
+        **build_info(),
+    }
+    assert manifest["source_app"] is None
     file_records = {item["path"]: item for item in manifest["files"]}
     assert "Library/Databases/projection.sqlite" in file_records
     assert (
@@ -615,6 +623,93 @@ def test_snapshot_copies_core_files_and_writes_marker_last(tmp_path: Path) -> No
     )
     assert destination.stat().st_mode & 0o222 == 0
     assert sandbox.projection_path.stat().st_mode & 0o222 == 0
+
+
+def test_snapshot_records_sqlite_library_format_from_the_copied_projection(
+    tmp_path: Path,
+) -> None:
+    source = make_library(tmp_path / "source")
+    with sqlite3.connect(source / "Databases" / "projection.sqlite") as connection:
+        connection.execute("PRAGMA user_version = 17")
+        connection.execute("PRAGMA application_id = 123456")
+
+    first = create_snapshot(source, tmp_path / "first")
+    second = create_snapshot(source, tmp_path / "second", previous_snapshot=first)
+
+    expected = {
+        "sqlite_user_version": 17,
+        "sqlite_application_id": 123456,
+    }
+    assert marker_data(first)["projection_validation"]["library_format"] == expected
+    assert marker_data(second)["projection_validation"]["library_format"] == expected
+
+
+def test_snapshot_records_installed_app_info_only_for_default_library(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = make_library(tmp_path / "default-library")
+    info_path = tmp_path / "Applications" / "Goodnotes.app" / "Contents" / "Info.plist"
+    info_path.parent.mkdir(parents=True)
+    info_path.write_bytes(
+        plistlib.dumps(
+            {
+                "CFBundleIdentifier": "com.goodnotesapp.x",
+                "CFBundleName": "Goodnotes",
+                "CFBundleShortVersionString": "7.1.2",
+                "CFBundleVersion": "7010200",
+            }
+        )
+    )
+    monkeypatch.setattr(config_module, "default_library", lambda: source)
+    monkeypatch.setattr(
+        snapshot_module,
+        "_goodnotes_info_plist_candidates",
+        lambda: (info_path,),
+    )
+
+    snapshot = create_snapshot(source, tmp_path / "snapshot")
+
+    assert marker_data(snapshot)["source_app"] == {
+        "name": "Goodnotes",
+        "bundle_id": "com.goodnotesapp.x",
+        "version": "7.1.2",
+        "build": "7010200",
+        "basis": "installed-app-at-capture",
+    }
+
+
+def test_snapshot_does_not_probe_installed_app_for_an_explicit_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = make_library(tmp_path / "explicit-copy")
+    monkeypatch.setattr(config_module, "default_library", lambda: tmp_path / "other-library")
+    monkeypatch.setattr(
+        snapshot_module,
+        "_read_installed_goodnotes_info",
+        lambda: (_ for _ in ()).throw(AssertionError("app metadata must not be probed")),
+    )
+
+    snapshot = create_snapshot(source, tmp_path / "snapshot")
+
+    assert marker_data(snapshot)["source_app"] is None
+
+
+def test_legacy_snapshot_without_provenance_remains_loadable(tmp_path: Path) -> None:
+    source = make_library(tmp_path / "source")
+    snapshot = create_snapshot(source, tmp_path / "snapshot")
+    marker = snapshot / "goodnotes-snapshot.json"
+    data = marker_data(snapshot)
+    data.pop("producer")
+    data.pop("source_app")
+    data["projection_validation"].pop("library_format")
+    marker.chmod(0o644)
+    marker.write_text(json.dumps(data), encoding="utf-8")
+    marker.chmod(0o444)
+
+    loaded = Sandbox.load(snapshot)
+
+    assert loaded.marker_data.get("producer") is None
+    assert loaded.marker_data.get("source_app") is None
 
 
 def test_real_cow_clone_has_independent_writes(tmp_path: Path) -> None:

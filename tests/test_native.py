@@ -23,6 +23,18 @@ from goodnotes_cli.native import (
 )
 
 
+@pytest.mark.parametrize(
+    "operation",
+    ["map_native_page", "decode_native_page", "render_native_page", "inspect_native_options"],
+)
+def test_unsupported_native_operation_has_targeted_remedy(operation: str) -> None:
+    result = NativeError(
+        "native_data_unavailable", "Generated unsupported data.", operation=operation
+    )
+    assert "does not add" in str(result.details["remedy"])
+    assert "refresh it with sync" not in str(result.details["remedy"])
+
+
 def store(tmp_path: Path) -> Path:
     source = tmp_path / "snapshot" / "Library" / "Databases" / "notes_main.db"
     source.mkdir(parents=True)

@@ -1,84 +1,96 @@
 # Everyday tasks
 
-[Install and sync](../README.md) first. Replace example names, paths, and pages with
-your own. Use exact full paths or IDs when names repeat. See [result conventions](commands.md#results).
+[Install and sync](../README.md) first. Replace the example names, paths, and page
+numbers with your own. Use an exact ID or full path when names repeat. See
+[command results](commands.md#output-and-sources).
 
-## Find and read a page
+## Find and read pages
 
 ```sh
 uv run --locked goodnotes --text ls --folder "Courses" --limit 20
 uv run --locked goodnotes --text pages "Course Notes" --limit 20
-uv run --locked goodnotes --text read "Course Notes" --pages 1-3 --source pdf
+uv run --locked goodnotes --text read "Course Notes" --pages 1-3
 ```
 
-Omit `--folder` to list the root; use `tree --depth 2` to explore nested folders.
-Pages follow current notebook order, which does not establish edit recency.
-For a known notebook/page, go straight to read, render, or bundle.
-`read` defaults to all text sources. Select `pdf`, `handwriting`, or `textbox` as needed.
+Use `ls --kind folder` or `ls --kind notebook` to filter before pagination.
 
-To locate stored handwriting candidates:
+The copied catalog can contain several library roots. To use one library by default,
+find the root ID of a folder you recognize:
 
 ```sh
-uv run --locked goodnotes --fields number,recognition pages "Course Notes" --with-recognition
-uv run --locked goodnotes read "Course Notes" --page 3 --source handwriting
+goodnotes --fields root_folder_id info "Courses"
 ```
 
-Recognition metadata describes the stored index, not visible ink. A cleaned reading
-of raw candidates is an interpretation. See [recognition states](pdf-and-handwriting.md#stored-recognition).
+Save `{"root_folder_id":"ROOT_ID"}` in `library-root.json` in the selected data
+directory. Browsing, resolution, searches, and reads then use that root. This filters
+the graph before resolving names, rather than hiding folders by name. Advanced
+`--library-root ROOT_ID` or `GOODNOTES_LIBRARY_ROOT` overrides the cache selection;
+`--library-root all` restores the combined view. Global options go before the command.
+An explicit `--sandbox` does not inherit another cache's saved selection.
 
-## Inspect a page with an agent
+`read` defaults to `--source text`: indexed PDF text plus typed textboxes, without
+stored handwriting-recognition candidates. Use `--source all` to include all
+sources or `--source handwriting` to read candidates alone. Page numbers follow
+current notebook order, not edit recency. `--pages` accepts a comma-separated
+range or list; public page numbers start at 1.
 
-After [native setup](pdf-and-handwriting.md#native-setup), refresh once and request the needed page:
+`pages` includes recognition counts and index state. Use them to prioritize pages
+for review, not as a test for whether a page has useful visuals. The index may miss
+diagrams, images, or unindexed ink. `doctor` counts and index warnings describe
+the selected local copy; they do not establish data loss. The root catalog shows
+local library membership, not item authorship, import source, or device/cloud provenance.
+Use `doctor --notebook "Course Notes"` to separate that notebook's page-index counts
+from library-wide catalog diagnostics.
+
+## Inspect pages visually
+
+Read a short range for a rough text overview, then bundle only the pages that need
+visual explanation:
 
 ```sh
-uv run --locked goodnotes sync
-uv run --locked goodnotes bundle "Course Notes" --pages 3
+uv run --locked goodnotes read "Course Notes" --pages 1-5
+uv run --locked goodnotes bundle "Course Notes" --pages 3,5
 ```
 
-Use `sync --library /path/to/Library` for an explicit source. Open
-`page_evidence[].image` and read the inline PDF text. Add `--source all` for stored
-recognition and typed text; it changes text selection only. For clean backgrounds
-without the native runtime, use `bundle --layer background`.
-Check warnings and [partial results](agent-guide.md#interpret-the-evidence) before drawing conclusions.
+Bundle defaults to native images and `--source text`. Open each
+`page_evidence[].image` and use the image as evidence when explaining the page.
+Recognition counts can help prioritize review, but do not exclude pages based on
+empty counts. For stored candidates, add `--source all` or choose
+`--source handwriting`; the CLI does not run image OCR. Check coverage and warnings
+before drawing conclusions. See the [agent guide](agent-guide.md) for partial-page
+behavior and snapshot consistency.
 
-## Search notes and PDF backgrounds
+## Search stored text
 
 ```sh
 uv run --locked goodnotes --text search "regression" --notebook "Course Notes"
-uv run --locked goodnotes --text scan-pdfs "regression" --notebook "Course Notes"
+uv run --locked goodnotes --text search "regression" --notebook "Course Notes" --source handwriting
 ```
 
-| Command | Searches |
-| --- | --- |
-| `search` | Literal, case-insensitive substrings in stored index rows. Use `--folder "Courses"` instead for folder scope. |
-| `scan-pdfs` | Text extracted from copied PDF backgrounds, independently of the index. |
+Search defaults to PDF and typed text. Add `--source all` or `--source handwriting`
+to search stored recognition candidates. Search returns bounded snippets; no hits do
+not prove absence. The advanced `scan-pdfs` command checks copied PDF backgrounds
+when the stored index misses slide text. Neither search path runs image OCR or
+searches registered annotated PDFs. Inspect a hit with `bundle --pages PAGE`.
 
-Use the second command when the index misses slide text or is unavailable.
-Neither command runs image OCR or searches registered annotated PDFs. PDF scans
-exclude native handwriting. Search never launches a scan automatically.
-Check coverage and warnings before treating no hits as absence. Use a hit's one-based
-`page` in `bundle --pages PAGE` to inspect it; pages are not listed by latest edit.
+## Save visual evidence
 
-## Export or save page images
+`export` writes a PDF of selected pages or the whole notebook. It defaults to the
+native layer, which includes supported reconstructed ink; use `--layer background`
+for an ink-free background. `bundle --output NEW_DIRECTORY` saves page PNGs and a
+text manifest. `render` is the advanced single-PNG command. Native rendering needs
+the [optional runtime](pdf-and-handwriting.md#native-setup), reports coverage, and
+does not guarantee full fidelity. The advanced annotated-PDF path uses a
+Goodnotes-exported PDF; see [images and handwriting](pdf-and-handwriting.md).
 
-These examples use backgrounds without native ink:
+Page expressions preserve listed order and reject duplicates. Destinations must be
+new; existing files and directories are not overwritten. Render and bundle without
+`--output` use [temporary artifact storage](commands.md#saved-files-and-errors).
 
-```sh
-uv run --locked goodnotes export "Course Notes" --pages 1-3,7 --output /tmp/selected-pages.pdf
-uv run --locked goodnotes render "Course Notes" --page 3 --output /tmp/page-3.png
-uv run --locked goodnotes bundle "Course Notes" --pages 1-3 --layer background --output /tmp/study-pages
-```
-
-Page expressions preserve listed order and reject duplicates. Omit export's
-`--pages` to include the whole notebook. Destinations must be new; nothing is overwritten.
-A bundle saves page PNGs and `text.json`. Render and bundle without `--output`
-use [temporary storage](commands.md#temporary-and-saved-files).
-For handwriting, choose the [native or annotated layer](pdf-and-handwriting.md).
-
-## Set up a restricted agent or refresh continuously
+## Restricted readers and refresh
 
 Run setup with source read and cache write access, then give the reader access to
-the executable and prepared cache through its runner:
+the executable and prepared cache:
 
 ```sh
 uv run --locked goodnotes --data-dir /path/to/cli-cache sync --library /path/to/Library
@@ -86,28 +98,28 @@ uv run --locked goodnotes --data-dir /path/to/cli-cache sync --library /path/to/
 .venv/bin/goodnotes --data-dir /path/to/cli-cache ls
 ```
 
-Use an absolute executable path outside the checkout. Metadata/text readers need
-only cache read access, including the existing lock. Managed visual outputs need
-artifact-cache write access; explicit `--output` can use another writable location.
-Uncached native rendering also needs runtime access and writable scratch; `attach-pdf` needs registration storage write access.
+Metadata and text readers need cache read access, including its existing lock.
+Managed images need artifact-cache write access; explicit outputs can use another
+writable location. Native rendering also needs the runtime and writable scratch.
+
+Keep one snapshot generation across reads that must match. Sync sees files already
+on this Mac; capture time cannot prove an expected iPad edit arrived. See the
+[refresh status semantics](commands.md#pagination-and-refresh-status) when checking
+`source_changed_during_refresh`, `status`, `captured_at`, and `checked_at`.
 
 `--data-dir` overrides `GOODNOTES_DATA_DIR`; the default is
-`$XDG_CACHE_HOME/goodnotes-cli`, or `~/.cache/goodnotes-cli`.
-For a caller-owned copy, use `snapshot LIBRARY NEW_DESTINATION`, then global
-`--sandbox NEW_DESTINATION`. A raw Library folder is not a marked snapshot.
-
-For continuous refresh, run `watch --library /path/to/Library` in a separate terminal
-with the same data directory. It runs in the foreground, stays quiet while unchanged,
-and stops with Ctrl-C. Sync/watch see files on the Mac; they cannot confirm an iPad edit arrived.
-Do not refresh between [reads that must match](commands.md#pagination).
+`$XDG_CACHE_HOME/goodnotes-cli`, or `~/.cache/goodnotes-cli`. The advanced
+`snapshot` command creates a separate marked copy for use with global `--sandbox`.
+The advanced `watch` command refreshes in the foreground while it runs. Neither
+can confirm that an expected iPad edit has reached the Mac.
 
 ## Recover from common failures
 
 | Symptom | Next step |
 | --- | --- |
-| Access failure | Run `doctor --access-only`, optionally with `--library PATH`, `--scratch-dir PATH`, or `--output-dir PATH`. Read `details.path`, `operation`, and `remedy`. Checks create nothing; write checks are hints. |
+| Access failure | Run `doctor --access-only`; read `details.path`, `operation`, and `remedy`. Access checks create nothing; write checks are hints. |
 | Uninitialized cache or missing lock | Stop other CLI processes, then sync the selected cache. Never delete or replace active locks. |
-| Missing handwriting in an image | Check the requested layer and [native requirements](pdf-and-handwriting.md#native-setup). Missing native data is unknown, not proof of a blank page. |
-| Empty or cut-off text | Check source availability, warnings, and `truncated`; request fewer pages or increase `--max-chars`. |
+| Native image or runtime failure | Check the selected layer and [native requirements](pdf-and-handwriting.md#native-setup). Errors stay visible; the CLI does not substitute a background. |
+| Empty or cut-off text | Check source availability, warnings, and `truncated`; request fewer pages or raise `--max-chars`. |
 | Missing temporary image or full artifact cache | Repeat the request, retry after protected entries expire, or save with `--output`. |
-| Annotated PDF fails after refresh or a file edit | Register the matching full PDF again. |
+| Annotated PDF no longer matches its registration | Register the matching full PDF again. |

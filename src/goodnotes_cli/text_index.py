@@ -16,7 +16,21 @@ TEXT_TABLES = {
     "pdf": "pdf_text_content",
 }
 TEXT_LABELS = {"handwriting": "Handwriting", "textbox": "Textbox", "pdf": "PDF"}
+_TEXT_SOURCE_CHOICES = ("all", "text", *TEXT_TABLES)
 _Value = TypeVar("_Value")
+
+
+def selected_text_sources(source: str) -> tuple[str, ...]:
+    """Expand a source selector into the concrete stored-text sources it requests."""
+    normalized = source.casefold() if isinstance(source, str) else ""
+    if normalized == "all":
+        return tuple(TEXT_TABLES)
+    if normalized == "text":
+        return ("pdf", "textbox")
+    if normalized in TEXT_TABLES:
+        return (normalized,)
+    choices = ", ".join(_TEXT_SOURCE_CHOICES)
+    raise GoodnotesError(f"Text source must be one of: {choices}.")
 
 
 def _required_integer(value: Any, field: str) -> int:

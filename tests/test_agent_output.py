@@ -495,24 +495,24 @@ def test_default_bundle_requires_native_data_without_background_fallback(
     assert _tree_manifest(generated_copy) == before
 
 
-def test_default_read_keeps_all_text_sources(generated_copy: Path, tmp_path: Path) -> None:
+def test_default_read_excludes_stored_handwriting(generated_copy: Path, tmp_path: Path) -> None:
     result = successful(
         invoke(["read", "doc-hostile", "--page", "1"], tmp_path, sandbox=generated_copy)
     )
     assert result["document_id"] == "doc-hostile"
     assert {part["source"] for part in result["pages"][0]["parts"]} == {
         "pdf",
-        "handwriting",
         "textbox",
     }
 
 
-@pytest.mark.parametrize("source", ["pdf", "handwriting", "textbox", "all"])
+@pytest.mark.parametrize("source", [None, "text", "pdf", "handwriting", "textbox", "all"])
 def test_bundle_source_filters_text_only_and_retains_selection(
-    source: str,
+    source: str | None,
     generated_copy: Path,
     tmp_path: Path,
 ) -> None:
+    source_args = ["--source", source] if source is not None else []
     result = successful(
         invoke(
             [
@@ -520,12 +520,11 @@ def test_bundle_source_filters_text_only_and_retains_selection(
                 "doc-hostile",
                 "--pages",
                 "1",
-                "--source",
-                source,
+                *source_args,
                 "--layer",
                 "background",
                 "--max-chars",
-                "20",
+                "100",
                 "--output",
                 str(tmp_path / "filtered-bundle"),
             ],
@@ -537,12 +536,15 @@ def test_bundle_source_filters_text_only_and_retains_selection(
     parts = result["page_evidence"][0]["parts"]
     assert parts == manifest["pages"][0]["text"]["parts"]
     assert parts
-    assert sum(len(part["text"]) for part in parts) <= 20
-    assert result["text_source"] == manifest["text_source"] == source
-    if source == "all":
+    assert sum(len(part["text"]) for part in parts) <= 100
+    expected_source = source or "text"
+    assert result["text_source"] == manifest["text_source"] == expected_source
+    if expected_source == "all":
         assert parts[0]["source"] == "handwriting"
+    elif expected_source == "text":
+        assert {part["source"] for part in parts} == {"pdf", "textbox"}
     else:
-        assert all(part["source"] == source for part in parts)
+        assert all(part["source"] == expected_source for part in parts)
     assert result["page_evidence"][0]["annotation_status"] == "not-included"
     assert Path(result["page_evidence"][0]["image"]).is_file()
 
@@ -574,7 +576,7 @@ def test_schema_advertises_concise_defaults_and_verbose_without_a_library(tmp_pa
     assert any(option["flags"] == ["--verbose"] for option in result["global_options"])
     defaults = {option["flags"][0]: option["default"] for option in result["options"]}
     assert defaults["--layer"] == "native"
-    assert defaults["--source"] == "pdf"
+    assert defaults["--source"] == "text"
     assert not (tmp_path / "state").exists()
 
 

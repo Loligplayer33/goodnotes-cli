@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Annotated, Any, NotRequired, TypedDict, cast
 import typer
 from typer.core import TyperGroup
 
-from . import __version__
+from . import __version__, build_info
 from .cache import read_view, refresh_cache
 from .config import Settings, default_data_dir, default_library
 from .errors import (
@@ -88,8 +88,10 @@ app = typer.Typer(
     cls=AgentGroup,
     help=(
         "Browse, read, search, and export a copied Goodnotes library. Compact JSON by default.\n\n"
-        "Put global options before the command. Use COMMAND --help for examples and options, "
-        "or schema COMMAND for machine-readable details. Start with sync to create a read view."
+        "Start with sync, then bundle for visual study or read for a rough text overview. "
+        "Open bundle images before explaining notes, diagrams, or handwriting. "
+        "Put global options before the command. schema lists advanced commands; "
+        "schema COMMAND gives full options and output details."
     ),
     no_args_is_help=True,
     add_completion=False,
@@ -112,7 +114,11 @@ def command(*args: Any, **kwargs: Any) -> Any:
                 cfg = settings(ctx)
                 projection = Projection(
                     command_name,
-                    frozenset(name for name, value in ctx.params.items() if value is True),
+                    frozenset(
+                        name
+                        for name, value in ctx.params.items()
+                        if value is True or (name == "notebook" and value is not None)
+                    ),
                 )
                 cfg.projection = projection
                 validate_projection(cfg.fields, projection)
@@ -131,7 +137,7 @@ def command(*args: Any, **kwargs: Any) -> Any:
 
 def version(value: bool) -> None:
     if value:
-        typer.echo(__version__)
+        typer.echo(f"{__version__} (source {build_info()['source_sha256'][:12]})")
         raise typer.Exit()
 
 
@@ -148,8 +154,18 @@ def configure(
             help="Managed cache directory; use the same selection for sync and reads.",
         ),
     ] = None,
+    library_root: Annotated[
+        str | None,
+        typer.Option(
+            hidden=True,
+            envvar="GOODNOTES_LIBRARY_ROOT",
+            help="Library root ID; all restores the combined view. Overrides cache selection.",
+        ),
+    ] = None,
     text: Annotated[bool, typer.Option("--text", help="Indent JSON for inspection.")] = False,
-    json_output: Annotated[bool, typer.Option("--json", help="Compact JSON, the default.")] = False,
+    json_output: Annotated[
+        bool, typer.Option("--json", hidden=True, help="Compact JSON, the default.")
+    ] = False,
     verbose: Annotated[
         bool,
         typer.Option("--verbose", help="Include full metadata and native format diagnostics."),
@@ -174,6 +190,7 @@ def configure(
         fields,
         expect_snapshot,
         brief=not verbose and fields is None,
+        library_root=library_root,
     )
 
 
@@ -190,7 +207,7 @@ def repository(ctx: typer.Context) -> Generator[Library, None, None]:
             try:
                 from .library import Library
 
-                lib = stack.enter_context(Library(sandbox))
+                lib = stack.enter_context(Library(sandbox, root_folder_id=cfg.load_library_root()))
             except sqlite3.Error as exc:
                 raise CacheAccessError(
                     "cache_invalid",
@@ -247,7 +264,7 @@ def sync(
     )
 
 
-@command()
+@command(hidden=True)
 def watch(
     ctx: typer.Context,
     library: Annotated[Path | None, typer.Option(help="Goodnotes Library directory.")] = None,
@@ -290,7 +307,7 @@ def watch(
         raise SystemExit(1)
 
 
-@command()
+@command(hidden=True)
 def snapshot(
     ctx: typer.Context,
     library: Annotated[Path, typer.Argument(help="Source Library directory.")],
@@ -312,6 +329,9 @@ def snapshot(
 def list_items(
     ctx: typer.Context,
     folder: FolderOption = "/",
+    kind: Annotated[
+        str | None, typer.Option(help="Filter to folder or notebook before paging.")
+    ] = None,
     limit: Annotated[int, typer.Option(min=1, max=1000)] = 100,
     offset: Annotated[int, typer.Option(min=0)] = 0,
 ) -> None:
@@ -322,12 +342,16 @@ def list_items(
 
     Example: goodnotes ls --folder "Course" --limit 20
     """
+    if kind not in {None, "folder", "notebook"}:
+        raise GoodnotesError("--kind must be folder or notebook.")
     with repository(ctx) as lib:
         items = repository_query(ctx, lib, lib.list_items, folder)
+        if kind is not None:
+            items = [item for item in items if item.kind == kind]
         emit(window(items, limit, offset), settings(ctx))
 
 
-@command()
+@command(hidden=True)
 def tree(
     ctx: typer.Context,
     folder: FolderOption = "/",
@@ -368,13 +392,14 @@ def pages(
     offset: Annotated[int, typer.Option(min=0)] = 0,
     with_recognition: Annotated[
         bool,
-        typer.Option(help="Include stored handwriting recognition availability and index state."),
+        typer.Option(hidden=True, help="Recognition metadata is always included."),
     ] = False,
 ) -> None:
     """List pages in current notebook order, numbered from 1.
 
-    Returns pages and next_offset. --with-recognition adds metadata without reading
-    candidate text. annotation_count counts projected note items, not ink or recognition.
+    Returns pages, next_offset, and recognition metadata without candidate text.
+    Recognition can prioritize image inspection; it cannot exclude diagrams or unindexed ink.
+    annotation_count counts projected note items, not ink; null means unavailable.
     Continue with --offset and pin --expect-snapshot for a consistent generation.
 
     Example: goodnotes pages "Course Notes" --limit 20
@@ -382,13 +407,16 @@ def pages(
     with repository(ctx) as lib:
         result = window(repository_query(ctx, lib, lib.pages, notebook), limit, offset)
         result["pages"] = result.pop("items")
-        if with_recognition:
-            recognition = repository_query(ctx, lib, lib.recognition_status, notebook)
-            result["pages"] = [
-                {**serializable(page), "recognition": serializable(recognition[page.id])}
-                for page in result["pages"]
-            ]
-        result["annotation_count_source"] = "projection.notes_items"
+        recognition = repository_query(ctx, lib, lib.recognition_status, notebook)
+        result["pages"] = [
+            {**serializable(page), "recognition": serializable(recognition[page.id])}
+            for page in result["pages"]
+        ]
+        result["annotation_count_source"] = (
+            "projection.notes_items"
+            if any(page["annotation_count"] is not None for page in result["pages"])
+            else None
+        )
         emit(result, settings(ctx))
 
 
@@ -396,23 +424,26 @@ def pages(
 def read_text(
     ctx: typer.Context,
     notebook: ItemSelector,
-    page: Annotated[int | None, typer.Option(min=1)] = None,
+    page: Annotated[int | None, typer.Option(min=1, hidden=True)] = None,
     pages: Annotated[str | None, typer.Option(help="Up to 20 pages, e.g. 1-3,7.")] = None,
-    source: Annotated[str, typer.Option(help="all, pdf, handwriting, or textbox.")] = "all",
+    source: Annotated[
+        str, typer.Option(help="text (PDF + typed text), pdf, textbox, handwriting, or all.")
+    ] = "text",
     max_chars: Annotated[int, typer.Option(min=1, max=1000000)] = 12000,
 ) -> None:
-    """Read page text with PDF, handwriting, and textbox source labels.
+    """Read a rough text overview. Use bundle images for explanation and visual study.
 
-    Defaults to page 1. Choose --page or --pages, up to 20 distinct pages. The
+    Defaults to page 1. Choose --pages, up to 20 distinct pages. The
     character budget covers all selected pages; check truncated in the response.
-    Handwriting is stored recognition output. Native ink and attached PDFs are not decoded.
+    Defaults to PDF and typed text. --source handwriting or all opts into unverified stored
+    recognition candidates. Text cannot establish the contents of diagrams or native ink.
 
     Example: goodnotes read "Course Notes" --pages 1-3,7 --source handwriting
     """
     if page is not None and pages is not None:
         raise GoodnotesError("Use --page or --pages, not both.")
-    if source not in {"all", "pdf", "handwriting", "textbox"}:
-        raise GoodnotesError("--source must be all, pdf, handwriting, or textbox.")
+    if source not in {"text", "all", "pdf", "handwriting", "textbox"}:
+        raise GoodnotesError("--source must be text, all, pdf, handwriting, or textbox.")
     with repository(ctx) as lib:
         all_pages = repository_query(ctx, lib, lib.pages, notebook)
         selected = select_pages(pages or str(page or 1), len(all_pages))
@@ -441,7 +472,9 @@ def search(
     query: Annotated[str, typer.Argument(help="Literal, case-insensitive text to find.")],
     folder: SearchFolderOption = None,
     notebook: SearchNotebookOption = None,
-    source: Annotated[str, typer.Option(help="all, pdf, handwriting, or textbox.")] = "all",
+    source: Annotated[
+        str, typer.Option(help="text (PDF + typed text), pdf, textbox, handwriting, or all.")
+    ] = "text",
     limit: Annotated[int, typer.Option(min=1, max=100)] = 20,
     offset: Annotated[int, typer.Option(min=0)] = 0,
 ) -> None:
@@ -449,6 +482,7 @@ def search(
 
     Choose --notebook for one notebook or --folder for a subtree. coverage_detail
     reports scoped source availability, not proof that every page was indexed.
+    Defaults to PDF and typed text. Use --source all to include stored handwriting candidates.
     No hits do not prove absence; scan-pdfs searches PDF backgrounds separately.
     Snippets are capped at 320 characters.
 
@@ -509,7 +543,7 @@ def search(
         )
 
 
-@command("scan-pdfs")
+@command("scan-pdfs", hidden=True)
 def scan_pdfs(
     ctx: typer.Context,
     query: Annotated[str, typer.Argument(help="Literal, case-insensitive PDF text to find.")],
@@ -555,7 +589,7 @@ def export_notebook(
     ctx: typer.Context,
     notebook: ItemSelector,
     output: Annotated[Path, typer.Option(help="New PDF file to write.")],
-    layer: Annotated[str, typer.Option(help="background, native, or annotated.")] = "background",
+    layer: Annotated[str, typer.Option(help="native, background, or annotated.")] = "native",
     pages: Annotated[
         str | None,
         typer.Option(help="Selected pages in listed order, e.g. 1-3,7. Defaults to all."),
@@ -563,7 +597,8 @@ def export_notebook(
 ) -> None:
     """Export all pages, or selected pages in listed order, to a new PDF.
 
-    The default background layer omits native ink. The annotated layer requires
+    The default native layer reconstructs copied ink and requires the native runtime.
+    Check coverage and warnings. Explicit background output omits native ink. Annotated requires
     attach-pdf and uses an unverified user export. Existing outputs are never replaced.
 
     Example: goodnotes export "Course Notes" --output /tmp/course.pdf
@@ -584,7 +619,7 @@ def export_notebook(
         )
 
 
-@command()
+@command(hidden=True)
 def render(
     ctx: typer.Context,
     notebook: ItemSelector,
@@ -592,12 +627,12 @@ def render(
         Path | None, typer.Option(help="Save a persistent PNG outside the cache.")
     ] = None,
     page: Annotated[int, typer.Option(min=1)] = 1,
-    layer: str = "background",
-    dpi: Annotated[int, typer.Option(min=72, max=300)] = 150,
+    layer: str = "native",
+    dpi: Annotated[int, typer.Option(min=72, max=300, hidden=True)] = 150,
 ) -> None:
     """Render one page to a temporary cached PNG, or save it with --output.
 
-    --layer native reconstructs supported copied ink and reports coverage. Background
+    Defaults to native reconstruction with coverage. Explicit background output
     omits native ink; annotated requires attach-pdf. Page numbers start at 1.
     Cached images expire after a day of inactivity and share a 100 MB limit.
     Returned paths are protected for five minutes. Explicit outputs are never replaced.
@@ -622,7 +657,7 @@ def render(
         emit(result, settings(ctx))
 
 
-@command("attach-pdf")
+@command("attach-pdf", hidden=True)
 def attach_pdf(
     ctx: typer.Context,
     notebook: ItemSelector,
@@ -657,14 +692,18 @@ def bundle(
     ] = None,
     pages: str = "1",
     layer: str = "native",
-    dpi: Annotated[int, typer.Option(min=72, max=300)] = 150,
+    dpi: Annotated[int, typer.Option(min=72, max=300, hidden=True)] = 150,
     max_chars: Annotated[int, typer.Option(min=1, max=1000000)] = 12000,
-    source: Annotated[str, typer.Option(help="pdf, all, handwriting, or textbox text.")] = "pdf",
+    source: Annotated[
+        str, typer.Option(help="text (PDF + typed text), pdf, textbox, handwriting, or all.")
+    ] = "text",
 ) -> None:
     """Inspect pages using a temporary cached bundle, or save it with --output.
 
     Select up to 10 distinct pages with --pages, e.g. 1-3,7. One character budget
-    covers all text. Defaults to native ink images and PDF text. Native reconstruction
+    covers all text. Defaults to native ink images, PDF and typed text. Open each image
+    before explaining notes or diagrams. Recognition metadata is not a filter for visible ink.
+    Native reconstruction
     reports coverage; annotated requires attach-pdf. Text keeps its original source labels.
     --source filters returned text only; the image still uses the selected layer.
     Returns page evidence directly. A bundle with at least one rendered native image keeps
@@ -676,8 +715,8 @@ def bundle(
     Example: goodnotes bundle "Course Notes" --pages 1-3 --output /tmp/course-pages
     """
 
-    if source not in {"all", "pdf", "handwriting", "textbox"}:
-        raise GoodnotesError("--source must be all, pdf, handwriting, or textbox.")
+    if source not in {"text", "all", "pdf", "handwriting", "textbox"}:
+        raise GoodnotesError("--source must be text, all, pdf, handwriting, or textbox.")
     cfg = settings(ctx)
     with repository(ctx) as lib:
         from .documents import render_pages
@@ -973,6 +1012,9 @@ def publish_bundle(temporary: Path, destination: Path) -> None:
 @command()
 def doctor(
     ctx: typer.Context,
+    notebook: Annotated[
+        str | None, typer.Option(help="Scope page/index diagnostics to one notebook.")
+    ] = None,
     access_only: Annotated[
         bool,
         typer.Option(help="Check filesystem access without opening databases or writing files."),
@@ -996,6 +1038,8 @@ def doctor(
     """
     cfg = settings(ctx)
     if access_only:
+        if notebook is not None:
+            raise GoodnotesError("--notebook cannot be combined with --access-only.")
         from .diagnostics import inspect_environment
         from .native import runtime_status
 
@@ -1013,11 +1057,22 @@ def doctor(
         raise GoodnotesError("--library, --scratch-dir, and --output-dir require --access-only.")
     with repository(ctx) as lib:
         cfg = settings(ctx)
-        result = repository_query(ctx, lib, lib.stats)
+        result = repository_query(ctx, lib, lib.stats, notebook=notebook)
         result["storage"] = {
             "cache_dir": cfg.cache_dir,
             "snapshot_path": lib.sandbox.root,
             "captured_at": lib.sandbox.captured_at,
+        }
+        marker = lib.sandbox.marker_data
+        validation = marker.get("projection_validation")
+        result["provenance"] = {
+            "cli": build_info(),
+            "snapshot_format": marker.get("format_version"),
+            "producer": marker.get("producer"),
+            "source_app": marker.get("source_app"),
+            "library_format": (
+                validation.get("library_format") if isinstance(validation, dict) else None
+            ),
         }
         from .native import runtime_status
 
@@ -1050,6 +1105,7 @@ def schema(
             parameters = target.get_params(target_ctx)
             result: dict[str, Any] = {
                 "version": __version__,
+                "build": build_info(),
                 "command": command_name,
                 "usage": target.get_usage(target_ctx).removeprefix("Usage: "),
                 "help": target.help,
@@ -1069,42 +1125,23 @@ def schema(
                 settings(ctx),
             )
         return
+    group = ctx.find_root().command
+    assert isinstance(group, TyperGroup)
     emit(
         {
             "version": __version__,
+            "build": build_info(),
             "format": "compact-json",
             "page_numbers": "one-based",
             "commands": {
-                "sync": "[--library PATH --force]",
-                "watch": "[--library PATH --interval SECONDS --debounce SECONDS --iterations N]",
-                "snapshot": "LIBRARY DESTINATION",
-                "ls": "[--folder FOLDER --limit N --offset N]",
-                "tree": "[--folder FOLDER --depth N --limit N --offset N]",
-                "info": "NOTEBOOK",
-                "pages": "NOTEBOOK [--with-recognition --limit N --offset N]",
-                "read": (
-                    "NOTEBOOK [--page N | --pages 1-3,7] "
-                    "[--source all|pdf|handwriting|textbox] [--max-chars N]"
-                ),
-                "search": (
-                    "QUERY [--folder FOLDER | --notebook NOTEBOOK] "
-                    "[--source SOURCE --limit N --offset N]"
-                ),
-                "scan-pdfs": (
-                    "QUERY [--folder FOLDER | --notebook NOTEBOOK] "
-                    "[--page-limit N --page-offset N --limit N]"
-                ),
-                "export": (
-                    "NOTEBOOK --output FILE [--pages 1-3,7 --layer background|native|annotated]"
-                ),
-                "render": "NOTEBOOK [--output PNG --page N --layer LAYER --dpi N]",
-                "bundle": (
-                    "NOTEBOOK [--output DIR --pages 1-3 --layer LAYER --dpi N "
-                    "--max-chars N --source SOURCE]"
-                ),
-                "attach-pdf": "NOTEBOOK PDF",
-                "doctor": "[--access-only --library PATH --scratch-dir PATH --output-dir PATH]",
-                "schema": "[COMMAND]",
+                name: target.get_short_help_str()
+                for name, target in group.commands.items()
+                if not target.hidden
+            },
+            "advanced_commands": {
+                name: target.get_short_help_str()
+                for name, target in group.commands.items()
+                if target.hidden
             },
             "limits": {
                 "read_pages": 20,
@@ -1119,18 +1156,17 @@ def schema(
                 "Use schema COMMAND for accepted option ranges."
             ),
             "global_options": [
-                "--fields FIELDS",
-                "--verbose",
-                "--data-dir PATH",
-                "--sandbox PATH",
-                "--json",
-                "--text",
-                "--expect-snapshot ID",
-                "--version",
-                "--help",
+                flag
+                for parameter in group.get_params(ctx.find_root())
+                if not getattr(parameter, "hidden", False)
+                for flag in parameter.opts
             ],
             "usage_notes": [
                 "Global options go before the command. schema COMMAND gives targeted details.",
+                "A managed cache can select a default root in library-root.json "
+                "with root_folder_id. --library-root ID or all overrides it; "
+                "info exposes root_folder_id with --fields. Explicit --sandbox reads "
+                "do not inherit the managed cache selection.",
                 "schema COMMAND includes output field hints for row-based responses.",
                 "Notebook selectors accept an exact UUID, full path, or unique exact name.",
                 "Follow next_offset or next_page_offset; pin snapshot with --expect-snapshot.",
@@ -1139,14 +1175,21 @@ def schema(
                 "--text indents JSON; --fields selects row fields or top-level keys.",
                 "Output keeps essential evidence by default; --verbose includes full metadata.",
                 "--fields selects from full rows or responses, overriding concise defaults.",
-                "bundle returns page evidence with native images and PDF text by default.",
+                "For explanation or learning, use bundle and open its images, including diagrams.",
+                "read is a rough text overview; read/search/bundle exclude handwriting candidates "
+                "unless --source handwriting or all is requested.",
+                "pages includes recognition counts, not candidate text. Use these to prioritize "
+                "inspection, never to exclude pages with diagrams or unindexed ink.",
+                "Advanced commands remain available with COMMAND --help or schema COMMAND.",
                 "Source files are read-only; some commands write local copies or exports.",
             ],
             "annotations": (
                 "--layer native reconstructs supported copied pen/highlighter records with "
                 "coverage diagnostics. It requires a compatible RocksDB runtime and writable "
                 "scratch storage. Full visual fidelity is unverified. --layer annotated uses "
-                "a PDF registered with attach-pdf."
+                "a PDF registered with attach-pdf. A successful native query with no matching "
+                "records renders the background with no-native-records-observed coverage; "
+                "absence of annotations in Goodnotes remains unverified."
             ),
             "exit_codes": {
                 "0": "success",
@@ -1174,6 +1217,8 @@ def parameter_contract(parameter: Any) -> dict[str, Any]:
         value = getattr(parameter, key, None)
         if value is not None:
             result[key] = value
+    if getattr(parameter, "hidden", False):
+        result["advanced"] = True
     for key in ("min", "max"):
         value = getattr(parameter.type, key, None)
         if value is not None:

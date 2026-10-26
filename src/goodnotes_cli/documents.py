@@ -26,7 +26,7 @@ if TYPE_CHECKING:
     from .artifacts import ArtifactCache
     from .native import NativeError
 
-_RENDER_CACHE_VERSION = 4
+_RENDER_CACHE_VERSION = 5
 
 
 class SandboxProtocol(Protocol):
@@ -246,7 +246,14 @@ def export_pdf(
             includes_handwriting = any(
                 bool(entry.get("rendered_strokes")) for entry in native_annotations
             )
-            annotation_status = "native-reconstructed-approximate"
+            annotation_status = (
+                "native-no-records-observed"
+                if all(
+                    entry.get("annotation_status") == "native-no-records-observed"
+                    for entry in native_annotations
+                )
+                else "native-reconstructed-approximate"
+            )
             warnings = list(
                 dict.fromkeys(
                     warning for entry in native_annotations for warning in _native_warnings(entry)
@@ -633,7 +640,9 @@ def _render_page_with_resources(
             render_doc.close()
         if native_annotations is not None:
             includes_handwriting = bool(native_annotations.get("rendered_strokes"))
-            annotation_status = "native-reconstructed-approximate"
+            annotation_status = str(
+                native_annotations.get("annotation_status", "native-reconstructed-approximate")
+            )
             source = "copied-native-records-and-background"
             warnings = _native_warnings(native_annotations)
         else:
