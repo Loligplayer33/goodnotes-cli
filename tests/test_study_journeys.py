@@ -130,6 +130,7 @@ class StudyCLI:
         *,
         layer: str = "native",
         output: Path | None = None,
+        verbose: bool = False,
     ) -> dict[str, Any]:
         arguments = [
             "bundle",
@@ -141,6 +142,8 @@ class StudyCLI:
             "--layer",
             layer,
         ]
+        if verbose:
+            arguments.insert(0, "--verbose")
         if output is not None:
             arguments.extend(["--output", str(output)])
         return self.call(
@@ -1037,10 +1040,17 @@ def test_study_unsupported_native_variants_keep_partial_mixed_page_output(
     _NATIVE_REJECTIONS,
 )
 @pytest.mark.parametrize("output_mode", ["artifact-cache", "persistent"])
+@pytest.mark.parametrize(
+    ("pages", "failed_index"),
+    [([3, 1, 2], 0), ([1, 3, 2], 1)],
+    ids=["failed-first", "failed-middle"],
+)
 def test_study_unsupported_only_native_variants_fail_with_page_context_and_cleanup(
     variant: str,
     reason: str,
     output_mode: str,
+    pages: list[int],
+    failed_index: int,
     generated_source: tuple[Path, GeneratedNativeStore],
     study_cli: StudyCLI,
 ) -> None:
@@ -1056,41 +1066,140 @@ def test_study_unsupported_only_native_variants_fail_with_page_context_and_clean
     if output_mode == "persistent":
         persistent_parent.mkdir()
 
-    for label, pages in (("single", [3]), ("second-selected", [1, 3])):
-        output = persistent_parent / f"{label}-{variant}" if output_mode == "persistent" else None
-        arguments = [
-            "bundle",
-            NOTEBOOK,
-            "--pages",
-            ",".join(map(str, pages)),
-            "--dpi",
-            "72",
-            "--layer",
-            "native",
-        ]
-        if output is not None:
-            arguments.extend(["--output", str(output)])
-        failed = cli.call(
-            arguments,
-            snapshot=snapshot,
-            error="native_data_unavailable",
-            pages=pages,
-        )
-        details = failed["error"]["details"]
-        assert details["page"] == 3
-        native = details["native_annotations"]
-        assert native["coverage"] == "partial"
-        assert native["full_fidelity_verified"] is False
-        assert native["native_objects"] == 1
-        assert native["rendered_objects"] == 0
-        assert native["unsupported_objects"] == 1
-        assert native["unsupported_reasons"] == {reason: 1}
+    failed_output = (
+        persistent_parent / f"all-failed-{variant}" if output_mode == "persistent" else None
+    )
+    failed_arguments = ["bundle", NOTEBOOK, "--pages", "3", "--dpi", "72", "--layer", "native"]
+    if failed_output is not None:
+        failed_arguments.extend(["--output", str(failed_output)])
+    failed = cli.call(
+        failed_arguments,
+        snapshot=snapshot,
+        error="native_data_unavailable",
+        pages=[3],
+    )
+    details = failed["error"]["details"]
+    assert details["page"] == 3
+    native = details["native_annotations"]
+    assert native["coverage"] == "partial"
+    assert native["full_fidelity_verified"] is False
+    assert native["native_objects"] == 1
+    assert native["rendered_objects"] == 0
+    assert native["unsupported_objects"] == 1
+    assert native["unsupported_reasons"] == {reason: 1}
 
-        if output_mode == "artifact-cache":
-            _assert_no_cached_artifacts(cli)
+    if output_mode == "artifact-cache":
+        _assert_no_cached_artifacts(cli)
+        output = None
+    else:
+        assert failed_output is not None and not failed_output.exists()
+        assert not list(persistent_parent.iterdir())
+        output = persistent_parent / f"partial-{variant}-{pages[0]}"
+
+    partial = cli.bundle(pages, snapshot, output=output)
+    assert partial["status"] == "partial"
+    assert partial["pages"] == pages
+    assert partial["failed_pages"] == [3]
+    assert partial["layer"] == "native"
+    assert partial["text_source"] == "pdf"
+    expected_warning = (
+        "Native rendering failed for page 3; source-labelled text evidence remains available, "
+        "but no image was produced."
+    )
+    assert expected_warning in partial["warnings"]
+    evidence = partial["page_evidence"]
+    assert [row["page"] for row in evidence] == pages
+    failed_row = evidence[failed_index]
+    assert failed_row["page"] == 3
+    assert failed_row["image"] is None
+    assert failed_row["render_error"]["code"] == "native_data_unavailable"
+    assert failed_row["render_error"]["message"]
+    assert failed_row["render_error"]["details"]["page"] == 3
+    failed_native = failed_row["render_error"]["details"]["native_annotations"]
+    assert failed_native["unsupported_reasons"] == {reason: 1}
+    assert failed_row["parts"]
+    assert all(part["source"] == "pdf" for part in failed_row["parts"])
+    assert failed_row["warnings"]
+    assert (
+        "Native image rendering failed for page 3; no image is available." in failed_row["warnings"]
+    )
+    assert "render" not in failed_row
+    assert (
+        not {
+            "image_source",
+            "annotation_status",
+            "includes_handwriting",
+            "native_annotations",
+        }
+        & failed_row.keys()
+    )
+
+    successful_rows = [row for index, row in enumerate(evidence) if index != failed_index]
+    assert [row["page"] for row in successful_rows] == [page for page in pages if page != 3]
+    for row in successful_rows:
+        assert row["image"]
+        assert row["parts"]
+        assert row["warnings"]
+        assert row["annotation_status"] == "native-reconstructed-approximate"
+        assert row["native_annotations"]["unsupported_objects"] == 0
+        assert Path(row["image"]).is_file()
+        if row["page"] == 1:
+            assert _pixel(row, 60, 30) == (255, 0, 0)
         else:
-            assert output is not None and not output.exists()
-            assert not list(persistent_parent.iterdir())
+            assert _pixel(row, 60, 90) == (0, 0, 255)
+
+    if output_mode == "artifact-cache":
+        first_images = {row["page"]: row["image"] for row in successful_rows}
+        replay = cli.bundle(pages, snapshot)
+        assert replay["failed_pages"] == [3]
+        replay_failed = replay["page_evidence"][failed_index]
+        assert replay_failed["image"] is None
+        assert replay_failed["render_error"] == failed_row["render_error"]
+        assert {
+            row["page"]: row["image"]
+            for index, row in enumerate(replay["page_evidence"])
+            if index != failed_index
+        } == first_images
+        verbose = cli.bundle(pages, snapshot, verbose=True)
+    else:
+        assert output is not None and output.is_dir()
+        manifest = json.loads((output / "text.json").read_text())
+        assert manifest["status"] == "partial"
+        assert manifest["failed_pages"] == [3]
+        assert expected_warning in manifest["warnings"]
+        assert [row["page"] for row in manifest["pages"]] == pages
+        manifest_failed = manifest["pages"][failed_index]
+        assert manifest_failed["image"] is None
+        assert manifest_failed["render_error"] == failed_row["render_error"]
+        assert manifest_failed["text"]["parts"] == failed_row["parts"]
+        assert (
+            "Native image rendering failed for page 3; no image is available."
+            in manifest_failed["warnings"]
+        )
+        assert "render" not in manifest_failed
+        assert sorted(path.name for path in output.glob("page-*.png")) == [
+            f"page-{page:04d}.png" for page in sorted(set(pages) - {3})
+        ]
+        assert not list(output.parent.glob(".goodnotes-bundle-*"))
+        verbose = cli.bundle(pages, snapshot, verbose=True)
+
+    assert verbose["status"] == "partial"
+    assert verbose["failed_pages"] == [3]
+    assert [row["page"] for row in verbose["page_evidence"]] == pages
+    verbose_failed = verbose["page_evidence"][failed_index]
+    assert verbose_failed["image"] is None
+    assert verbose_failed["render_error"] == failed_row["render_error"]
+    assert verbose_failed["text"]["parts"] == failed_row["parts"]
+    for row in successful_rows:
+        verbose_row = verbose["page_evidence"][pages.index(row["page"])]
+        assert verbose_row["image"]
+        assert verbose_row["render"]["native_annotations"]["unsupported_objects"] == 0
+        assert verbose_row["text"]["parts"] == row["parts"]
+
+    healthy = cli.bundle([2], snapshot)
+    assert healthy["pages"] == [2]
+    assert healthy["page_evidence"][0]["image"]
+    assert _pixel(healthy["page_evidence"][0], 60, 90) == (0, 0, 255)
 
     _assert_preserved(cli, source, captured, before)
 

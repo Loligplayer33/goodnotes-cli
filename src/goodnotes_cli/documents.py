@@ -24,6 +24,7 @@ from .safety import _require_not_production, open_database, resolve_confined_fil
 
 if TYPE_CHECKING:
     from .artifacts import ArtifactCache
+    from .native import NativeError
 
 _RENDER_CACHE_VERSION = 4
 
@@ -330,12 +331,15 @@ def render_pages(
     *,
     layer: str = "background",
     dpi: int = 150,
+    allow_partial_native_errors: bool = False,
 ) -> list[dict[str, object]]:
     """Render pages in one operation, sharing bounded source and native resources.
 
     Results preserve the input order and use the same shape as :func:`render_page`. The
     registered PDF is verified once per notebook, and one disposable native-store session is
-    used for every page when ``layer="native"``.
+    used for every page when ``layer="native"``. With
+    ``allow_partial_native_errors=True``, classified native page failures are returned as
+    ``render_error`` rows when at least one page succeeds; all-page failure raises the first error.
     """
     _check_layer(layer)
     _check_dpi(dpi)
@@ -351,10 +355,22 @@ def render_pages(
     if layer == "native":
         with _native_record_reader(sandbox) as record_reader:
             return _render_pages_with_resources(
-                sandbox, pages, output_paths, layer=layer, dpi=dpi, record_reader=record_reader
+                sandbox,
+                pages,
+                output_paths,
+                layer=layer,
+                dpi=dpi,
+                record_reader=record_reader,
+                allow_partial_native_errors=allow_partial_native_errors,
             )
     return _render_pages_with_resources(
-        sandbox, pages, output_paths, layer=layer, dpi=dpi, record_reader=None
+        sandbox,
+        pages,
+        output_paths,
+        layer=layer,
+        dpi=dpi,
+        record_reader=None,
+        allow_partial_native_errors=allow_partial_native_errors,
     )
 
 
@@ -365,15 +381,18 @@ def cached_render_pages(
     *,
     layer: str = "background",
     dpi: int = 150,
+    allow_partial_native_errors: bool = False,
 ) -> list[dict[str, object]]:
     """Reuse verified page renders without opening a native engine on cache hits.
 
     Keys belong to one immutable read view and include the current input metadata.
     PNG publication also deduplicates identical images across views. Registered PDFs
-    retain their full integrity check once per operation, even on an artifact hit.
+    retain their full integrity check once per operation, even on an artifact hit. When
+    ``allow_partial_native_errors=True``, failed page renders are retried on the next call and
+    are never published as page-image cache entries.
     """
     from .artifacts import artifact_key
-    from .native import native_store_fingerprint
+    from .native import NativeError, native_store_fingerprint
     from .native_assets import native_attachment_fingerprint
     from .output import serializable
 
@@ -387,6 +406,7 @@ def cached_render_pages(
     signatures: dict[Path, tuple[int, int, int, int, int, int]] = {}
     registered: dict[str, _RegisteredPdf] = {}
     rendered: list[dict[str, object]] = []
+    first_page_error: NativeError | None = None
 
     def check_inputs() -> None:
         for path, expected in signatures.items():
@@ -456,23 +476,40 @@ def cached_render_pages(
                 else:
                     if layer == "native" and record_reader is None:
                         record_reader = resources.enter_context(_native_record_reader(sandbox))
-                    stage = resources.enter_context(cache.staging())
-                    result = _render_page_with_resources(
-                        sandbox,
-                        page,
-                        sandbox.ensure_output(stage / "page.png"),
-                        layer=layer,
-                        dpi=dpi,
-                        pdf_cache=pdf_cache,
-                        registered=registered,
-                        record_reader=record_reader,
-                    )
+                    stage_resources = ExitStack()
+                    try:
+                        stage = stage_resources.enter_context(cache.staging())
+                        result = _render_page_with_resources(
+                            sandbox,
+                            page,
+                            sandbox.ensure_output(stage / "page.png"),
+                            layer=layer,
+                            dpi=dpi,
+                            pdf_cache=pdf_cache,
+                            registered=registered,
+                            record_reader=record_reader,
+                        )
+                    except NativeError as exc:
+                        stage_resources.close()
+                        if not allow_partial_native_errors or not _is_page_local_native_error(exc):
+                            raise
+                        first_page_error = first_page_error or exc
+                        rendered.append(_native_render_error(page, exc))
+                        continue
+                    except BaseException:
+                        stage_resources.close()
+                        raise
+                    resources.callback(stage_resources.close)
                     result["path"] = str(cache.destination(key) / "page.png")
                     pending.append((len(rendered), key, stage, result))
                 result["captured_at"] = getattr(sandbox, "captured_at", None)
                 result["temporary"] = True
                 rendered.append(result)
             check_inputs()
+            if first_page_error is not None and not any(
+                "render_error" not in result for result in rendered
+            ):
+                raise first_page_error
             for index, key, stage, result in pending:
                 cache.publish(key, stage, result)
                 rendered[index] = result
@@ -490,14 +527,18 @@ def _render_pages_with_resources(
     layer: str,
     dpi: int,
     record_reader: Callable[[str], list[tuple[bytes, bytes]]] | None,
+    allow_partial_native_errors: bool = False,
 ) -> list[dict[str, object]]:
+    from .native import NativeError
+
     rendered: list[dict[str, object]] = []
     registered: dict[str, _RegisteredPdf] = {}
+    first_page_error: NativeError | None = None
     with _PdfDocumentCache() as pdf_cache:
         try:
             for page, output_path in zip(pages, output_paths, strict=True):
-                rendered.append(
-                    _render_page_with_resources(
+                try:
+                    result = _render_page_with_resources(
                         sandbox,
                         page,
                         output_path,
@@ -507,12 +548,44 @@ def _render_pages_with_resources(
                         registered=registered,
                         record_reader=record_reader,
                     )
-                )
+                except NativeError as exc:
+                    if not allow_partial_native_errors or not _is_page_local_native_error(exc):
+                        raise
+                    first_page_error = first_page_error or exc
+                    rendered.append(_native_render_error(page, exc))
+                    continue
+                rendered.append(result)
             for registered_pdf in registered.values():
                 registered_pdf.ensure_unchanged()
+            if first_page_error is not None and not any(
+                "render_error" not in result for result in rendered
+            ):
+                raise first_page_error
         finally:
             _close_registered_pdfs(registered)
     return rendered
+
+
+def _is_page_local_native_error(exc: NativeError) -> bool:
+    # read_native_page is used for missing records; engine and copy-integrity failures use other
+    # operations and must abort the whole bundle.
+    return exc.code == "native_data_unavailable" and exc.details.get("operation") in {
+        "decode_native_page",
+        "render_native_page",
+        "map_native_page",
+        "read_native_page",
+    }
+
+
+def _native_render_error(page: Page, exc: NativeError) -> dict[str, object]:
+    return {
+        "page": page.number,
+        "render_error": {
+            "code": exc.code,
+            "message": str(exc),
+            "details": dict(exc.details),
+        },
+    }
 
 
 def _render_page_with_resources(

@@ -139,7 +139,7 @@ _PROJECTIONS: dict[str, _ProjectionSpec] = {
             "truncated",
             "snapshot",
         ),
-        optional_fields=("captured_at", "temporary"),
+        optional_fields=("captured_at", "temporary", "status", "failed_pages", "warnings"),
     ),
     "doctor": _ProjectionSpec(
         (
@@ -221,6 +221,16 @@ def output_contract(command_name: str) -> dict[str, Any] | None:
             result["optional_fields"] = {
                 field: "May be absent from a successful response." for field in spec.optional_fields
             }
+            if command_name == "bundle":
+                result["optional_fields"].update(
+                    {
+                        "status": (
+                            "Present as 'partial' when some images succeed and others fail."
+                        ),
+                        "failed_pages": "One-based pages without an image in a partial bundle.",
+                        "warnings": "Explains why page images are missing in a partial bundle.",
+                    }
+                )
         result.setdefault("optional_fields", {}).update(
             {
                 field: f"Requires --{option.replace('_', '-')}"
@@ -323,6 +333,7 @@ def _describe_default(contract: dict[str, Any], command_name: str) -> None:
                 "parts",
                 "truncated",
                 "warnings",
+                "render_error",
             ],
             "native_annotations": {
                 "fields": [
@@ -335,7 +346,12 @@ def _describe_default(contract: dict[str, Any], command_name: str) -> None:
                     "Moved to the response when all pages share it; otherwise kept per page."
                 )
             },
-            "image": "Absolute path to the published PNG.",
+            "image": (
+                "Absolute path to the published PNG, or null for failed pages in a partial bundle."
+            ),
+            "render_error": (
+                "Structured native rendering error for failed pages in a partial bundle."
+            ),
             "parts": "Unchanged source-labelled text parts.",
             "warnings": "All distinct render, native, and text warnings retained once per page.",
         }
@@ -444,26 +460,33 @@ def _brief_render(value: dict[str, Any]) -> dict[str, Any]:
 
 
 def _brief_evidence(entry: dict[str, Any]) -> dict[str, Any]:
-    render = entry["render"]
+    render = entry.get("render")
     text = entry["text"]
     result = {
         "page": entry["page"],
         **_pick(text, ("document_id", "page_id", "parts", "truncated")),
         "image": entry["image"],
-        **{
-            ("image_source" if key == "source" else key): value
-            for key, value in _pick(
-                render, ("source", "annotation_status", "includes_handwriting")
-            ).items()
-        },
     }
-    native = render.get("native_annotations")
+    if isinstance(render, dict):
+        result.update(
+            {
+                ("image_source" if key == "source" else key): value
+                for key, value in _pick(
+                    render, ("source", "annotation_status", "includes_handwriting")
+                ).items()
+            }
+        )
+    render_error = entry.get("render_error")
+    if isinstance(render_error, dict):
+        result["render_error"] = render_error
+    native = render.get("native_annotations") if isinstance(render, dict) else None
     if isinstance(native, dict):
         result["native_annotations"] = _pick(
             native, (field for field in _BRIEF_NATIVE_FIELDS if field not in {"page", "page_id"})
         )
     result["warnings"] = _warnings(
-        render.get("warnings"),
+        entry.get("warnings"),
+        render.get("warnings") if isinstance(render, dict) else None,
         native.get("warnings") if isinstance(native, dict) else None,
         text.get("warnings"),
     )

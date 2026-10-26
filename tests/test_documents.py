@@ -855,6 +855,181 @@ def test_render_pages_uses_one_native_store_session(
     assert session_counts == {"opened": 1, "closed": 1, "reads": 2}
 
 
+def test_bundle_render_recovers_page_local_native_error_and_preserves_shared_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from goodnotes_cli.annotations import NativeOverlay
+
+    sandbox = FakeSandbox(tmp_path / "sandbox")
+    sandbox.add_notebook("notebook-1", 2)
+    _make_pdf(sandbox.attachments_dir / "background.pdf", ["one", "two"])
+    pages = [
+        Page(
+            id=str(uuid4()),
+            document_id="notebook-1",
+            number=number,
+            position=f"{number:02}",
+            attachment_path="attachments/background.pdf",
+            pdf_page=number,
+            width=612,
+            height=792,
+        )
+        for number in (1, 2)
+    ]
+    session_counts = {"opened": 0, "closed": 0, "reads": 0}
+    page_error = NativeError(
+        "native_data_unavailable",
+        "The copied page has native records, but none could be rendered by the supported renderer.",
+        operation="decode_native_page",
+    )
+
+    class FakeSession:
+        def __init__(self, _sandbox: Any) -> None:
+            session_counts["opened"] += 1
+
+        def __enter__(self) -> FakeSession:
+            return self
+
+        def __exit__(self, *_args: object) -> Literal[False]:
+            session_counts["closed"] += 1
+            return False
+
+        def read_page_records(self, _root_uuid: str) -> list[tuple[bytes, bytes]]:
+            session_counts["reads"] += 1
+            return []
+
+    def render_overlay(
+        _sandbox: Any,
+        page: Page,
+        *,
+        width_points: float,
+        height_points: float,
+        record_reader: Any,
+    ) -> NativeOverlay:
+        assert width_points == 612 and height_points == 792
+        record_reader("page-root")
+        if page.number == 1:
+            raise page_error
+        return NativeOverlay(b"", {"rendered_strokes": 0, "warnings": []})
+
+    monkeypatch.setattr("goodnotes_cli.native.NativeStoreSession", FakeSession)
+    monkeypatch.setattr("goodnotes_cli.annotations.render_native_overlay", render_overlay)
+    results = render_pages(
+        sandbox,
+        pages,
+        [Path("native-one.png"), Path("native-two.png")],
+        layer="native",
+        dpi=72,
+        allow_partial_native_errors=True,
+    )
+
+    assert [result["page"] for result in results] == [1, 2]
+    assert results[0]["render_error"] == {
+        "code": "native_data_unavailable",
+        "message": str(page_error),
+        "details": {
+            "operation": "decode_native_page",
+            "path": "",
+            "remedy": page_error.details["remedy"],
+            "page": 1,
+        },
+    }
+    assert "path" not in results[0]
+    assert results[1]["source"] == "copied-native-records-and-background"
+    assert Path(str(results[1]["path"])).is_file()
+    assert not (sandbox.outputs_dir / "native-one.png").exists()
+    assert session_counts == {"opened": 1, "closed": 1, "reads": 2}
+
+
+@pytest.mark.parametrize(
+    ("page_count", "second_operation", "expected_page"),
+    [(1, None, 1), (2, "decode_native_page", 1), (2, "read_native_copy", 2)],
+)
+def test_bundle_render_rethrows_all_failed_or_global_native_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    page_count: int,
+    second_operation: str | None,
+    expected_page: int,
+) -> None:
+    from goodnotes_cli.annotations import NativeOverlay
+
+    sandbox = FakeSandbox(tmp_path / f"sandbox-{page_count}-{second_operation}")
+    sandbox.add_notebook("notebook-1", page_count)
+    _make_pdf(
+        sandbox.attachments_dir / "background.pdf", [str(number) for number in range(page_count)]
+    )
+    pages = [
+        Page(
+            id=str(uuid4()),
+            document_id="notebook-1",
+            number=number,
+            position=f"{number:02}",
+            attachment_path="attachments/background.pdf",
+            pdf_page=number,
+            width=612,
+            height=792,
+        )
+        for number in range(1, page_count + 1)
+    ]
+    errors: list[NativeError] = []
+    session_counts = {"opened": 0, "closed": 0}
+
+    class FakeSession:
+        def __init__(self, _sandbox: Any) -> None:
+            session_counts["opened"] += 1
+
+        def __enter__(self) -> FakeSession:
+            return self
+
+        def __exit__(self, *_args: object) -> Literal[False]:
+            session_counts["closed"] += 1
+            return False
+
+        def read_page_records(self, _root_uuid: str) -> list[tuple[bytes, bytes]]:
+            return []
+
+    def render_overlay(
+        _sandbox: Any,
+        page: Page,
+        *,
+        width_points: float,
+        height_points: float,
+        record_reader: Any,
+    ) -> NativeOverlay:
+        operation = (
+            second_operation
+            if page.number == 2 and second_operation is not None
+            else "decode_native_page"
+        )
+        error = NativeError(
+            "native_data_unavailable",
+            f"Synthetic failure on page {page.number}.",
+            operation=operation,
+        )
+        errors.append(error)
+        raise error
+
+    monkeypatch.setattr("goodnotes_cli.native.NativeStoreSession", FakeSession)
+    monkeypatch.setattr("goodnotes_cli.annotations.render_native_overlay", render_overlay)
+    destinations = [Path(f"native-{number}.png") for number in range(1, page_count + 1)]
+    with pytest.raises(NativeError) as captured:
+        render_pages(
+            sandbox,
+            pages,
+            destinations,
+            layer="native",
+            dpi=72,
+            allow_partial_native_errors=True,
+        )
+
+    expected_error = errors[expected_page - 1]
+    assert captured.value is expected_error
+    assert captured.value.details["page"] == expected_page
+    assert session_counts == {"opened": 1, "closed": 1}
+    assert not any((sandbox.outputs_dir / path).exists() for path in destinations)
+
+
 def test_render_pages_closes_native_session_and_backgrounds_after_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

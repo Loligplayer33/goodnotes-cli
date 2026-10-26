@@ -32,6 +32,7 @@ Notable changes to the project are recorded here. Versions follow Semantic Versi
 
 - Missing native handwriting and drawing forms now decode with bounded geometry validation. Renderer upgrades and changed copied image attachments invalidate cached page renders.
 - Added the observed two-point open-line shape with bounded line translation, exact direct image-resource binding, and an explicit count and warning for image records that omit body field 6. Generated installed-CLI journeys now compare supported schema combinations against independent per-object references and reject stale renderer-cache entries.
+- Multi-page native bundles can now retain successful page images and all selected pages' text when a page-local native render fails; failed rows carry structured errors and no image, while single-page and all-page failures remain errors.
 - Filesystem overlap checks recognize case and directory-identity aliases. Cleanup does not follow symlinks or change their targets' permissions.
 - Source edits during the final freshness scan preserve a validated view and trigger another refresh; watch coalesces transient inventory changes.
 - Genuine hot rollback journals recover only on independent staging copies. Fallback SQLite output leaves WAL mode before publication.

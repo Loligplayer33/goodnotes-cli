@@ -167,11 +167,14 @@ renderer-version cache entry contains a background-only image, so the current
 renderer must regenerate it before the installed CLI can pass.
 
 Mixed-page and unsupported-only journeys keep genuinely unknown geometry and
-object types fail-closed. They check that supported marks remain visible beside
-an unknown record, and that a failing selected second page reports its public
-one-based page number without publishing partial managed or persistent output.
-The suite also verifies that selection and cache/output modes do not change the
-supported-schema expectations.
+object types fail-closed. A multi-page request with a recoverable page-local
+native error keeps successful images and source-labelled text, preserves the
+requested order, marks the failed row with `image: null` and `render_error`, and
+reports `status: "partial"` plus `failed_pages`. The generated journey covers a
+failed page first and in the middle, managed and persistent outputs, healthy
+requests after failure, and the single-page all-failed path, which still returns
+a structured error without publishing a bundle. The CLI does not replace a
+failed image with the page background.
 
 Generated reference pages are drawn independently of the production decoder and
 renderer. The comparator checks dimensions, the whole page, and declared regions

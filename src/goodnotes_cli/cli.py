@@ -11,7 +11,7 @@ from collections.abc import Generator
 from contextlib import ExitStack, contextmanager
 from functools import wraps
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any, TypedDict, cast
+from typing import TYPE_CHECKING, Annotated, Any, NotRequired, TypedDict, cast
 
 import typer
 from typer.core import TyperGroup
@@ -77,9 +77,11 @@ class AgentGroup(TyperGroup):
 
 class _BundlePage(TypedDict):
     page: int
-    image: str
-    render: dict[str, Any]
+    image: str | None
     text: dict[str, Any]
+    render: NotRequired[dict[str, Any]]
+    render_error: NotRequired[dict[str, Any]]
+    warnings: NotRequired[list[str]]
 
 
 app = typer.Typer(
@@ -665,7 +667,9 @@ def bundle(
     covers all text. Defaults to native ink images and PDF text. Native reconstruction
     reports coverage; annotated requires attach-pdf. Text keeps its original source labels.
     --source filters returned text only; the image still uses the selected layer.
-    Returns page evidence directly. Global --verbose includes full metadata.
+    Returns page evidence directly. A bundle with at least one rendered native image keeps
+    text for failed pages and reports their render errors; a bundle with no rendered images
+    remains an error. Global --verbose includes full metadata.
     Cached outputs share a 100 MB limit and expire after a day of inactivity.
     Returned paths are protected for five minutes; explicit outputs remain until removed.
 
@@ -716,12 +720,16 @@ def bundle(
                 [temporary / filename for filename in filenames],
                 layer=layer,
                 dpi=dpi,
+                allow_partial_native_errors=layer == "native",
             )
             manifest, truncated = _bundle_content(
                 ctx, lib, notebook, selected, rendered_pages, max_chars, source
             )
             for entry in manifest:
-                entry["render"]["path"] = str(destination / entry["image"])
+                render = entry.get("render")
+                image = entry.get("image")
+                if isinstance(render, dict) and isinstance(image, str):
+                    render["path"] = str(destination / image)
             _write_bundle_manifest(temporary, manifest, truncated, cfg, sandbox.captured_at, source)
             publish_bundle(temporary, destination)
         except BaseException as exc:
@@ -770,14 +778,28 @@ def _bundle_content(
         )
         text = serializable(page_data)
         remaining -= sum(len(part["text"]) for part in text["parts"])
-        manifest.append(
-            {
-                "page": number,
-                "image": f"page-{number:04d}.png",
-                "render": dict(rendered),
-                "text": text,
-            }
-        )
+        render_error = rendered.get("render_error")
+        if isinstance(render_error, dict):
+            manifest.append(
+                {
+                    "page": number,
+                    "image": None,
+                    "render_error": dict(render_error),
+                    "warnings": [
+                        f"Native image rendering failed for page {number}; no image is available."
+                    ],
+                    "text": text,
+                }
+            )
+        else:
+            manifest.append(
+                {
+                    "page": number,
+                    "image": f"page-{number:04d}.png",
+                    "render": dict(rendered),
+                    "text": text,
+                }
+            )
     return manifest, bound_page_text([entry["text"] for entry in manifest], max_chars)
 
 
@@ -796,6 +818,17 @@ def _write_bundle_manifest(
         "truncated": truncated,
         "text_source": source,
     }
+    failed_pages = [
+        entry["page"] for entry in manifest if isinstance(entry.get("render_error"), dict)
+    ]
+    if failed_pages:
+        content.update(
+            {
+                "status": "partial",
+                "failed_pages": failed_pages,
+                "warnings": [_bundle_partial_warning(failed_pages)],
+            }
+        )
     (temporary / "text.json").write_text(json.dumps(content, ensure_ascii=False))
 
 
@@ -807,18 +840,55 @@ def _bundle_response(
     truncated: bool,
     source: str,
 ) -> dict[str, Any]:
-    return {
+    response = {
         "directory": str(destination),
         "manifest": str(destination / "text.json"),
         "pages": selected,
         "layer": layer,
         "truncated": truncated,
-        "captured_at": next(iter(manifest))["render"].get("captured_at"),
+        "captured_at": next(
+            (
+                entry["render"].get("captured_at")
+                for entry in manifest
+                if isinstance(entry.get("render"), dict)
+            ),
+            None,
+        ),
         "text_source": source,
         "page_evidence": [
-            {**entry, "image": str(destination / entry["image"])} for entry in manifest
+            {
+                **entry,
+                "image": (
+                    str(destination / cast(str, entry["image"]))
+                    if isinstance(entry.get("image"), str)
+                    else None
+                ),
+            }
+            for entry in manifest
         ],
     }
+    failed_pages = [
+        entry["page"] for entry in manifest if isinstance(entry.get("render_error"), dict)
+    ]
+    if failed_pages:
+        response.update(
+            {
+                "status": "partial",
+                "failed_pages": failed_pages,
+                "warnings": [_bundle_partial_warning(failed_pages)],
+            }
+        )
+    return response
+
+
+def _bundle_partial_warning(failed_pages: list[int]) -> str:
+    pages = ", ".join(str(page) for page in failed_pages)
+    page_label = "page" if len(failed_pages) == 1 else "pages"
+    image_notice = "no image was produced" if len(failed_pages) == 1 else "no images were produced"
+    return (
+        f"Native rendering failed for {page_label} {pages}; source-labelled text evidence "
+        f"remains available, but {image_notice}."
+    )
 
 
 def _cached_bundle(
@@ -838,7 +908,12 @@ def _cached_bundle(
 
     cfg = settings(ctx)
     rendered = cached_render_pages(
-        lib.sandbox, [all_pages[number - 1] for number in selected], cache, layer=layer, dpi=dpi
+        lib.sandbox,
+        [all_pages[number - 1] for number in selected],
+        cache,
+        layer=layer,
+        dpi=dpi,
+        allow_partial_native_errors=layer == "native",
     )
     # Text always comes from this request's pinned read view, including on image hits.
     manifest, truncated = _bundle_content(ctx, lib, notebook, selected, rendered, max_chars, source)
@@ -853,14 +928,20 @@ def _cached_bundle(
     )
     destination = cache.destination(key)
     for entry in manifest:
-        entry["render"]["path"] = str(destination / entry["image"])
+        render = entry.get("render")
+        image = entry.get("image")
+        if isinstance(render, dict) and isinstance(image, str):
+            render["path"] = str(destination / image)
     response = _bundle_response(destination, manifest, selected, layer, truncated, source)
     response["temporary"] = True
     if cache.lookup(key) is not None:
         return response
     with cache.staging() as temporary:
         for entry, image in zip(manifest, rendered, strict=True):
-            os.link(Path(str(image["path"])), temporary / entry["image"], follow_symlinks=False)
+            image_name = entry.get("image")
+            image_path = image.get("path")
+            if isinstance(image_name, str) and isinstance(image_path, str):
+                os.link(Path(image_path), temporary / image_name, follow_symlinks=False)
         _write_bundle_manifest(temporary, manifest, truncated, cfg, lib.sandbox.captured_at, source)
         cache.publish(key, temporary, {"kind": "bundle"})
     return response

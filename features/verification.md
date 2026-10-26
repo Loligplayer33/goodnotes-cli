@@ -37,7 +37,9 @@ region. The omitted-image-field case preserves its count and warning through
 render, export, cached bundle reuse, and persistent bundle manifests. A stale
 renderer-version cache seeded with a background-only image must be rejected.
 Separate controls retain partial output beside unknown records and fail
-unsupported-only pages with page context and clean output state.
+single-page all-failed requests with page context and clean output state. Mixed
+multi-page requests cover failed-first and failed-middle ordering in both output
+modes, preserving successful images and text while marking failed images null.
 
 ### Independent rendering references
 
