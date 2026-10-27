@@ -10,10 +10,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .errors import CacheAccessError, GoodnotesError, _permission_denied
-from .safety import Sandbox
+from .storage.sandbox import Sandbox
 
 if TYPE_CHECKING:
-    from .output import Projection
+    from .presentation.contracts import Projection
 
 
 def default_data_dir() -> Path:
@@ -44,6 +44,7 @@ class Settings:
         if selected is None and self.sandbox is None and self.cache_dir is not None:
             path = self.cache_dir / "library-root.json"
             try:
+                before = path.lstat()
                 descriptor = os.open(
                     path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
                 )
@@ -60,9 +61,30 @@ class Settings:
             try:
                 with os.fdopen(descriptor, "rb") as stream:
                     info = os.fstat(stream.fileno())
-                    if not stat.S_ISREG(info.st_mode) or info.st_size > 4096:
+                    if (
+                        not stat.S_ISREG(before.st_mode)
+                        or not stat.S_ISREG(info.st_mode)
+                        or (before.st_dev, before.st_ino) != (info.st_dev, info.st_ino)
+                        or info.st_size > 4096
+                    ):
                         raise ValueError("Invalid selection file.")
                     raw = stream.read(4097)
+                    after = path.lstat()
+                    final = os.fstat(stream.fileno())
+
+                    def identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
+                        return (
+                            value.st_dev,
+                            value.st_ino,
+                            value.st_size,
+                            value.st_mtime_ns,
+                            value.st_ctime_ns,
+                        )
+
+                    if identity(before) != identity(info) or any(
+                        identity(value) != identity(info) for value in (after, final)
+                    ):
+                        raise ValueError("Selection file changed while reading.")
                     if len(raw) > 4096:
                         raise ValueError("Selection file is too large.")
                     data = json.loads(raw)
@@ -100,15 +122,12 @@ class Settings:
 
         # Use the cache's canonical pointer checks so direct settings loads and
         # locked read-view loads apply the same generation and path rules.
-        from .cache import _read_pointer
+        from .storage.cache.state import PointerEntryError, _read_pointer
 
         try:
             resolved = _read_pointer(state, state / "snapshots")
         except (GoodnotesError, OSError) as exc:
-            message = str(exc).casefold()
-            pointer_entry_error = "active library pointer" in message and "snapshot" not in message
-            pointer_read_denied = _permission_denied(exc) and "active library pointer" in message
-            if self.cache_dir is not None and not (pointer_entry_error or pointer_read_denied):
+            if self.cache_dir is not None and not isinstance(exc, PointerEntryError):
                 # `read_view` owns the shared lock and adds its established
                 # operation/path context around pointer and snapshot failures.
                 raise

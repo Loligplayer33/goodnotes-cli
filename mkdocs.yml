@@ -19,6 +19,7 @@ nav:
   - Development:
       - Contributing: contributing.md
       - Architecture: architecture.md
+      - Refactor acceptance: architecture-refactor.md
       - Failure behavior: robustness.md
       - Verification: verification.md
       - Releases: releases.md

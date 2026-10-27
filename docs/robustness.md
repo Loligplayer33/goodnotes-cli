@@ -15,9 +15,9 @@ The app does not participate in locks. A changing source can exhaust retries. Te
 
 | Tests | Scenarios |
 | --- | --- |
-| [test_cache.py](../tests/test_cache.py), [test_cli.py](../tests/test_cli.py) | Inventory reuse, force refresh, changed-source reporting, pointer preservation, locks, and concurrency. |
-| [test_snapshot.py](../tests/test_snapshot.py) | Independent copies, clone fallback, SQLite WAL consolidation, and source changes. |
-| [test_watch.py](../tests/test_watch.py) | Burst coalescing, transient failures, recovery, backoff, and interruption. |
+| [test_cache.py](../tests/storage/test_cache.py), [test_cli.py](../tests/interface/test_cli.py) | Inventory reuse, force refresh, changed-source reporting, pointer preservation, locks, and concurrency. |
+| [test_snapshot.py](../tests/storage/test_snapshot.py) | Independent copies, clone fallback, SQLite WAL consolidation, and source changes. |
+| [test_watch.py](../tests/storage/test_watch.py) | Burst coalescing, transient failures, recovery, backoff, and interruption. |
 
 ## Native reconstruction
 
@@ -27,9 +27,9 @@ Unknown visibility, geometry, transforms, versions, and records remain unknown o
 
 | Tests | Coverage |
 | --- | --- |
-| [test_annotations.py](../tests/test_annotations.py), [test_decoders.py](../tests/test_decoders.py) | Observed schemas, malformed input, and bounded decoding. |
-| [test_native.py](../tests/test_native.py), [test_native_assets.py](../tests/test_native_assets.py), [test_native_rendering.py](../tests/test_native_rendering.py) | Scratch safety, copied image bindings, raster validation, and drawing. |
-| [test_native_workflow.py](../tests/test_native_workflow.py) | Generated RocksDB updates, read-only behavior, watch, rendering, retention, pruning, and SIGINT. Requires optional engine; macOS CI makes it mandatory. |
+| [test_annotations.py](../tests/native/test_annotations.py), [test_decoders.py](../tests/native/test_decoders.py) | Observed schemas, malformed input, and bounded decoding. |
+| [test_native.py](../tests/native/test_native.py), [test_native_assets.py](../tests/native/test_native_assets.py), [test_native_rendering.py](../tests/rendering/test_native_rendering.py) | Scratch safety, copied image bindings, raster validation, and drawing. |
+| [test_native_workflow.py](../tests/journeys/test_native_workflow.py) | Generated RocksDB updates, read-only behavior, watch, rendering, retention, pruning, and SIGINT. Requires optional engine; macOS CI makes it mandatory. |
 
 ## Readers and output boundaries
 
@@ -44,6 +44,6 @@ Unknown visibility, geometry, transforms, versions, and records remain unknown o
 | Full PDF export error | All-or-nothing. Any selected-page failure prevents publication of a partial PDF and keeps the page context in the error. |
 | Output destination | Must be outside snapshot and production Library paths. Existing paths are never overwritten; bundle manifest publishes last. |
 
-Filesystem containment uses identity checks for aliases. Cleanup checks parent directories and unlinks symlinks without changing targets. See [test_safety.py](../tests/test_safety.py), [test_library.py](../tests/test_library.py), [test_documents.py](../tests/test_documents.py), and [test_agent_output.py](../tests/test_agent_output.py).
+Filesystem containment uses identity checks for aliases. Cleanup checks parent directories and unlinks symlinks without changing targets. See [test_safety.py](../tests/storage/test_safety.py), [test_library.py](../tests/reader/test_library.py), [test_documents.py](../tests/rendering/test_documents.py), and [test_agent_output.py](../tests/interface/test_agent_output.py).
 
-For cache bounds and leases, see [Architecture](architecture.md#artifact-cache) and [test_artifacts.py](../tests/test_artifacts.py), [test_storage_workflow.py](../tests/test_storage_workflow.py).
+For cache bounds and leases, see [Architecture](architecture.md#artifact-cache) and [test_artifacts.py](../tests/storage/test_artifacts.py), [test_storage_workflow.py](../tests/journeys/test_storage_workflow.py).

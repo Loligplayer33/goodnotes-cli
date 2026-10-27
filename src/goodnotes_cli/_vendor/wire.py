@@ -116,7 +116,7 @@ def decode_message(data: bytes) -> Message:
         key, pos = _read_varint(data, pos)
         number, wire_number = key >> 3, key & 7
         if number == 0 or number >= (1 << 29):
-            raise DecodeError("field number 0 is invalid")
+            raise DecodeError(f"protobuf field number {number} is outside the valid range")
         try:
             wire_type = WireType(wire_number)
         except ValueError as error:

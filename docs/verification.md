@@ -9,9 +9,14 @@
 | Copied private reference corpus | Add `--private-corpus /outside/repository/manifest.json` |
 | Receipt location | Add `--report PATH`; default is `.local/verification/report.json`. |
 
-The runner requires `tests/test_study_journeys.py` and `tests/test_verification_reference.py` to pass with zero skips. Generated fixtures do not read a private Library. A required skip, including unavailable native support, is `blocked` and makes the command fail.
+The runner requires `tests/journeys/test_study_journeys.py` and `tests/verification/test_verification_reference.py` to pass with zero skips. Generated fixtures do not read a private Library. A required skip, including unavailable native support, is `blocked` and makes the command fail.
 
 This focused runner does not replace full tests, Ruff, or `ty` ([Contributing](../CONTRIBUTING.md)). CI runs generated journeys from source and an installed macOS wheel; its separate `goodnotes schema` smoke check is not a substitute. CI uses generated PDFs only.
+
+The test-only architecture comparator records timed-out cases as incomplete, including captured
+stdout/stderr decoded with UTF-8 replacement for invalid bytes. Matching timeouts cannot establish
+equivalence. Its exit status reports capture completion; inspect `comparison_state`,
+`incomplete_cases`, and completed-case differences before making a behavior-preservation claim.
 
 ## Receipt status and provenance
 
@@ -24,7 +29,8 @@ This focused runner does not replace full tests, Ruff, or `ty` ([Contributing](.
 
 The receipt records the source commit, dirty state, content fingerprint, target, environment, selected checks, executed checks, and journey metrics. The runner compares source contents and Git status before and after the run. Report the commit and fingerprint with any claim about what passed.
 
-With `--cli`, the runner invokes an absolute executable outside the checkout and removes `PYTHONPATH`. It resolves the console script's interpreter and verifies that the imported package is outside the checkout and matches the current source package. The receipt records version and package fingerprints, not local executable or import paths.
+With `--cli`, the runner invokes an absolute executable outside the checkout and isolates inherited Goodnotes configuration, Python and pytest settings. It preserves an explicitly selected
+`GOODNOTES_ROCKSDB_LIBRARY` and applies the requested verification target controls. It resolves the console script's interpreter and verifies that the imported package is outside the checkout and matches the current source package. The receipt records version and package fingerprints, not local executable or import paths.
 
 ## Installed build and snapshot provenance
 
@@ -73,7 +79,7 @@ dependency synchronization and does not install or verify dependencies.
 
 It also rejects a destination inside or below an ancestor containing `goodnotes-snapshot.json` or a `Databases` directory. This prevents writing into a snapshot or Library. The default receipt is allowed only when repository `.local/` is not a symlink and resolves inside the checkout.
 
-An existing destination is replaced only if it is a receipt with schema `goodnotes-verification/v1`. Unrelated files remain untouched. Report-path protections are covered by [`tests/test_verification_runner.py`](../tests/test_verification_runner.py).
+An existing destination is replaced only if it is a receipt with schema `goodnotes-verification/v1`. Unrelated files remain untouched. Report-path protections are covered by [`tests/verification/test_verification_runner.py`](../tests/verification/test_verification_runner.py).
 
 ## Private manifest and comparison rules
 
@@ -118,7 +124,7 @@ The corpus fingerprint covers the manifest, reference PDFs, and snapshot-marker 
 
 ## What the evidence establishes
 
-Generated journeys test selected-page retrieval across edits, page movement/deletion, stale snapshots, artifact expiry, and unavailable native evidence. The schema matrix compares observed object layouts with independent references; omission controls must fail their region. See [study journeys](../tests/test_study_journeys.py) and [reference checks](../tests/test_verification_reference.py).
+Generated journeys test selected-page retrieval across edits, page movement/deletion, stale snapshots, artifact expiry, and unavailable native evidence. The schema matrix compares observed object layouts with independent references; omission controls must fail their region. See [study journeys](../tests/journeys/test_study_journeys.py) and [reference checks](../tests/verification/test_verification_reference.py).
 
 Generated references test geometry against independent drawings. They do not establish universal Goodnotes compatibility, full native fidelity, general study-answer accuracy, or fresh iPad/TCC acceptance. iPad/TCC remains manual and `unverified`.
 
