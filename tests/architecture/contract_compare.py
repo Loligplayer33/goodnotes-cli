@@ -8,7 +8,10 @@ Run from the checkout whose project environment is already prepared:
       --candidate . --output /private/tmp/architecture-contracts
 
 Each side runs in subprocesses with only that tree's ``src`` on PYTHONPATH. The
-fixture is generated locally and contains no Goodnotes Library data.
+fixture is generated locally and contains no Goodnotes Library data. Before any
+capture, the frozen baseline package is checked against the expected Git commit.
+The process exit status reports capture completion; semantic differences are
+written to ``diff.json`` for review and do not make capture itself fail.
 """
 
 from __future__ import annotations
@@ -28,6 +31,9 @@ from typing import Any
 
 import pymupdf
 
+BASELINE_REVISION = "0dc897713694326f9b00ef200cc77c2aeb601870"
+PACKAGE_SOURCE = "src/goodnotes_cli"
+
 TIMESTAMP_KEYS = {
     "captured_at",
     "checked_at",
@@ -40,6 +46,105 @@ SOURCE_FINGERPRINT_KEYS = {"source_sha256", "source_fingerprint", "source_hash"}
 TIMESTAMP = re.compile(r"^\d{4}-\d\d-\d\d[T ]\d\d:\d\d:\d\d")
 VERSION_SOURCE = re.compile(r"\(source [0-9a-f]{12}\)")
 SNAPSHOT_PATH = re.compile(r"snapshots/\d{8}T\d{6}Z-[0-9a-f]+")
+
+
+def _git_output(repo_root: Path, *arguments: str) -> bytes:
+    try:
+        result = subprocess.run(
+            ["git", *arguments],
+            cwd=repo_root,
+            capture_output=True,
+            check=False,
+        )
+    except OSError as exc:
+        raise ValueError(f"Cannot run Git in candidate repository {repo_root}: {exc}") from exc
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", "replace").strip()
+        raise ValueError(f"Git command failed in {repo_root}: {' '.join(arguments)}: {detail}")
+    return result.stdout
+
+
+def _verify_baseline_package(
+    baseline_root: Path,
+    candidate_root: Path,
+    expected_revision: str = BASELINE_REVISION,
+) -> dict[str, Any]:
+    """Require the baseline's Python package files to match the expected Git tree."""
+    baseline_root = baseline_root.resolve()
+    candidate_root = candidate_root.resolve()
+    if not baseline_root.is_dir():
+        raise ValueError(f"Frozen baseline directory does not exist: {baseline_root}")
+    if not (candidate_root / ".git").exists():
+        raise ValueError(f"Candidate is not a Git checkout: {candidate_root}")
+
+    revision = (
+        _git_output(candidate_root, "rev-parse", "--verify", f"{expected_revision}^{{commit}}")
+        .decode("ascii", "strict")
+        .strip()
+    )
+    if revision != expected_revision:
+        raise ValueError(
+            f"Expected baseline revision {expected_revision}, but Git resolved {revision}."
+        )
+
+    tree = _git_output(
+        candidate_root,
+        "ls-tree",
+        "-r",
+        "--name-only",
+        "-z",
+        revision,
+        "--",
+        PACKAGE_SOURCE,
+    )
+    expected_paths = sorted(
+        entry.decode("utf-8", "strict") for entry in tree.split(b"\0") if entry.endswith(b".py")
+    )
+    if not expected_paths:
+        raise ValueError(
+            f"Git revision {revision} contains no Python files under {PACKAGE_SOURCE}."
+        )
+
+    package_root = baseline_root / PACKAGE_SOURCE
+    if not package_root.is_dir():
+        raise ValueError(f"Frozen baseline is missing package source directory: {package_root}")
+    actual_files = sorted(
+        path.relative_to(baseline_root).as_posix()
+        for path in package_root.rglob("*.py")
+        if "__pycache__" not in path.parts and path.suffix == ".py"
+    )
+    if actual_files != expected_paths:
+        missing = sorted(set(expected_paths) - set(actual_files))
+        unexpected = sorted(set(actual_files) - set(expected_paths))
+        raise ValueError(
+            "Frozen baseline Python package pathset does not match Git revision "
+            f"{revision}; missing={missing}, unexpected={unexpected}."
+        )
+
+    digest = hashlib.sha256()
+    for relative_path in expected_paths:
+        baseline_file = baseline_root / relative_path
+        if baseline_file.is_symlink() or not baseline_file.is_file():
+            raise ValueError(f"Frozen baseline package file is not a regular file: {relative_path}")
+        expected_bytes = _git_output(
+            candidate_root, "cat-file", "blob", f"{revision}:{relative_path}"
+        )
+        actual_bytes = baseline_file.read_bytes()
+        if actual_bytes != expected_bytes:
+            raise ValueError(
+                f"Frozen baseline package content differs from Git at {relative_path}."
+            )
+        digest.update(relative_path.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(actual_bytes)
+        digest.update(b"\0")
+
+    return {
+        "revision": revision,
+        "package_path": PACKAGE_SOURCE,
+        "package_python_file_count": len(expected_paths),
+        "package_python_sha256": digest.hexdigest(),
+    }
 
 
 def _create_fixture(root: Path) -> tuple[Path, Path, Path]:
@@ -393,6 +498,7 @@ def _run_side(
     source: Path,
     base_sandbox: Path,
     source_pdf: Path,
+    baseline_provenance: dict[str, Any],
 ) -> dict[str, Any]:
     root = root.resolve()
     run_root = output / "runs" / capture_id / label
@@ -736,10 +842,8 @@ def _run_side(
             record(f"error/{name}", arguments)
 
     return {
-        "root": str(root),
-        "baseline_revision": "0dc897713694326f9b00ef200cc77c2aeb601870"
-        if label == "baseline"
-        else None,
+        "root_label": label,
+        "verified_baseline": baseline_provenance,
         "commands": command_names,
         "records": records,
     }
@@ -754,9 +858,17 @@ def main() -> int:
         "--capture",
         choices=("baseline", "candidate", "both"),
         default="both",
-        help="Capture one side now, or both sides and compare them.",
+        help=(
+            "Capture one side now, or both sides and compare them. Exit status reports capture "
+            "completion; semantic differences are written for review."
+        ),
     )
     args = parser.parse_args()
+    try:
+        baseline_provenance = _verify_baseline_package(args.baseline, args.candidate)
+    except ValueError as exc:
+        parser.error(f"baseline provenance verification failed: {exc}")
+
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     capture_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
@@ -777,19 +889,32 @@ def main() -> int:
             source,
             base_sandbox,
             source_pdf,
+            baseline_provenance,
         )
-        (output / f"{label}.json").write_text(
+        receipt_path = (
+            output / f"{label}.json"
+            if args.capture == "both"
+            else output / f"{label}-{capture_id}.json"
+        )
+        receipt_path.write_text(
             json.dumps(results[label], ensure_ascii=False, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
-    baseline_path = output / "baseline.json"
-    candidate_path = output / "candidate.json"
-    if "baseline" not in results and baseline_path.exists():
-        results["baseline"] = json.loads(baseline_path.read_text(encoding="utf-8"))
-    if "candidate" not in results and candidate_path.exists():
-        results["candidate"] = json.loads(candidate_path.read_text(encoding="utf-8"))
-    if "baseline" not in results or "candidate" not in results:
-        print(json.dumps({"captured": list(labels), "comparison": "pending_other_side"}))
+    if args.capture != "both":
+        summary = {
+            "capture_complete": True,
+            "captured": list(labels),
+            "comparison_state": "not_compared",
+            "exit_status_policy": "capture-completion-only",
+            "verified_baseline": baseline_provenance,
+            "receipt": str(receipt_path),
+        }
+        summary_path = output / f"capture-{capture_id}.json"
+        summary_path.write_text(
+            json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        print(json.dumps(summary, sort_keys=True))
         return 0
     baseline_records = results["baseline"]["records"]
     candidate_records = results["candidate"]["records"]
@@ -806,7 +931,10 @@ def main() -> int:
         if baseline_records.get(key) != candidate_records.get(key)
     ]
     summary = {
-        "baseline_revision": "0dc897713694326f9b00ef200cc77c2aeb601870",
+        "capture_complete": True,
+        "comparison_state": "equivalent" if not differences else "differences_require_review",
+        "exit_status_policy": "capture-completion-only",
+        "verified_baseline": baseline_provenance,
         "baseline_command_count": len(results["baseline"]["commands"]),
         "candidate_command_count": len(results["candidate"]["commands"]),
         "baseline_case_count": len(baseline_records),
@@ -820,8 +948,7 @@ def main() -> int:
     )
     print(
         json.dumps(
-            {key: value for key, value in summary.items() if key != "differences"},
-            sort_keys=True,
+            {key: value for key, value in summary.items() if key != "differences"}, sort_keys=True
         )
     )
     return 0

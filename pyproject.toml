@@ -31,15 +31,7 @@ docs = [
 packages = ["src/goodnotes_cli"]
 
 [tool.pytest.ini_options]
-testpaths = [
-    "tests/reader",
-    "tests/storage",
-    "tests/native",
-    "tests/rendering",
-    "tests/interface",
-    "tests/journeys",
-    "tests/verification",
-]
+testpaths = ["tests"]
 pythonpath = ["."]
 
 [tool.ruff]

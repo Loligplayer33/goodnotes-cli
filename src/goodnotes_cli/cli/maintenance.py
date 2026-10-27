@@ -7,12 +7,12 @@ from typing import Annotated
 
 import typer
 
-from ..cache import refresh_cache
 from ..config import default_data_dir, default_library
 from ..errors import (
     GoodnotesError,
 )
 from ..presentation.json import emit
+from ..storage.cache import refresh_cache
 from ..storage.capture.lifecycle import create_snapshot
 from ..watch import watch_library
 from .core import command, settings

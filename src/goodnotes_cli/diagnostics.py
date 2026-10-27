@@ -8,7 +8,6 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from .cache import read_view
 from .config import Settings
 from .errors import (
     CacheAccessError,
@@ -16,6 +15,7 @@ from .errors import (
     GoodnotesError,
     _permission_denied,
 )
+from .storage.cache import read_view
 from .storage.paths import trusted_macos_alias
 
 

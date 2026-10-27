@@ -20,9 +20,9 @@ from ..presentation.json import emit
 from ..presentation.selection import select_pages
 
 if TYPE_CHECKING:
-    from ..artifacts import ArtifactCache
     from ..library import Library
     from ..models import Page
+    from ..storage.artifacts import ArtifactCache
 
 from .core import ItemSelector, command, repository, repository_query, settings
 
@@ -48,7 +48,7 @@ def export_notebook(
     """
 
     with repository(ctx) as lib:
-        from ..documents import export_pdf
+        from ..rendering import export_pdf
 
         all_pages = repository_query(ctx, lib, lib.pages, notebook)
         selected = (
@@ -84,12 +84,12 @@ def render(
     """
 
     with repository(ctx) as lib:
-        from ..documents import cached_render_pages, render_page
+        from ..rendering import cached_render_pages, render_page
 
         all_pages = repository_query(ctx, lib, lib.pages, notebook)
         number = select_pages(str(page), len(all_pages))[0]
         if output is None:
-            from ..artifacts import ArtifactCache
+            from ..storage.artifacts import ArtifactCache
 
             with ArtifactCache(_artifact_directory(settings(ctx)), lib.sandbox.root) as cache:
                 result = cached_render_pages(
@@ -116,7 +116,7 @@ def attach_pdf(
     """
 
     with repository(ctx) as lib:
-        from ..documents import register_annotated_pdf
+        from ..rendering import register_annotated_pdf
 
         item = repository_query(ctx, lib, lib.resolve, notebook, kind="notebook")
         page_count = len(repository_query(ctx, lib, lib.pages, notebook))
@@ -165,7 +165,7 @@ def bundle(
         raise GoodnotesError("--source must be text, all, pdf, handwriting, or textbox.")
     cfg = settings(ctx)
     with repository(ctx) as lib:
-        from ..documents import render_pages
+        from ..rendering import render_pages
 
         sandbox = lib.sandbox
         item = repository_query(ctx, lib, lib.resolve, notebook, kind="notebook")
@@ -174,7 +174,7 @@ def bundle(
         if not item.id or any(all_pages[number - 1].document_id != item.id for number in selected):
             raise GoodnotesError("Bundle pages have missing or inconsistent document identity.")
         if output is None:
-            from ..artifacts import ArtifactCache
+            from ..storage.artifacts import ArtifactCache
 
             try:
                 with ArtifactCache(_artifact_directory(cfg), sandbox.root) as cache:
@@ -274,14 +274,14 @@ def _cached_bundle(
     max_chars: int,
     source: str,
 ) -> dict[str, Any]:
-    from ..artifacts import artifact_key
-    from ..documents import cached_render_pages
+    from ..rendering import cached_render_pages
     from ..rendering.bundle import (
         _bundle_content,
         _bundle_response,
         _read_bundle_text,
         _write_bundle_manifest,
     )
+    from ..storage.artifacts import artifact_key
 
     cfg = settings(ctx)
     texts = iter(

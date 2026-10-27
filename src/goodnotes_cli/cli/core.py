@@ -13,7 +13,6 @@ import typer
 from typer.core import TyperGroup
 
 from .. import __version__, build_info
-from ..cache import read_view
 from ..config import Settings
 from ..errors import (
     CacheAccessError,
@@ -21,6 +20,7 @@ from ..errors import (
 )
 from ..presentation.contracts import Projection, validate_projection
 from ..presentation.json import emit_error
+from ..storage.cache import read_view
 
 if TYPE_CHECKING:
     from ..library import Library

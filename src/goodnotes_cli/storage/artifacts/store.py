@@ -396,8 +396,7 @@ class ArtifactCache:
 
     def _maintain(self) -> None:
         self._require_open()
-        self._blobs._verified_blob_stats.clear()
-        self._blobs._blob_digests_by_stat.clear()
+        self._blobs._reset_verification()
         self._cleanup_staging()
         self._records.clear()
         self._records.update(self._retention._scan_entries())
@@ -545,8 +544,7 @@ class ArtifactCache:
                     os.unlink(item.name, dir_fd=directory_fd)
                 except OSError as exc:
                     raise GoodnotesError(f"Could not remove unused artifact blob: {path}") from exc
-                self._blobs._verified_blob_stats.pop(digest, None)
-                self._blobs._blob_digests_by_stat.pop(self._fs._content_signature(info), None)
+                self._blobs._forget_blob(digest, info)
         finally:
             os.close(directory_fd)
 

@@ -102,12 +102,12 @@ evidence, not proof of every possible input or native format.
 | First-party package metric | Main | Refactor |
 | --- | ---: | ---: |
 | Python modules, including compatibility exports | 20 | 86 |
-| Physical lines | 15,733 | 17,481 |
-| Nonblank, noncomment, nondocstring lines | 13,897 | 15,283 |
-| Lines occupied by import statements | 316 | 1,012 |
-| Function definitions, including nested/protocol methods | 496 | 551 |
+| Physical lines | 15,733 | 17,497 |
+| Nonblank, noncomment, nondocstring lines | 13,897 | 15,295 |
+| Lines occupied by import statements | 316 | 1,013 |
+| Function definitions, including nested/protocol methods | 496 | 555 |
 | Classes, including typed records | 55 | 86 |
-| Functions consisting of one delegating call | 18 | 25 |
+| Functions consisting of one delegating call | 18 | 26 |
 | Largest module | 2,521 | 616 |
 
 These totals include fixes, types, import overhead and compatibility exports; vendor, tests and
@@ -116,8 +116,8 @@ multiline imports. The delegating-call heuristic includes useful public facade m
 count of defects. Source relocation and fixes were integrated together, so no reliable mechanical-only
 line delta is claimed. The combined diff and focused regressions expose the actual behavior changes.
 
-The original no-growth target was missed: code grew by 1,386 lines, or 10.0%. Of that increase,
-696 lines are import spans. The remaining increase includes explicit session and filesystem ownership,
+The original no-growth target was missed: code grew by 1,398 lines, or 10.1%. Of that increase,
+697 lines are import spans. The remaining increase includes explicit session and filesystem ownership,
 owner-local result types, bounded metadata and failure cleanup. This is an explicit deviation from
 the target, not a claimed reduction. Shared bounded text materialization, count queries, session
 checks and duplicate reset state were consolidated. We kept substantive safety checks and independent
@@ -135,7 +135,13 @@ permission/ACL and clone-errno changes, global source-hash caching, uncertain WA
 normalization and new native schema support remain outside this change. Before a future release tag,
 promote the changelog with the real release date; this refactor does not create a release.
 
-The local full suite passed with native support required: 955 passed and one case-sensitive-filesystem
+The local full suite passed with native support required: 962 passed and one case-sensitive-filesystem
 skip. Formatting, lint, types, strict docs, source verification and isolated wheel/sdist smoke checks
 passed. Source verification ran 102 required acceptance cases with zero skips. Manual private-corpus,
 iPad and TCC acceptance remains unverified.
+
+Final two-axis review findings were corrected: commands import their owning packages, blob-cache
+state changes stay with the blob owner, managed render identities are checked before any pending
+publication, and the comparator verifies frozen baseline content against Git. Partial captures cannot
+reuse stale receipts. Its fixed audit matrix and fixture setup form a reviewed test-only module-size
+exception. The default pytest root includes every subsystem and the provenance regressions.

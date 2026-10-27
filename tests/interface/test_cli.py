@@ -356,12 +356,12 @@ def test_document_sqlite_failure_is_not_classified_as_cache_access(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from goodnotes_cli import documents
+    from goodnotes_cli import rendering
 
     def fail(*args: object, **kwargs: object) -> None:
         raise sqlite3.OperationalError("synthetic document failure")
 
-    monkeypatch.setattr(documents, "export_pdf", fail)
+    monkeypatch.setattr(rendering, "export_pdf", fail)
     result = invoke_in_process(
         [
             "export",

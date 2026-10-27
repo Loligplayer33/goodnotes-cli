@@ -74,9 +74,7 @@ class ArtifactRetention:
         missing = set(png_references) - set(blob_map)
         if missing:
             raise GoodnotesError("An artifact entry refers to a missing generated PNG blob.")
-        self._blobs._blob_digests_by_stat = {
-            self._fs._content_signature(info): digest for digest, info in blob_map.items()
-        }
+        self._blobs._index_inventory(blob_map)
         return records
 
     def _active_stage_png_references(self, blob_map: Mapping[str, os.stat_result]) -> Counter[str]:
@@ -98,8 +96,7 @@ class ArtifactRetention:
                 file_info = self._fs._regular_file(path, purpose="staged artifact file")
                 self._fs._require_owner(file_info, purpose="staged artifact file")
                 if child.name.endswith(".png") and file_info.st_nlink > 1:
-                    signature = self._fs._content_signature(file_info)
-                    digest = self._blobs._blob_digests_by_stat.get(signature)
+                    digest = self._blobs._digest_for_file(file_info)
                     if digest is None:
                         raise GoodnotesError(
                             "A staged PNG hardlink must refer to a verified artifact cache blob."

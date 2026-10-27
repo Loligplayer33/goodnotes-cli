@@ -167,6 +167,10 @@ def cached_render_pages(
                     resources.callback(stage_resources.close)
                     result["path"] = str(cache.destination(key) / "page.png")
                     pending.append((len(rendered), key, stage, result))
+                if result.get("document_id") != page.document_id:
+                    raise GoodnotesError(
+                        "Bundle page render has missing or inconsistent document identity."
+                    )
                 result["captured_at"] = getattr(sandbox, "captured_at", None)
                 result["temporary"] = True
                 rendered.append(result)

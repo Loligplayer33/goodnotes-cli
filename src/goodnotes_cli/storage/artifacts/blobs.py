@@ -4,6 +4,7 @@ import hashlib
 import os
 import re
 import stat
+from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import uuid4
@@ -32,6 +33,22 @@ class ArtifactBlobs:
         self._fs, self._io = fs, io
         self._verified_blob_stats: dict[str, tuple[int, int, int, int, int]] = {}
         self._blob_digests_by_stat: dict[tuple[int, int, int, int, int], str] = {}
+
+    def _reset_verification(self) -> None:
+        self._verified_blob_stats.clear()
+        self._blob_digests_by_stat.clear()
+
+    def _index_inventory(self, blobs: Mapping[str, os.stat_result]) -> None:
+        self._blob_digests_by_stat = {
+            self._fs._content_signature(info): digest for digest, info in blobs.items()
+        }
+
+    def _digest_for_file(self, info: os.stat_result) -> str | None:
+        return self._blob_digests_by_stat.get(self._fs._content_signature(info))
+
+    def _forget_blob(self, digest: str, info: os.stat_result) -> None:
+        self._verified_blob_stats.pop(digest, None)
+        self._blob_digests_by_stat.pop(self._fs._content_signature(info), None)
 
     def _prepare_stage_files(
         self,

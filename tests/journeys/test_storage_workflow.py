@@ -353,3 +353,90 @@ def test_native_cached_request_skips_engine_and_refresh_invalidates_images(
     assert current["snapshot"] != first["snapshot"]
     assert Path(current["page_evidence"][0]["image"]).read_bytes() != old_bytes
     assert old_image.read_bytes() == old_bytes
+
+
+@pytest.mark.parametrize("bad_identity", [None, "other-document"])
+def test_managed_bundle_rejects_bad_hit_before_publishing_staged_miss(
+    visual_snapshot: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    bad_identity: str | None,
+) -> None:
+    successful(
+        invoke_in_process(
+            ["render", "doc-hostile", "--page", "2", "--layer", "background"],
+            tmp_path,
+            sandbox=visual_snapshot,
+        )
+    )
+    original_lookup = ArtifactCache.lookup
+    original_publish = ArtifactCache.publish
+    publications: list[str] = []
+    hits: list[int] = []
+
+    def malformed_hit(self: ArtifactCache, key: str) -> Any:
+        hit = original_lookup(self, key)
+        if hit is not None and hit.result.get("page") == 2:
+            hits.append(2)
+            result = dict(hit.result)
+            if bad_identity is None:
+                result.pop("document_id", None)
+            else:
+                result["document_id"] = bad_identity
+            return replace(hit, result=result)
+        return hit
+
+    def track_publish(self: ArtifactCache, key: str, stage: Path, result: dict[str, Any]) -> Any:
+        publications.append(key)
+        return original_publish(self, key, stage, result)
+
+    monkeypatch.setattr(ArtifactCache, "lookup", malformed_hit)
+    monkeypatch.setattr(ArtifactCache, "publish", track_publish)
+    response = invoke_in_process(
+        ["bundle", "doc-hostile", "--pages", "1,2", "--layer", "background"],
+        tmp_path,
+        sandbox=visual_snapshot,
+    )
+    assert response.returncode != 0
+    assert "missing or inconsistent document identity" in response.stderr
+    assert hits == [2]
+    assert not publications
+    assert not list((tmp_path / "state" / "artifacts").rglob("text.json"))
+    assert not list((tmp_path / "state" / "artifacts").rglob(".staging-*"))
+
+
+@pytest.mark.parametrize("bad_identity", [None, "other-document"])
+def test_managed_bundle_rejects_bad_fresh_render_before_publication(
+    visual_snapshot: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    bad_identity: str | None,
+) -> None:
+    original_render = documents._render_page_with_resources
+    original_publish = ArtifactCache.publish
+    publications: list[str] = []
+
+    def malformed_render(*args: Any, **kwargs: Any) -> dict[str, object]:
+        result = original_render(*args, **kwargs)
+        if bad_identity is None:
+            result.pop("document_id", None)
+        else:
+            result["document_id"] = bad_identity
+        return result
+
+    def track_publish(self: ArtifactCache, key: str, stage: Path, result: dict[str, Any]) -> Any:
+        publications.append(key)
+        return original_publish(self, key, stage, result)
+
+    monkeypatch.setattr(documents, "_render_page_with_resources", malformed_render)
+    monkeypatch.setattr(ArtifactCache, "publish", track_publish)
+    response = invoke_in_process(
+        ["bundle", "doc-hostile", "--pages", "1,2", "--layer", "background"],
+        tmp_path,
+        sandbox=visual_snapshot,
+    )
+    assert response.returncode != 0
+    assert "missing or inconsistent document identity" in response.stderr
+    assert not publications
+    assert not list((tmp_path / "state" / "artifacts").rglob("text.json"))
+    assert not list((tmp_path / "state" / "artifacts").rglob(".staging-*"))
