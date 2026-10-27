@@ -317,7 +317,7 @@ class Catalog:
         self.cycle_count = self._count_folder_cycles()
         self.orphan_count = len(live_folders) + len(live_documents) - len(self.entries)
         for key in self.entries:
-            path = self._path_for_key(key, set())
+            path = self._path_for_key(key)
             self.paths[key] = path
             if path is None:
                 self.orphan_count += 1
@@ -342,13 +342,9 @@ class Catalog:
             completed.update(chain)
         return len(cycle_members)
 
-    def _path_for_key(
-        self,
-        key: tuple[str, str],
-        visiting: set[tuple[str, str]],
-    ) -> str | None:
+    def _path_for_key(self, key: tuple[str, str]) -> str | None:
         chain: list[tuple[str, str]] = []
-        seen = set(visiting)
+        seen: set[tuple[str, str]] = set()
         current = key
         path: str | None = None
         while current not in self.paths:

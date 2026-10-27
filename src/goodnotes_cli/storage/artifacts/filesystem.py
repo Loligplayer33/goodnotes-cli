@@ -163,12 +163,15 @@ class ArtifactFilesystem:
                     except FileExistsError:
                         pass
                     child = os.open(part, flags, dir_fd=descriptor)
-                info = os.fstat(child)
-                if not stat.S_ISDIR(info.st_mode):
+                try:
+                    info = os.fstat(child)
+                    if not stat.S_ISDIR(info.st_mode):
+                        raise GoodnotesError(
+                            f"Artifact cache path component is not a directory: {part}"
+                        )
+                except BaseException:
                     os.close(child)
-                    raise GoodnotesError(
-                        f"Artifact cache path component is not a directory: {part}"
-                    )
+                    raise
                 os.close(descriptor)
                 descriptor = child
             return descriptor

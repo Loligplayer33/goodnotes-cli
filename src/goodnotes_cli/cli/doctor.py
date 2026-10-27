@@ -63,7 +63,6 @@ def doctor(
     if any(value is not None for value in (library, scratch_dir, output_dir)):
         raise GoodnotesError("--library, --scratch-dir, and --output-dir require --access-only.")
     with repository(ctx) as lib:
-        cfg = settings(ctx)
         result = repository_query(ctx, lib, lib.stats, notebook=notebook)
         result["storage"] = {
             "cache_dir": cfg.cache_dir,

@@ -24,6 +24,7 @@ class PageReader:
 
     def clear(self) -> None:
         self._page_numbers: dict[tuple[str, str], int] | None = None
+        self._page_number_scope: frozenset[str] | None = None
         self._page_cache: dict[tuple[str, str], Page] = {}
         self._pages_by_notebook: dict[str, list[Page]] = {}
         self._attachment_state_by_page: dict[tuple[str, str], tuple[str, str | None]] = {}
@@ -439,7 +440,7 @@ class PageReader:
         return {page_id: number for (_, page_id), number in self._page_numbers.items()}
 
     def _ensure_page_numbers(self, notebook_ids: set[str]) -> None:
-        if self._page_numbers is not None:
+        if self._page_numbers is not None and self._page_number_scope == notebook_ids:
             return
         assert self._session.projection is not None
         page_numbers: dict[tuple[str, str], int] = {}
@@ -460,3 +461,4 @@ class PageReader:
             counts[document_id] = number
             page_numbers[(document_id, page_id)] = number
         self._page_numbers = page_numbers
+        self._page_number_scope = frozenset(notebook_ids)

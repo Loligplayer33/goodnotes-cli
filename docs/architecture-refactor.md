@@ -145,3 +145,20 @@ state changes stay with the blob owner, managed render identities are checked be
 publication, and the comparator verifies frozen baseline content against Git. Partial captures cannot
 reuse stale receipts. Its fixed audit matrix and fixture setup form a reviewed test-only module-size
 exception. The default pytest root includes every subsystem and the provenance regressions.
+
+## Follow-up audit decisions
+
+The external review of `5f72522` identified four residual items. Each was checked against the
+implementation and reviewed independently before changing it.
+
+| Item | Decision |
+| --- | --- |
+| Directory descriptor cleanup and permission order | Close the newly opened child if validation fails before descriptor ownership transfers. Keep the privacy check before chmod: a directory accessible to other users must be rejected rather than silently adopted. |
+| Selection-file JSON duplication | Retain the specialized reader. Initial lookup/open failures distinguish a missing selection and access errors; failures after opening invalidate the selection. The shared metadata reader does not expose these phases, so substituting it would change error contracts. |
+| Page-number cache scope | Remember only the last notebook scope as an immutable set and rebuild when it changes. Existing public callers use a stable scope, but the reader methods accept different scopes. No unbounded per-scope cache is added. |
+| Catalog and doctor cleanup | Remove the obsolete traversal argument and second settings lookup. Iterative cycle detection and the shared settings object preserve their behavior. |
+
+Generated regressions inject directory-stat errors and interruption, verify both descriptors close,
+and switch and mutate notebook scopes through empty, disjoint and combined sets. Existing catalog
+and doctor tests cover the two mechanical cleanups. These changes add no new dependencies or modules
+to the production package and do not expand annotation-format support.

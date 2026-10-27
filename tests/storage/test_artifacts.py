@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import multiprocessing
@@ -39,6 +40,41 @@ def _make_cache(
     if clock is not None:
         kwargs["clock"] = clock
     return ArtifactCache(root, snapshot, **kwargs), root, snapshot
+
+
+@pytest.mark.parametrize("failure", [OSError, KeyboardInterrupt])
+def test_directory_stat_failure_closes_parent_and_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: type[BaseException]
+) -> None:
+    opened: list[int] = []
+    original_open = os.open
+    original_fstat = os.fstat
+
+    def record_open(*args: Any, **kwargs: Any) -> int:
+        descriptor = original_open(*args, **kwargs)
+        opened.append(descriptor)
+        return descriptor
+
+    def fail_child_stat(descriptor: int) -> os.stat_result:
+        raise failure("generated child stat failure")
+
+    try:
+        with monkeypatch.context() as fault:
+            fault.setattr(filesystem_module.os, "open", record_open)
+            fault.setattr(filesystem_module.os, "fstat", fail_child_stat)
+            with pytest.raises(failure, match="generated child stat failure"):
+                ArtifactFilesystem._open_directory_tree(tmp_path.resolve())
+        assert len(opened) == 2
+        for descriptor in opened:
+            with pytest.raises(OSError) as error:
+                original_fstat(descriptor)
+            assert error.value.errno == errno.EBADF
+    finally:
+        for descriptor in opened:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
 
 def _publish(
