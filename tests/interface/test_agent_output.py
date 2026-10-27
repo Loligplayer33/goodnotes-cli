@@ -618,14 +618,18 @@ def test_removed_flags_have_no_hidden_aliases(arguments: list[str], tmp_path: Pa
     assert not (tmp_path / "state").exists()
 
 
-@pytest.mark.parametrize("managed", [False, True])
-@pytest.mark.parametrize("mapping", ["rotation", "crop"])
+@pytest.mark.parametrize(
+    ("managed", "mapping", "verbose"),
+    [(m, mapping, True) for m in (False, True) for mapping in ("rotation", "crop")]
+    + [(True, "rotation", False)],
+)
 def test_bundle_reports_unsupported_native_background_per_page(
     generated_copy: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     managed: bool,
     mapping: str,
+    verbose: bool,
 ) -> None:
     import pymupdf as fitz
 
@@ -668,23 +672,29 @@ def test_bundle_reports_unsupported_native_background_per_page(
     options = ["bundle", "doc-hostile", "--pages", "1,2", "--layer", "native"]
     if not managed:
         options += ["--output", str(output)]
-    result = successful(invoke_in_process(options, tmp_path, sandbox=generated_copy))
+    result = successful(
+        invoke_in_process(options, tmp_path, sandbox=generated_copy, verbose=verbose)
+    )
     assert result["status"] == "partial"
     assert result["failed_pages"] == [1]
     assert result["page_evidence"][0]["image"] is None
     assert result["page_evidence"][0]["render_error"]["details"]["operation"] == "map_native_page"
     assert Path(result["page_evidence"][1]["image"]).is_file()
-    assert not list((Path(result["directory"])).glob("page-0001.png"))
+    assert not list(Path(result["manifest"]).parent.glob("page-0001.png"))
 
 
-@pytest.mark.parametrize("managed", [False, True])
-@pytest.mark.parametrize("wrong_id", ["", "other-notebook"])
+@pytest.mark.parametrize(
+    ("managed", "wrong_id", "verbose"),
+    [(m, identity, True) for m in (False, True) for identity in ("", "other-notebook")]
+    + [(True, "other-notebook", False)],
+)
 def test_bundle_rejects_inconsistent_text_identity_before_bundle_publication(
     generated_copy: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     managed: bool,
     wrong_id: str,
+    verbose: bool,
 ) -> None:
     from dataclasses import replace
 
@@ -700,22 +710,25 @@ def test_bundle_rejects_inconsistent_text_identity_before_bundle_publication(
     options = ["bundle", "doc-hostile", "--layer", "background"]
     if not managed:
         options += ["--output", str(destination)]
-    result = invoke_in_process(options, tmp_path, sandbox=generated_copy)
+    result = invoke_in_process(options, tmp_path, sandbox=generated_copy, verbose=verbose)
     assert result.returncode != 0
     assert "inconsistent document identity" in result.stderr
     assert not destination.exists()
     assert not list((tmp_path / "state").rglob("text.json"))
+    if managed:
+        assert not list((tmp_path / "state").rglob("page.png"))
 
 
+@pytest.mark.parametrize("verbose", [False, True])
 def test_bundle_fields_returns_resolved_document_identity(
-    generated_copy: Path, tmp_path: Path
+    generated_copy: Path, tmp_path: Path, verbose: bool
 ) -> None:
     result = successful(
         invoke_in_process(
             ["--fields", "document_id", "bundle", "doc-hostile", "--layer", "background"],
             tmp_path,
             sandbox=generated_copy,
-            verbose=False,
+            verbose=verbose,
         )
     )
     assert result["document_id"] == "doc-hostile"
@@ -727,9 +740,7 @@ def test_bundle_evidence_rejects_missing_or_mixed_render_identity(identity: str 
     from goodnotes_cli.errors import GoodnotesError
     from goodnotes_cli.rendering.bundle import _bundle_content
 
-    def text(_number: int, _remaining: int) -> dict[str, Any]:
-        return {"document_id": "expected", "parts": [], "truncated": False}
-
+    texts = {1: {"document_id": "expected", "page": 1, "parts": [], "truncated": False}}
     rendered: dict[str, object] = {"document_id": identity} if identity else {}
     with pytest.raises(GoodnotesError, match="render has missing or inconsistent"):
-        _bundle_content(text, "expected", [1], [rendered], 100)
+        _bundle_content(texts, "expected", [1], [rendered], 100)

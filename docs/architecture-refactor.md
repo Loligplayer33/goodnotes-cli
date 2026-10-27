@@ -162,3 +162,19 @@ Generated regressions inject directory-stat errors and interruption, verify both
 and switch and mutate notebook scopes through empty, disjoint and combined sets. Existing catalog
 and doctor tests cover the two mechanical cleanups. These changes add no new dependencies or modules
 to the production package and do not expand annotation-format support.
+
+A subsequent review identified an implicit positional handoff in cached bundles. Text evidence is
+now read once into a map keyed by public page number, with document, page-number and page-ID checks
+against the selected snapshot pages. Manifest assembly accepts this map directly, checks exact
+selection coverage and render-page order, and rejects missing or mismatched evidence. Managed
+rendering checks page identity before publishing pending images. The cumulative text budget is
+applied while reading; assembly no longer repeats that accounting through a stateful callback.
+Generated cases cover reversed selections, partial errors, missing/reordered results, cold/warm
+image caches, and compact/verbose output. Existing F13/F14 checks now explicitly cover both output
+modes, alongside F15 truncation consistency.
+
+GitHub's legacy commit-status endpoint can report pending with zero entries when Actions check runs
+are successful. Review CI through check runs or the workflow itself, pinned to the PR revision.
+Installed-target receipts verify an external package origin and matching source/package fingerprints;
+the fixture harness may import repository helpers. Local independent agent reviews assess behavior
+and ownership; they do not constitute a GitHub approval review or human sign-off.

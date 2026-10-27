@@ -158,7 +158,12 @@ def bundle(
     Example: goodnotes bundle "Course Notes" --pages 1-3 --output /tmp/course-pages
     """
 
-    from ..rendering.bundle import _bundle_content, _bundle_response, _write_bundle_manifest
+    from ..rendering.bundle import (
+        _bundle_content,
+        _bundle_response,
+        _read_bundle_text,
+        _write_bundle_manifest,
+    )
     from ..rendering.publication import publish_bundle
 
     if source not in {"text", "all", "pdf", "handwriting", "textbox"}:
@@ -212,14 +217,15 @@ def bundle(
                 dpi=dpi,
                 allow_partial_native_errors=layer == "native",
             )
-            manifest, truncated = _bundle_content(
+            texts = _read_bundle_text(
                 lambda number, remaining: repository_query(
                     ctx, lib, lib.read_page, item.id, number, source=source, max_chars=remaining
                 ),
-                item.id,
-                selected,
-                rendered_pages,
+                [all_pages[number - 1] for number in selected],
                 max_chars,
+            )
+            manifest, truncated = _bundle_content(
+                texts, item.id, selected, rendered_pages, max_chars
             )
             for entry in manifest:
                 render = entry.get("render")
@@ -284,28 +290,24 @@ def _cached_bundle(
     from ..storage.artifacts import artifact_key
 
     cfg = settings(ctx)
-    texts = iter(
-        _read_bundle_text(
-            lambda number, remaining: repository_query(
-                ctx, lib, lib.read_page, notebook, number, source=source, max_chars=remaining
-            ),
-            notebook,
-            selected,
-            max_chars,
-        )
+    pages = [all_pages[number - 1] for number in selected]
+    texts = _read_bundle_text(
+        lambda number, remaining: repository_query(
+            ctx, lib, lib.read_page, notebook, number, source=source, max_chars=remaining
+        ),
+        pages,
+        max_chars,
     )
     rendered = cached_render_pages(
         lib.sandbox,
-        [all_pages[number - 1] for number in selected],
+        pages,
         cache,
         layer=layer,
         dpi=dpi,
         allow_partial_native_errors=layer == "native",
     )
     # Text always comes from this request's pinned read view, including on image hits.
-    manifest, truncated = _bundle_content(
-        lambda _number, _remaining: next(texts), notebook, selected, rendered, max_chars
-    )
+    manifest, truncated = _bundle_content(texts, notebook, selected, rendered, max_chars)
     key = artifact_key(
         {
             "bundle": 1,

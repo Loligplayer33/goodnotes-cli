@@ -171,6 +171,10 @@ def cached_render_pages(
                     raise GoodnotesError(
                         "Bundle page render has missing or inconsistent document identity."
                     )
+                if result.get("page") != page.number:
+                    raise GoodnotesError(
+                        "Bundle page render has missing or inconsistent page identity."
+                    )
                 result["captured_at"] = getattr(sandbox, "captured_at", None)
                 result["temporary"] = True
                 rendered.append(result)

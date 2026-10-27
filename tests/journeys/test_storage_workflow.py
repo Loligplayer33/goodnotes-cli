@@ -130,6 +130,96 @@ def test_bundle_uses_fresh_text_when_reusing_an_image(
     assert os.path.samefile(first["page_evidence"][0]["image"], second["page_evidence"][0]["image"])
 
 
+@pytest.mark.parametrize("verbose", [False, True])
+def test_cached_bundle_reads_ordered_text_once_before_publication(
+    visual_snapshot: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, verbose: bool
+) -> None:
+    original_read = Library.read_page
+    original_publish = ArtifactCache.publish
+    events: list[tuple[str, int]] = []
+    reads: list[tuple[int, int | None]] = []
+
+    def read(self: Library, notebook: Any, page: int, **kwargs: Any) -> PageText:
+        remaining = kwargs["max_chars"]
+        reads.append((page, remaining))
+        events.append(("read", page))
+        text = f"page-{page}"
+        return replace(
+            original_read(self, notebook, page, **kwargs),
+            parts=[TextPart("pdf", text[:remaining], truncated=len(text) > remaining)],
+            truncated=len(text) > remaining,
+        )
+
+    def publish(self: ArtifactCache, *args: Any, **kwargs: Any) -> Any:
+        events.append(("publish", 0))
+        return original_publish(self, *args, **kwargs)
+
+    monkeypatch.setattr(Library, "read_page", read)
+    monkeypatch.setattr(ArtifactCache, "publish", publish)
+    for _ in range(2):
+        events.clear()
+        reads.clear()
+        result = successful(
+            invoke_in_process(
+                [
+                    "bundle",
+                    "doc-hostile",
+                    "--pages",
+                    "3,1,2",
+                    "--layer",
+                    "background",
+                    "--max-chars",
+                    "8",
+                ],
+                tmp_path,
+                sandbox=visual_snapshot,
+                verbose=verbose,
+            )
+        )
+        assert reads == [(3, 8), (1, 2), (2, 0)]
+        assert events[:3] == [("read", 3), ("read", 1), ("read", 2)]
+        manifest = json.loads(Path(result["manifest"]).read_text())
+        assert [entry["text"]["page_id"] for entry in manifest["pages"]] == [
+            "page-30",
+            "page-02",
+            "page-10",
+        ]
+        assert [entry["text"]["parts"][0]["text"] for entry in manifest["pages"]] == [
+            "page-3",
+            "pa",
+            "",
+        ]
+        assert manifest["truncated"] is result["truncated"] is True
+        assert [entry["text"]["truncated"] for entry in manifest["pages"]] == [False, True, True]
+
+
+@pytest.mark.parametrize("field", ["page", "page_id"])
+def test_cached_bundle_rejects_wrong_text_page_before_publication(
+    visual_snapshot: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str
+) -> None:
+    original = Library.read_page
+    publications: list[str] = []
+
+    def malformed(self: Library, *args: Any, **kwargs: Any) -> PageText:
+        return replace(
+            original(self, *args, **kwargs), **{field: 99 if field == "page" else "other"}
+        )
+
+    monkeypatch.setattr(Library, "read_page", malformed)
+    monkeypatch.setattr(
+        ArtifactCache, "publish", lambda _self, key, *_a, **_k: publications.append(key)
+    )
+    result = invoke_in_process(
+        ["bundle", "doc-hostile", "--pages", "3,1", "--layer", "background"],
+        tmp_path,
+        sandbox=visual_snapshot,
+    )
+    assert result.returncode != 0
+    assert "text has missing or inconsistent page identity" in result.stderr
+    assert not publications
+    assert not list((tmp_path / "state").rglob("page.png"))
+
+
 def test_identical_images_across_distinct_views_share_storage(
     visual_snapshot: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -355,12 +445,16 @@ def test_native_cached_request_skips_engine_and_refresh_invalidates_images(
     assert old_image.read_bytes() == old_bytes
 
 
-@pytest.mark.parametrize("bad_identity", [None, "other-document"])
+@pytest.mark.parametrize(
+    ("field", "bad_identity"),
+    [("document_id", None), ("document_id", "other-document"), ("page", None), ("page", 99)],
+)
 def test_managed_bundle_rejects_bad_hit_before_publishing_staged_miss(
     visual_snapshot: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    bad_identity: str | None,
+    field: str,
+    bad_identity: str | int | None,
 ) -> None:
     successful(
         invoke_in_process(
@@ -380,9 +474,9 @@ def test_managed_bundle_rejects_bad_hit_before_publishing_staged_miss(
             hits.append(2)
             result = dict(hit.result)
             if bad_identity is None:
-                result.pop("document_id", None)
+                result.pop(field, None)
             else:
-                result["document_id"] = bad_identity
+                result[field] = bad_identity
             return replace(hit, result=result)
         return hit
 
@@ -398,19 +492,26 @@ def test_managed_bundle_rejects_bad_hit_before_publishing_staged_miss(
         sandbox=visual_snapshot,
     )
     assert response.returncode != 0
-    assert "missing or inconsistent document identity" in response.stderr
+    assert (
+        f"missing or inconsistent {'document' if field == 'document_id' else 'page'} identity"
+        in response.stderr
+    )
     assert hits == [2]
     assert not publications
     assert not list((tmp_path / "state" / "artifacts").rglob("text.json"))
     assert not list((tmp_path / "state" / "artifacts").rglob(".staging-*"))
 
 
-@pytest.mark.parametrize("bad_identity", [None, "other-document"])
+@pytest.mark.parametrize(
+    ("field", "bad_identity"),
+    [("document_id", None), ("document_id", "other-document"), ("page", None), ("page", 99)],
+)
 def test_managed_bundle_rejects_bad_fresh_render_before_publication(
     visual_snapshot: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    bad_identity: str | None,
+    field: str,
+    bad_identity: str | int | None,
 ) -> None:
     original_render = documents._render_page_with_resources
     original_publish = ArtifactCache.publish
@@ -419,9 +520,9 @@ def test_managed_bundle_rejects_bad_fresh_render_before_publication(
     def malformed_render(*args: Any, **kwargs: Any) -> dict[str, object]:
         result = original_render(*args, **kwargs)
         if bad_identity is None:
-            result.pop("document_id", None)
+            result.pop(field, None)
         else:
-            result["document_id"] = bad_identity
+            result[field] = bad_identity
         return result
 
     def track_publish(self: ArtifactCache, key: str, stage: Path, result: dict[str, Any]) -> Any:
@@ -436,7 +537,10 @@ def test_managed_bundle_rejects_bad_fresh_render_before_publication(
         sandbox=visual_snapshot,
     )
     assert response.returncode != 0
-    assert "missing or inconsistent document identity" in response.stderr
+    assert (
+        f"missing or inconsistent {'document' if field == 'document_id' else 'page'} identity"
+        in response.stderr
+    )
     assert not publications
     assert not list((tmp_path / "state" / "artifacts").rglob("text.json"))
     assert not list((tmp_path / "state" / "artifacts").rglob(".staging-*"))

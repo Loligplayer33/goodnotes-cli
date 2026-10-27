@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, NotRequired, TypedDict, cast
 
 from ..errors import GoodnotesError
+from ..models import Page
 from ..presentation.json import serializable
 from ..presentation.selection import bound_page_text
 
@@ -23,41 +24,50 @@ class _BundlePage(TypedDict):
 
 def _read_bundle_text(
     read_page: Callable[[int, int], object],
-    document_id: str,
-    selected: list[int],
+    pages: list[Page],
     max_chars: int,
-) -> list[dict[str, Any]]:
+) -> dict[int, dict[str, Any]]:
     """Read and verify evidence before any managed image is published."""
-    texts: list[dict[str, Any]] = []
+    texts: dict[int, dict[str, Any]] = {}
     remaining = max_chars
-    for number in selected:
-        text = serializable(read_page(number, remaining))
-        if not isinstance(text, dict) or text.get("document_id") != document_id:
+    for page in pages:
+        text = serializable(read_page(page.number, remaining))
+        if not isinstance(text, dict) or text.get("document_id") != page.document_id:
             raise GoodnotesError("Bundle page text has missing or inconsistent document identity.")
-        texts.append(text)
+        if text.get("page") != page.number or text.get("page_id") != page.id:
+            raise GoodnotesError("Bundle page text has missing or inconsistent page identity.")
+        texts[page.number] = text
         remaining -= sum(len(part["text"]) for part in text["parts"])
     return texts
 
 
 def _bundle_content(
-    read_page: Callable[[int, int], object],
+    text_by_page: dict[int, dict[str, Any]],
     document_id: str,
     selected: list[int],
     rendered_pages: list[dict[str, object]],
     max_chars: int,
 ) -> tuple[list[_BundlePage], bool]:
+    """Pair pre-read text with renders in the requested page order."""
+    if (
+        set(text_by_page) != set(selected)
+        or len(text_by_page) != len(selected)
+        or len(rendered_pages) != len(selected)
+    ):
+        raise GoodnotesError("Bundle evidence does not match the selected pages.")
     manifest: list[_BundlePage] = []
-    remaining = max_chars
     for number, rendered in zip(selected, rendered_pages, strict=True):
-        page_data = read_page(number, remaining)
-        text = serializable(page_data)
-        if not isinstance(text, dict) or text.get("document_id") != document_id:
+        text = text_by_page[number]
+        if text.get("document_id") != document_id:
             raise GoodnotesError("Bundle page text has missing or inconsistent document identity.")
+        if text.get("page") != number:
+            raise GoodnotesError("Bundle page text has missing or inconsistent page identity.")
         if "render_error" not in rendered and rendered.get("document_id") != document_id:
             raise GoodnotesError(
                 "Bundle page render has missing or inconsistent document identity."
             )
-        remaining -= sum(len(part["text"]) for part in text["parts"])
+        if rendered.get("page") != number:
+            raise GoodnotesError("Bundle page render has missing or inconsistent page identity.")
         render_error = rendered.get("render_error")
         if isinstance(render_error, dict):
             manifest.append(
