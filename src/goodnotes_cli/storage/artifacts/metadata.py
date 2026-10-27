@@ -164,11 +164,15 @@ class ArtifactMetadata:
         ):
             raise GoodnotesError(f"Artifact entry marker is invalid: {marker}")
         created_at = data.get("created_at")
-        if (
-            isinstance(created_at, bool)
-            or not isinstance(created_at, (int, float))
-            or not math.isfinite(float(created_at))
-        ):
+        try:
+            valid_time = (
+                not isinstance(created_at, bool)
+                and isinstance(created_at, (int, float))
+                and math.isfinite(created_at)
+            )
+        except OverflowError:
+            valid_time = False
+        if not valid_time:
             raise GoodnotesError(f"Artifact entry creation time is invalid: {marker}")
 
         files: list[_FileRecord] = []

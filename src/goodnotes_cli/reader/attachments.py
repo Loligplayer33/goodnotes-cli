@@ -16,7 +16,7 @@ class AttachmentResolver:
         self._attachment_resolution_cache: dict[str, tuple[Path | None, str]] = {}
         self._attachment_basename_cache: dict[str, list[Path]] | None = None
 
-    def begin_read_cache(self) -> None:
+    def begin_read_operation(self) -> None:
         self._attachment_basename_cache = None
 
     def resolve(self, raw_path: Any, *, for_read: bool = False) -> tuple[Path | None, str]:
@@ -48,35 +48,27 @@ class AttachmentResolver:
         if not stored_path.is_absolute() and ".." in stored_path.parts:
             return None, "unsafe"
         candidate = stored_path if stored_path.is_absolute() else root / stored_path
+        result = self._classify_candidate(root, candidate)
+        if result[1] != "missing" or stored_path.is_absolute() or not stored_path.name:
+            return result
+        if len(stored_path.parts) > 1 and stored_path.parts[0] == "Attachments":
+            result = self._classify_candidate(root, root.joinpath(*stored_path.parts[1:]))
+            if result[1] != "missing":
+                return result
+        matches = self._attachment_paths_by_basename().get(stored_path.name, [])
+        if len(matches) == 1:
+            return self._classify_candidate(root, matches[0])
+        return None, "ambiguous" if matches else "missing"
+
+    @staticmethod
+    def _classify_candidate(root: Path, candidate: Path) -> tuple[Path | None, str]:
         try:
             resolved = resolve_confined_file(root, candidate)
         except GoodnotesError:
             return None, "unsafe"
         except OSError:
             return None, "unavailable"
-        if resolved is not None:
-            return resolved, "available"
-        if stored_path.is_absolute() or not stored_path.name:
-            return None, "missing"
-        if len(stored_path.parts) > 1 and stored_path.parts[0] == "Attachments":
-            try:
-                resolved = resolve_confined_file(root, root.joinpath(*stored_path.parts[1:]))
-            except GoodnotesError:
-                return None, "unsafe"
-            except OSError:
-                return None, "unavailable"
-            if resolved is not None:
-                return resolved, "available"
-        matches = self._attachment_paths_by_basename().get(stored_path.name, [])
-        if len(matches) == 1:
-            try:
-                resolved = resolve_confined_file(root, matches[0])
-            except GoodnotesError:
-                return None, "unsafe"
-            except OSError:
-                return None, "unavailable"
-            return (resolved, "available") if resolved is not None else (None, "missing")
-        return None, "ambiguous" if matches else "missing"
+        return (resolved, "available") if resolved is not None else (None, "missing")
 
     def _attachment_paths_by_basename(self) -> dict[str, list[Path]]:
         if self._attachment_basename_cache is not None:

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import shutil
 import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any
@@ -18,6 +17,7 @@ from ..errors import (
 from ..native import NativeError
 from ..presentation.json import emit
 from ..presentation.selection import select_pages
+from ..storage.paths import _remove_entry_at, stat_key
 
 if TYPE_CHECKING:
     from ..library import Library
@@ -210,9 +210,22 @@ def bundle(
         destination = sandbox.ensure_output(output)
         parent_existed = destination.parent.exists()
         temporary: Path | None = None
+        temporary_identity: tuple[int, int] | None = None
+        parent_identity: tuple[int, int] | None = None
+        parent_fd = -1
         try:
             destination.parent.mkdir(parents=True, exist_ok=True)
+            parent_fd = os.open(
+                destination.parent,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+            )
+            parent_identity = stat_key(os.fstat(parent_fd))[:2]
             temporary = Path(tempfile.mkdtemp(prefix=".goodnotes-bundle-", dir=destination.parent))
+            temporary_identity = stat_key(
+                os.stat(temporary.name, dir_fd=parent_fd, follow_symlinks=False)
+            )[:2]
+            if stat_key(destination.parent.stat())[:2] != parent_identity:
+                raise GoodnotesError("The bundle output parent changed during staging.")
             filenames = [f"page-{number:04d}.png" for number in selected]
             rendered_pages = render_pages(
                 sandbox,
@@ -240,13 +253,19 @@ def bundle(
             _write_bundle_manifest(
                 temporary, manifest, truncated, cfg.snapshot_id, sandbox.captured_at, source
             )
-            publish_bundle(temporary, destination)
+            publish_bundle(temporary, destination, expected_source_identity=temporary_identity)
         except BaseException as exc:
-            if temporary is not None:
-                shutil.rmtree(temporary, ignore_errors=True)
-            if not parent_existed:
+            if temporary is not None and temporary_identity is not None:
                 try:
-                    destination.parent.rmdir()
+                    _remove_entry_at(
+                        parent_fd, temporary.name, temporary, expected_identity=temporary_identity
+                    )
+                except (GoodnotesError, OSError):
+                    pass
+            if not parent_existed and parent_identity is not None:
+                try:
+                    if stat_key(destination.parent.lstat())[:2] == parent_identity:
+                        destination.parent.rmdir()
                 except OSError:
                     pass
             if isinstance(exc, NativeError):
@@ -256,6 +275,9 @@ def bundle(
                     exc, operation="write_bundle_output", path=destination, kind="output"
                 ) from exc
             raise
+        finally:
+            if parent_fd >= 0:
+                os.close(parent_fd)
         response = _bundle_response(destination, manifest, selected, layer, truncated, source)
         if cfg.fields and "document_id" in {field.strip() for field in cfg.fields.split(",")}:
             response["document_id"] = item.id

@@ -99,6 +99,8 @@ Bundle publication pins its parent and reserved directory, links relative to tha
 rolls back only entries with the identities it created. These checks reject observed replacements;
 the operating system does not make separate identity-check and unlink/rmdir calls atomic against
 arbitrary same-user mutation.
+Its staging parent and source directory remain pinned through handoff, including cleanup after
+render failure. An interrupt after a link completes retains the pending link for owned rollback.
 
 ## Native and output limits
 

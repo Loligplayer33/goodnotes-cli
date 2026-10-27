@@ -46,7 +46,7 @@ class PdfTextReader:
     @contextmanager
     def pdf_session(self) -> Generator[None, None, None]:
         self._session.start_pdf_cache()
-        self._attachments.begin_read_cache()
+        self._attachments.begin_read_operation()
         yield
 
     @staticmethod

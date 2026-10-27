@@ -32,31 +32,32 @@ class _PDFDocumentCache:
 
     def __init__(self, maximum: int = _MAX_OPEN_PDFS) -> None:
         self.maximum = maximum
-        self.documents: OrderedDict[Path, Any] = OrderedDict()
-        self.identities: dict[Path, tuple[int, int, int, int, int, int]] = {}
+        self.documents: OrderedDict[Path, tuple[Any, tuple[int, int, int, int, int, int]]] = (
+            OrderedDict()
+        )
 
     def get(self, path: Path) -> Any:
         identity = stat_key(path.stat())
-        document = self.documents.pop(path, None)
-        if document is not None and identity != self.identities.get(path):
-            document.close()
-            document = None
+        cached = self.documents.pop(path, None)
+        document = None
+        if cached is not None:
+            document, previous_identity = cached
+            if identity != previous_identity:
+                document.close()
+                document = None
         if document is None:
             document = _pymupdf().open(path)
-        self.identities[path] = identity
-        self.documents[path] = document
+        self.documents[path] = (document, identity)
         while len(self.documents) > self.maximum:
-            evicted_path, evicted = self.documents.popitem(last=False)
-            self.identities.pop(evicted_path, None)
+            _, (evicted, _) = self.documents.popitem(last=False)
             evicted.close()
         return document
 
     def close(self) -> None:
         documents = list(reversed(self.documents.values()))
         self.documents.clear()
-        self.identities.clear()
         first_error: BaseException | None = None
-        for document in documents:
+        for document, _ in documents:
             try:
                 document.close()
             except BaseException as exc:

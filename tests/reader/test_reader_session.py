@@ -52,7 +52,7 @@ def test_cleanup_attempts_all_resources_and_preserves_first_failure(
     session.start_pdf_cache()
     assert session.pdf_documents is not None
     session.pdf_documents.documents.update(
-        {Path(name): Document(name) for name in ("first", "second")}
+        {Path(name): (Document(name), (0, 0, 0, 0, 0, 0)) for name in ("first", "second")}
     )
 
     def fail_index():
@@ -80,7 +80,9 @@ def test_close_failure_retains_body_error_as_context(tmp_path: Path) -> None:
         with Library(_create_snapshot(tmp_path)) as library:
             library._session.start_pdf_cache()
             assert library._session.pdf_documents is not None
-            library._session.pdf_documents.documents.update({Path("test"): Document()})
+            library._session.pdf_documents.documents.update(
+                {Path("test"): (Document(), (0, 0, 0, 0, 0, 0))}
+            )
             raise ValueError("body failed")
     assert isinstance(error.value.__context__, ValueError)
     assert not library._session.is_open
@@ -101,7 +103,9 @@ def test_reopen_replaces_catalog_and_read_caches_after_close_error(tmp_path: Pat
             old_catalog = library._catalog
             library._session.start_pdf_cache()
             assert library._session.pdf_documents is not None
-            library._session.pdf_documents.documents.update({Path("test"): Document()})
+            library._session.pdf_documents.documents.update(
+                {Path("test"): (Document(), (0, 0, 0, 0, 0, 0))}
+            )
     assert library._pages is not old_pages
     assert library._catalog is not old_catalog
     with library:

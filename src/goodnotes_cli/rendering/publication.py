@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import os
-import shutil
 import uuid
 from collections.abc import Callable
 from pathlib import Path
 
 from ..errors import FilesystemAccessError, GoodnotesError
+from ..storage.paths import _remove_entry_at
 
 
 def _publish_new_file(
@@ -42,31 +42,54 @@ def _identity(info: os.stat_result) -> tuple[int, int]:
     return info.st_dev, info.st_ino
 
 
-def publish_bundle(temporary: Path, destination: Path) -> None:
+def publish_bundle(
+    temporary: Path,
+    destination: Path,
+    *,
+    expected_source_identity: tuple[int, int] | None = None,
+) -> None:
     """Publish into the reserved directory and remove only entries we created on failure."""
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-    parent_fd = os.open(destination.parent, flags)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    source_parent_fd = os.open(temporary.parent, flags)
+    source_fd = -1
+    parent_fd = -1
     directory_fd = -1
+    source_identity: tuple[int, int] | None = None
     directory_identity: tuple[int, int] | None = None
     published: list[tuple[str, tuple[int, int]]] = []
     reserved = False
     try:
+        source_fd = os.open(temporary.name, flags | nofollow, dir_fd=source_parent_fd)
+        source_identity = _identity(os.fstat(source_fd))
+        if (
+            expected_source_identity is not None and source_identity != expected_source_identity
+        ) or _identity(
+            os.stat(temporary.name, dir_fd=source_parent_fd, follow_symlinks=False)
+        ) != source_identity:
+            raise GoodnotesError("The bundle staging directory changed before publication.")
+        parent_fd = os.open(destination.parent, flags)
         parent_identity = _identity(os.fstat(parent_fd))
         os.mkdir(destination.name, mode=0o700, dir_fd=parent_fd)
         reserved = True
         directory_identity = _identity(
             os.stat(destination.name, dir_fd=parent_fd, follow_symlinks=False)
         )
-        directory_fd = os.open(
-            destination.name, flags | getattr(os, "O_NOFOLLOW", 0), dir_fd=parent_fd
-        )
+        directory_fd = os.open(destination.name, flags | nofollow, dir_fd=parent_fd)
         if _identity(os.fstat(directory_fd)) != directory_identity:
             raise GoodnotesError("The bundle output directory changed during publication.")
-        files = sorted(temporary.iterdir(), key=lambda path: path.name == "text.json")
-        for source in files:
-            identity = _identity(source.lstat())
-            os.link(source, source.name, dst_dir_fd=directory_fd, follow_symlinks=False)
-            published.append((source.name, identity))
+        files = sorted(os.listdir(source_fd), key=lambda name: name == "text.json")
+        for name in files:
+            identity = _identity(os.stat(name, dir_fd=source_fd, follow_symlinks=False))
+            published.append((name, identity))
+            try:
+                os.link(
+                    name, name, src_dir_fd=source_fd, dst_dir_fd=directory_fd, follow_symlinks=False
+                )
+            except OSError:
+                # A failed no-overwrite link did not install an entry we own.
+                published.pop()
+                raise
         if (
             _identity(os.stat(destination.name, dir_fd=parent_fd, follow_symlinks=False))
             != directory_identity
@@ -88,7 +111,7 @@ def publish_bundle(temporary: Path, destination: Path) -> None:
                         os.unlink(name, dir_fd=directory_fd)
                 except OSError:
                     pass
-        if directory_identity is not None:
+        if directory_identity is not None and parent_fd >= 0:
             try:
                 if (
                     _identity(os.stat(destination.name, dir_fd=parent_fd, follow_symlinks=False))
@@ -101,6 +124,20 @@ def publish_bundle(temporary: Path, destination: Path) -> None:
     finally:
         if directory_fd >= 0:
             os.close(directory_fd)
-        os.close(parent_fd)
-        if reserved:
-            shutil.rmtree(temporary, ignore_errors=True)
+        if parent_fd >= 0:
+            os.close(parent_fd)
+        try:
+            if reserved and source_identity is not None:
+                try:
+                    _remove_entry_at(
+                        source_parent_fd,
+                        temporary.name,
+                        temporary,
+                        expected_identity=source_identity,
+                    )
+                except (OSError, GoodnotesError):
+                    pass
+        finally:
+            if source_fd >= 0:
+                os.close(source_fd)
+            os.close(source_parent_fd)

@@ -146,3 +146,26 @@ def test_post_delivery_renewal_failure_returns_nonzero(
     assert (
         json.loads(result.stderr)["error"]["message"] == "Generated post-delivery renewal failure."
     )
+
+
+@pytest.mark.parametrize("timestamp", [10**400, -(10**400)])
+@pytest.mark.parametrize("verbose", [False, True])
+def test_oversized_artifact_creation_time_is_a_structured_error(
+    tmp_path: Path, timestamp: int, verbose: bool
+) -> None:
+    sandbox = _create_snapshot(tmp_path / "snapshot", with_fts=False)
+    arguments = ["render", "doc-hostile", "--page", "3", "--layer", "background"]
+    first = invoke_in_process(arguments, tmp_path, sandbox=sandbox.root, verbose=verbose)
+    assert first.returncode == 0, first.stderr
+    marker = Path(json.loads(first.stdout)["path"]).parent / ".artifact.json"
+    record = json.loads(marker.read_text())
+    record["created_at"] = timestamp
+    marker.write_text(json.dumps(record), encoding="utf-8")
+
+    result = invoke_in_process(arguments, tmp_path, sandbox=sandbox.root, verbose=verbose)
+
+    assert result.returncode == 1
+    assert result.stdout == ""
+    error = json.loads(result.stderr)["error"]
+    assert error["code"] == "operation_failed"
+    assert "creation time is invalid" in error["message"]

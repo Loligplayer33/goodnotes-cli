@@ -1397,7 +1397,9 @@ def test_pdf_cache_attempts_every_close() -> None:
                 raise RuntimeError(self.name)
 
     cache = session_module._PDFDocumentCache()
-    cache.documents.update({Path(name): Document(name) for name in ("one", "two", "three")})
+    cache.documents.update(
+        {Path(name): (Document(name), (0, 0, 0, 0, 0, 0)) for name in ("one", "two", "three")}
+    )
     with pytest.raises(RuntimeError, match="three"):
         cache.close()
     assert calls == ["three", "two", "one"]
@@ -1473,7 +1475,7 @@ def test_cached_basename_match_is_revalidated_before_read(tmp_path: Path) -> Non
     outside = tmp_path / "outside.pdf"
     _write_pdf(outside, "outside generated content")
     with Library(sandbox) as library:
-        library._attachments.begin_read_cache()
+        library._attachments.begin_read_operation()
         path, state = library._attachments.resolve("old/location/fallback.pdf", for_read=True)
         assert state == "available"
         assert path == sandbox.attachments_dir / "fallback.pdf"
