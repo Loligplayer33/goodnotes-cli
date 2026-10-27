@@ -94,3 +94,19 @@ def test_cleanup_rejects_changed_owned_directory(tmp_path: Path) -> None:
     finally:
         os.close(parent_fd)
     assert (owned / "keep").read_text(encoding="utf-8") == "keep"
+
+
+def test_metadata_classifies_excessive_json_nesting(tmp_path: Path) -> None:
+    path = tmp_path / "metadata.json"
+    path.write_bytes(b"[" * 10_000 + b"0" + b"]" * 10_000)
+    with pytest.raises(ValueError, match="nesting") as error:
+        metadata.read_json(path, limit=metadata.CACHE_METADATA_LIMIT)
+    assert isinstance(error.value.__cause__, RecursionError)
+
+
+def test_metadata_optional_encoding_preserves_existing_reader_policies(tmp_path: Path) -> None:
+    path = tmp_path / "metadata.json"
+    path.write_bytes('{"ok":true}'.encode("utf-16"))
+    assert metadata.read_json(path, limit=64) == {"ok": True}
+    with pytest.raises(UnicodeDecodeError):
+        metadata.read_json(path, limit=64, encoding="utf-8")

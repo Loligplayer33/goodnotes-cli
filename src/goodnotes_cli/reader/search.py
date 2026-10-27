@@ -135,20 +135,13 @@ class SearchReader:
         retained_keys: set[tuple[str, str, int, bytes]] = set()
         sequence = 0
         assert self._session.fts is not None
-        search_batch_size = (
-            min(
-                index.SQL_BIND_LIMIT,
-                self._session.fts.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER),
-            )
-            - 1
-        )
-        if search_batch_size < 1:
-            raise GoodnotesError("SQLite parameter limit is too low for text search.")
+        search_batch_size = self._search_batch_size()
         notebook_batches = list(index.batches(sorted(notebook_ids), search_batch_size))
         # Each source cursor orders by text_id, and a page/source fixes the other
         # sort fields. Thus a later exact duplicate can never outrank its first row;
         # keys for candidates outside the retained top-K set need not be kept.
         active_notebook_ids = self._catalog.active_items_by_kind("notebook")
+        page_numbers = self._pages.page_numbers(active_notebook_ids)
         for item_source in available:
             if item_source == "pdf":
                 assert pdf_bindings is not None
@@ -168,9 +161,7 @@ class SearchReader:
             for row in rows:
                 document_id = row["document_id"]
                 page_id = row["page_id"]
-                page_number = self._pages.page_number_for_id(
-                    document_id, page_id, active_notebook_ids
-                )
+                page_number = page_numbers.get((document_id, page_id))
                 if page_number is None:
                     continue
                 entry = self._catalog.entries.get(("notebook", document_id))
@@ -219,6 +210,13 @@ class SearchReader:
             for candidate in sorted(candidates, key=lambda x: (x.sort_key, x.sequence))
         ]
 
+    def _search_batch_size(self) -> int:
+        assert self._session.fts is not None
+        try:
+            return index.sql_batch_size(self._session.fts, fixed=1)
+        except GoodnotesError as exc:
+            raise GoodnotesError("SQLite parameter limit is too low for text search.") from exc
+
     def _search_rows(
         self, source: str, query: str, document_ids: list[str] | None = None
     ) -> Iterator[sqlite3.Row]:
@@ -226,15 +224,7 @@ class SearchReader:
         assert self._session.fts is not None
         if document_ids is None:
             document_ids = sorted(self._catalog.notebook_ids_under(None))
-        batch_size = (
-            min(
-                index.SQL_BIND_LIMIT,
-                self._session.fts.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER),
-            )
-            - 1
-        )
-        if batch_size < 1:
-            raise GoodnotesError("SQLite parameter limit is too low for text search.")
+        batch_size = self._search_batch_size()
         if len(document_ids) > batch_size:
             for batch in index.batches(document_ids, batch_size):
                 yield from self._search_rows(source, query, batch)

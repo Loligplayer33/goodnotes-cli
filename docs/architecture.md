@@ -36,7 +36,7 @@ SQLite may accept only a committed WAL prefix. A checkpoint, backup, or integrit
 | Completed snapshot | Immutable; readers open databases read-only. |
 | `.sync.lock` | Serializes the full refresh. |
 | `.view.lock` | Readers open the existing file read-only and hold a shared lock through their last read. Sync takes it exclusively only to publish/prune. |
-| Artifact store | Separate from snapshots. Render/bundle acquire its lock after the shared view lock. |
+| Artifact store | Separate from snapshots. Managed render/bundle hold its lock through response delivery, after acquiring the shared view lock. |
 
 Locks must be regular, no-follow files with stable identity. Readers create no cache paths and never recreate missing locks. A long reader delays publish/prune while capture proceeds.
 
@@ -51,6 +51,10 @@ Managed `render` and `bundle` outputs use a separate artifact store; explicit ou
 | 5-minute lease | Protect returned entries from expiry and eviction. Fail if a result cannot fit without evicting protected entries. |
 
 Render reuse checks snapshot, background/native inputs, page, layer, DPI, and renderer version before and after reuse. Cache hits do not open RocksDB. Bundles read current text; annotated PDFs keep full digest verification. Only generated PNGs may be hardlinked, within this store.
+
+Managed commands renew pinned entries before delivery and again when the artifact session exits.
+If final renewal fails after response bytes were written, the command exits nonzero and reports
+the error on stderr. Consumers must require a successful exit before using a returned path.
 
 ## Package boundaries
 
@@ -76,11 +80,14 @@ Reader algorithms return domain records; the public Library boundary formats cov
 
 ArtifactCache enters its private filesystem owner once and keeps all borrowed descriptors inside the
 session. Stages, pins and publication state belong to the transaction owner. Retention accounting
-never bypasses identity checks at deletion. Native scratch encloses every engine and iterator handle.
+passes known directory identities through deletion. Native scratch encloses every engine and iterator handle.
 
 Snapshot markers contain the captured file inventory and are limited to 64 MiB. If the generated
 marker exceeds this limit, capture fails before publication and removes its staging copy; the
 previous active snapshot remains available.
+
+Metadata readers classify excessive JSON nesting as invalid input. Annotated-PDF registry records
+use a stable, no-follow read capped at 1 MiB and preserve strict UTF-8 decoding.
 
 Capture statistics count planned source inputs. The final snapshot manifest describes the copied
 files after SQLite sidecar consolidation, so its file and byte totals can differ from those inputs.
@@ -88,6 +95,10 @@ files after SQLite sidecar consolidation, so its file and byte totals can differ
 See [refactor acceptance](architecture-refactor.md) for the reviewed scope and explicit changes to
 exceptional outcomes. Existing late registered-source mutation errors can leave an already-published
 output; publication does not provide rollback against a concurrent path replacement.
+Bundle publication pins its parent and reserved directory, links relative to that directory, and
+rolls back only entries with the identities it created. These checks reject observed replacements;
+the operating system does not make separate identity-check and unlink/rmdir calls atomic against
+arbitrary same-user mutation.
 
 ## Native and output limits
 
@@ -101,6 +112,12 @@ scope membership; moved or deleted items may remain diagnostic records without
 becoming reachable notes.
 
 Native rendering uses disposable scratch copied from a validated snapshot. Fresh engine options keep writes in scratch; copied `OPTIONS` files are not loaded. Byte-copy fallback is limited to 64 MiB per extraction. The RocksDB runtime is optional for the CLI, but required by the default native image layer; `GOODNOTES_ROCKSDB_LIBRARY` and `GOODNOTES_SCRATCH_DIR` select runtime and scratch paths.
+
+Native page decoding reserves decompressed bytes per framed block before expansion, including work
+in records that later fail to decode. Per-object and cumulative page limits remain distinct.
+PDF fallback revalidates attachment confinement at each read and invalidates changed PDF handles
+while retaining the session LRU. Completed snapshots must remain immutable; these checks do not
+promise protection against every concurrent replacement of a path or its ancestors.
 
 Observed support includes pen/highlighter records, filled paths, one ellipse form, variable-width pencil, one open-line form, and some linked PNG/JPEG images. Pencil texture is approximate. Unknown visibility, geometry, transforms, and records stay unknown or reduce coverage. A successful lookup with no page records reports `native-no-records-observed` / `no-native-records-observed` and warns that absence is unverified. Missing stores, runtime failures, and record-read errors remain errors. Generated tests do not prove Goodnotes compatibility or full rendering fidelity.
 

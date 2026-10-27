@@ -13,6 +13,11 @@ The runner requires `tests/journeys/test_study_journeys.py` and `tests/verificat
 
 This focused runner does not replace full tests, Ruff, or `ty` ([Contributing](../CONTRIBUTING.md)). CI runs generated journeys from source and an installed macOS wheel; its separate `goodnotes schema` smoke check is not a substitute. CI uses generated PDFs only.
 
+The test-only architecture comparator records timed-out cases as incomplete, including captured
+stdout/stderr decoded with UTF-8 replacement for invalid bytes. Matching timeouts cannot establish
+equivalence. Its exit status reports capture completion; inspect `comparison_state`,
+`incomplete_cases`, and completed-case differences before making a behavior-preservation claim.
+
 ## Receipt status and provenance
 
 | Status | Meaning |

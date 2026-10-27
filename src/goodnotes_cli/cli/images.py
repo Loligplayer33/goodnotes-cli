@@ -95,8 +95,10 @@ def render(
                 result = cached_render_pages(
                     lib.sandbox, [all_pages[number - 1]], cache, layer=layer, dpi=dpi
                 )[0]
-        else:
-            result = render_page(lib.sandbox, all_pages[number - 1], output, layer=layer, dpi=dpi)
+                cache.renew_leases()
+                emit(result, settings(ctx))
+            return
+        result = render_page(lib.sandbox, all_pages[number - 1], output, layer=layer, dpi=dpi)
         emit(result, settings(ctx))
 
 
@@ -195,12 +197,15 @@ def bundle(
                         max_chars,
                         source,
                     )
+                    if cfg.fields and "document_id" in {
+                        field.strip() for field in cfg.fields.split(",")
+                    }:
+                        response["document_id"] = item.id
+                    cache.renew_leases()
+                    emit(response, cfg)
             except NativeError as exc:
                 _bundle_native_remedy(exc)
                 raise
-            if cfg.fields and "document_id" in {field.strip() for field in cfg.fields.split(",")}:
-                response["document_id"] = item.id
-            emit(response, cfg)
             return
         destination = sandbox.ensure_output(output)
         parent_existed = destination.parent.exists()

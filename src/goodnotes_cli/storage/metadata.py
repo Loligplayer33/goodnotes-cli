@@ -15,7 +15,7 @@ SNAPSHOT_MARKER_LIMIT = 64 * 1024 * 1024
 CACHE_METADATA_LIMIT = 1024 * 1024
 
 
-def read_json(path: Path, *, limit: int) -> Any:
+def read_json(path: Path, *, limit: int, encoding: str | None = None) -> Any:
     """Read one stable, regular file without following the final component."""
     before = path.lstat()
     if not stat.S_ISREG(before.st_mode) or before.st_size > limit:
@@ -37,7 +37,10 @@ def read_json(path: Path, *, limit: int) -> Any:
             or stat_key(opened) != stat_key(after_path)
         ):
             raise ValueError("Metadata changed while reading or exceeds its limit.")
-        return json.loads(raw)
+        try:
+            return json.loads(raw.decode(encoding) if encoding is not None else raw)
+        except RecursionError as exc:
+            raise ValueError("Metadata JSON nesting exceeds the parser limit.") from exc
     finally:
         if fd >= 0:
             os.close(fd)

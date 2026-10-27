@@ -228,9 +228,9 @@ def test_page_hydration_queries_stay_bounded_for_500_pages_and_20_reads(
 
         before_reads = resolved_candidates.count(fallback_file)
         library.read_page("doc-hostile", 3, source="pdf")
-        assert resolved_candidates.count(fallback_file) == before_reads + 1
+        assert resolved_candidates.count(fallback_file) == before_reads + 2
         library.read_page("doc-hostile", 3, source="pdf")
-        assert resolved_candidates.count(fallback_file) == before_reads + 1
+        assert resolved_candidates.count(fallback_file) == before_reads + 4
 
 
 def test_metadata_navigation_does_not_open_fts(
@@ -1436,3 +1436,71 @@ def test_zero_budget_missing_attachment_ignores_working_directory(
         result = library.read_page("doc-hostile", 3, source="pdf", max_chars=0)
         assert not result.truncated
         assert any("mapped copied attachment is missing" in warning for warning in result.warnings)
+
+
+def test_pdf_replaced_between_public_reads_stays_confined_after_lru_eviction(
+    tmp_path: Path,
+) -> None:
+    sandbox = _create_snapshot(tmp_path / "snapshot", with_fts=False)
+    _add_repeated_fallback_pages(sandbox, 4)
+    outside = tmp_path / "outside.pdf"
+    _write_pdf(outside, "outside generated secret")
+    with sqlite3.connect(sandbox.projection_path) as connection:
+        for i in range(4):
+            attachment = f"generated-attachment-{i}"
+            name = f"generated-{i}.pdf"
+            _write_pdf(sandbox.attachments_dir / name, f"generated text {i}")
+            connection.execute("INSERT INTO attachments VALUES (?, ?)", (attachment, name))
+            connection.execute(
+                "UPDATE templates SET attachment_id = ? WHERE id = ?",
+                (attachment, f"batch-template-{i:04d}"),
+            )
+    with Library(sandbox) as library:
+        first = library.read_page("doc-hostile", 3, source="pdf")
+        assert any("fallback text" in part.text for part in first.parts)
+        target = sandbox.attachments_dir / "fallback.pdf"
+        target.unlink()
+        target.symlink_to(outside)
+        for page_number in range(4, 8):
+            library.read_page("doc-hostile", page_number, source="pdf")
+        result = library.read_page("doc-hostile", 3, source="pdf")
+        assert not any("outside generated secret" in part.text for part in result.parts)
+        assert any("outside the sandbox" in warning for warning in result.warnings)
+
+
+def test_cached_basename_match_is_revalidated_before_read(tmp_path: Path) -> None:
+    sandbox = _create_snapshot(tmp_path / "snapshot", with_fts=False)
+    outside = tmp_path / "outside.pdf"
+    _write_pdf(outside, "outside generated content")
+    with Library(sandbox) as library:
+        library._attachments.begin_read_cache()
+        path, state = library._attachments.resolve("old/location/fallback.pdf", for_read=True)
+        assert state == "available"
+        assert path == sandbox.attachments_dir / "fallback.pdf"
+        path.unlink()
+        path.symlink_to(outside)
+        assert library._attachments.resolve("old/location/fallback.pdf", for_read=True) == (
+            None,
+            "unsafe",
+        )
+
+
+def test_pdf_path_replaced_during_open_is_not_extracted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sandbox = _create_snapshot(tmp_path / "snapshot", with_fts=False)
+    outside = tmp_path / "outside.pdf"
+    _write_pdf(outside, "outside generated content")
+    target = sandbox.attachments_dir / "fallback.pdf"
+    actual_open = pymupdf.open
+
+    def replace_and_open(path: Path) -> pymupdf.Document:
+        target.unlink()
+        target.symlink_to(outside)
+        return actual_open(path)
+
+    monkeypatch.setattr(session_module, "_pymupdf", lambda: SimpleNamespace(open=replace_and_open))
+    with Library(sandbox) as library:
+        result = library.read_page("doc-hostile", 3, source="pdf")
+        assert not any("outside generated content" in part.text for part in result.parts)
+        assert any("could not be read" in warning for warning in result.warnings)

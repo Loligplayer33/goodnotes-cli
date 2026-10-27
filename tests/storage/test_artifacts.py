@@ -1099,3 +1099,175 @@ def test_marker_failure_preserves_unknown_directory_contents(
     with pytest.raises(GoodnotesError):
         with ArtifactCache(root, snapshot):
             pass
+
+
+@pytest.mark.parametrize("marker", ["root", "stage"])
+@pytest.mark.parametrize("failure", [OSError, KeyboardInterrupt])
+def test_marker_identity_failure_closes_and_allows_reopen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, marker: str, failure: type[BaseException]
+) -> None:
+    cache, root, snapshot = _make_cache(tmp_path)
+    if marker == "stage":
+        with cache:
+            pass
+    original_open, original_fstat = os.open, os.fstat
+    marker_fd: int | None = None
+    failed = False
+    name = ".goodnotes-artifacts.json" if marker == "root" else ".artifact-staging.json"
+
+    def record_open(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        nonlocal marker_fd
+        fd = original_open(path, flags, *args, **kwargs)
+        if Path(path).name == name and flags & os.O_EXCL:
+            marker_fd = fd
+        return fd
+
+    def fail_once(fd: int) -> os.stat_result:
+        nonlocal failed
+        if fd == marker_fd and not failed:
+            failed = True
+            raise failure("identity fault")
+        return original_fstat(fd)
+
+    with monkeypatch.context() as fault:
+        fault.setattr(os, "open", record_open)
+        fault.setattr(os, "fstat", fail_once)
+        with pytest.raises(failure, match="identity fault"):
+            with cache:
+                if marker == "stage":
+                    with cache.staging():
+                        pass
+    assert marker_fd is not None and failed
+    with pytest.raises(OSError) as error:
+        original_fstat(marker_fd)
+    assert error.value.errno == errno.EBADF
+    with ArtifactCache(root, snapshot) as reopened:
+        with reopened.staging():
+            pass
+
+
+@pytest.mark.parametrize("failure", ["stat", "interrupt", "owner"])
+def test_managed_directory_walker_closes_untransferred_descriptors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    cache, _, _ = _make_cache(tmp_path)
+    with cache:
+        fs = cache._fs
+        original_open, original_dup, original_fstat = os.open, os.dup, os.fstat
+        descriptors: list[int] = []
+
+        def dup(fd: int) -> int:
+            result = original_dup(fd)
+            descriptors.append(result)
+            return result
+
+        def open_child(*args: Any, **kwargs: Any) -> int:
+            result = original_open(*args, **kwargs)
+            descriptors.append(result)
+            return result
+
+        def fstat(fd: int) -> os.stat_result:
+            if len(descriptors) == 2 and fd == descriptors[-1] and failure != "owner":
+                if failure == "interrupt":
+                    raise KeyboardInterrupt("child fault")
+                raise OSError("child fault")
+            return original_fstat(fd)
+
+        def reject_owner(*args: Any, **kwargs: Any) -> None:
+            raise GoodnotesError("child fault")
+
+        with monkeypatch.context() as fault:
+            fault.setattr(os, "dup", dup)
+            fault.setattr(os, "open", open_child)
+            fault.setattr(os, "fstat", fstat)
+            if failure == "owner":
+                fault.setattr(fs, "_require_owner", reject_owner)
+            with pytest.raises((OSError, KeyboardInterrupt, GoodnotesError), match="child fault"):
+                fs._open_directory_fd(fs.entries)
+        assert len(descriptors) == 2
+        for fd in descriptors:
+            with pytest.raises(OSError) as error:
+                original_fstat(fd)
+            assert error.value.errno == errno.EBADF
+        fd = fs._open_directory_fd(fs.entries)
+        try:
+            assert stat.S_ISDIR(original_fstat(fd).st_mode)
+        finally:
+            os.close(fd)
+
+
+def test_eviction_preserves_replacement_after_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cache, _, _ = _make_cache(tmp_path)
+    key = "a" * 64
+    with cache:
+        path = _publish(cache, key, text=b"generated")
+        record = cache._records[key]
+        original = cache._metadata._read_entry
+
+        def replace_after_read(*args: Any, **kwargs: Any) -> Any:
+            result = original(*args, **kwargs)
+            path.rename(path.with_name("moved"))
+            path.mkdir(mode=0o700)
+            (path / "other").write_text("keep")
+            return result
+
+        with monkeypatch.context() as fault:
+            fault.setattr(cache._metadata, "_read_entry", replace_after_read)
+            with pytest.raises(GoodnotesError, match="changed"):
+                cache._remove_entry(record)
+        assert (path / "other").read_text() == "keep"
+        assert (path.with_name("moved") / "text.json").exists()
+        (path / "other").unlink()
+        path.rmdir()
+        path.with_name("moved").rename(path)
+
+
+def test_deep_artifact_metadata_has_classified_error(tmp_path: Path) -> None:
+    cache, _, _ = _make_cache(tmp_path)
+    with cache:
+        path = cache.root / "nested.json"
+        depth = 10_000
+        path.write_text("[" * depth + "]" * depth)
+        with pytest.raises(GoodnotesError, match="Generated metadata is invalid"):
+            cache._io._read_json_file(path, purpose="generated metadata")
+
+
+@pytest.mark.parametrize("replace", [False, True])
+def test_marker_identity_failure_preserves_unknown_or_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, replace: bool
+) -> None:
+    cache, _, _ = _make_cache(tmp_path)
+    with cache:
+        path = cache.root / "generated-marker.json"
+        original_open, original_fstat = os.open, os.fstat
+        descriptor: int | None = None
+
+        def record_open(name: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+            nonlocal descriptor
+            fd = original_open(name, flags, *args, **kwargs)
+            if Path(name).name == path.name:
+                descriptor = fd
+            return fd
+
+        def fail_stat(fd: int) -> os.stat_result:
+            if fd == descriptor:
+                if replace and not path.with_suffix(".old").exists():
+                    path.rename(path.with_suffix(".old"))
+                    path.write_text("replacement")
+                    raise OSError("identity fault")
+                if not replace:
+                    raise OSError("identity fault")
+            return original_fstat(fd)
+
+        with monkeypatch.context() as fault:
+            fault.setattr(os, "open", record_open)
+            fault.setattr(os, "fstat", fail_stat)
+            with pytest.raises(OSError, match="identity fault"):
+                cache._io._write_json_exclusive(path, {}, mode=0o600)
+        assert descriptor is not None
+        with pytest.raises(OSError) as error:
+            original_fstat(descriptor)
+        assert error.value.errno == errno.EBADF
+        assert path.read_text() == ("replacement" if replace else "")

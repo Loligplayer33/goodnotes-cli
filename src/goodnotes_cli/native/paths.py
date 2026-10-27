@@ -138,9 +138,7 @@ def _decode_native_path(body: Message, budget: _DecodeBudget) -> NativePath:
     # without using them to invent additional centerline geometry.
     for raw in [*sample_metadata, *segment_metadata]:
         _tpl_float(raw, label="path sample metadata")
-    if circle_variant and _tpl_float(sample_metadata[2], label="path sample radius") <= 0:
-        raise ValueError("Invalid native path sample radius")
-    if ellipse_variant and _tpl_float(sample_metadata[2], label="path sample radius") <= 0:
+    if _tpl_float(sample_metadata[2], label="path sample radius") <= 0:
         raise ValueError("Invalid native path sample radius")
 
     move_index = cubic_index = arc_index = command_index = 0

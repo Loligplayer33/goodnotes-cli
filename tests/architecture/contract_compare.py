@@ -457,13 +457,19 @@ def _run_case(
             "source_unchanged": source_unchanged,
         }
     except subprocess.TimeoutExpired as exc:
+        stdout = (
+            exc.stdout.decode("utf-8", "replace") if isinstance(exc.stdout, bytes) else exc.stdout
+        )
+        stderr = (
+            exc.stderr.decode("utf-8", "replace") if isinstance(exc.stderr, bytes) else exc.stderr
+        )
         return {
             "command": _normalise(arguments, run_root, output),
             "verbose": verbose,
             "fields": fields,
             "timeout": True,
-            "stdout": _normalise(exc.stdout or "", run_root, output),
-            "stderr": _normalise(exc.stderr or "", run_root, output),
+            "stdout": _normalise(stdout or "", run_root, output),
+            "stderr": _normalise(stderr or "", run_root, output),
         }
 
 
@@ -901,10 +907,14 @@ def main() -> int:
             encoding="utf-8",
         )
     if args.capture != "both":
+        incomplete_cases = sorted(
+            key for key, record in results[labels[0]]["records"].items() if record.get("timeout")
+        )
         summary = {
             "capture_complete": True,
             "captured": list(labels),
             "comparison_state": "not_compared",
+            "incomplete_cases": incomplete_cases,
             "exit_status_policy": "capture-completion-only",
             "verified_baseline": baseline_provenance,
             "receipt": str(receipt_path),
@@ -919,6 +929,13 @@ def main() -> int:
     baseline_records = results["baseline"]["records"]
     candidate_records = results["candidate"]["records"]
     keys = sorted(set(baseline_records) | set(candidate_records))
+    incomplete_cases = [
+        key
+        for key in keys
+        if baseline_records.get(key, {}).get("timeout")
+        or candidate_records.get(key, {}).get("timeout")
+    ]
+    incomplete_set = set(incomplete_cases)
     differences = [
         {
             "case": key,
@@ -928,11 +945,17 @@ def main() -> int:
             "candidate": candidate_records.get(key),
         }
         for key in keys
-        if baseline_records.get(key) != candidate_records.get(key)
+        if key not in incomplete_set and baseline_records.get(key) != candidate_records.get(key)
     ]
     summary = {
         "capture_complete": True,
-        "comparison_state": "equivalent" if not differences else "differences_require_review",
+        "comparison_state": (
+            "incomplete"
+            if incomplete_cases
+            else "differences_require_review"
+            if differences
+            else "equivalent"
+        ),
         "exit_status_policy": "capture-completion-only",
         "verified_baseline": baseline_provenance,
         "baseline_command_count": len(results["baseline"]["commands"]),
@@ -941,6 +964,8 @@ def main() -> int:
         "candidate_case_count": len(candidate_records),
         "difference_count": len(differences),
         "differences": differences,
+        "incomplete_case_count": len(incomplete_cases),
+        "incomplete_cases": incomplete_cases,
     }
     (output / "diff.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n",

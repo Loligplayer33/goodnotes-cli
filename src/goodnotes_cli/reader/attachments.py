@@ -14,22 +14,18 @@ class AttachmentResolver:
 
     def clear(self) -> None:
         self._attachment_resolution_cache: dict[str, tuple[Path | None, str]] = {}
-        self._pdf_attachment_resolution_cache: dict[str, tuple[Path | None, str]] | None = None
         self._attachment_basename_cache: dict[str, list[Path]] | None = None
 
     def begin_read_cache(self) -> None:
-        if self._pdf_attachment_resolution_cache is None:
-            self._pdf_attachment_resolution_cache = {}
+        self._attachment_basename_cache = None
 
     def resolve(self, raw_path: Any, *, for_read: bool = False) -> tuple[Path | None, str]:
         """Resolve one stored reference, memoized within its pinned snapshot view.
 
         Metadata hydration reuses results for repeated attachment references. A PDF
-        read uses a separate operation cache so the path is revalidated before it opens.
+        read revalidates the path before opening and using the PDF.
         """
-        cache = (
-            self._pdf_attachment_resolution_cache if for_read else self._attachment_resolution_cache
-        )
+        cache = None if for_read else self._attachment_resolution_cache
         if isinstance(raw_path, str) and cache is not None:
             cached = cache.get(raw_path)
             if cached is not None:
@@ -73,7 +69,13 @@ class AttachmentResolver:
                 return resolved, "available"
         matches = self._attachment_paths_by_basename().get(stored_path.name, [])
         if len(matches) == 1:
-            return matches[0], "available"
+            try:
+                resolved = resolve_confined_file(root, matches[0])
+            except GoodnotesError:
+                return None, "unsafe"
+            except OSError:
+                return None, "unavailable"
+            return (resolved, "available") if resolved is not None else (None, "missing")
         return None, "ambiguous" if matches else "missing"
 
     def _attachment_paths_by_basename(self) -> dict[str, list[Path]]:

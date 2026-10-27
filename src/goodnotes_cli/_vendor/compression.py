@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import struct
+from collections.abc import Callable
 
 _MAX_OUTPUT = 16 * 1024 * 1024
 
@@ -84,11 +85,14 @@ def _decode_lz4_block(source: bytes, expected_size: int, dictionary: bytes) -> b
     return bytes(output)
 
 
-def decode_apple_lz4(data: bytes, *, max_output: int = _MAX_OUTPUT) -> tuple[bytes, int]:
+def decode_apple_lz4(
+    data: bytes, *, max_output: int = _MAX_OUTPUT, charge_block: Callable[[int], None] | None = None
+) -> tuple[bytes, int]:
     """Decode an Apple framed LZ4 payload and return (output, bytes_consumed).
 
     The frame is a sequence of explicit ``bv41`` compressed or ``bv4-`` stored
     blocks, terminated by ``bv4$``. This is a format decoder, not float scanning.
+    If supplied, ``charge_block`` reserves declared output bytes before expansion.
     """
     output = bytearray()
     position = 0
@@ -115,6 +119,8 @@ def decode_apple_lz4(data: bytes, *, max_output: int = _MAX_OUTPUT) -> tuple[byt
             raise CompressionError("Apple LZ4 output exceeds the decompression budget")
         if position + stored_size > len(data):
             raise CompressionError("truncated Apple LZ4 block")
+        if charge_block is not None:
+            charge_block(uncompressed_size)
         block = data[position : position + stored_size]
         position += stored_size
         if magic == b"bv4-":

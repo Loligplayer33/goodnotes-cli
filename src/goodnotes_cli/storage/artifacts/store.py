@@ -88,7 +88,7 @@ class ArtifactCache:
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
         try:
-            self._renew_leases()
+            self.renew_leases()
         except GoodnotesError:
             if exc_type is None:
                 raise
@@ -163,7 +163,7 @@ class ArtifactCache:
                 if (current.st_dev, current.st_ino) != identity:
                     raise GoodnotesError(f"Artifact staging directory changed: {stage}")
                 self._io._verify_staging_marker(stage, kind="staging", token=token)
-                self._fs._safe_remove_tree(stage)
+                self._fs._safe_remove_tree(stage, expected_identity=identity)
                 self._cleanup_orphan_blobs(self._records)
 
     def _initialize_staging_directory(
@@ -289,7 +289,7 @@ class ArtifactCache:
             finally:
                 os.close(entries_fd)
             self._io._verify_staging_marker(publish_dir, kind="publishing", token=token)
-            self._fs._safe_remove_tree(publish_dir)
+            self._fs._safe_remove_tree(publish_dir, expected_identity=publish_identity)
         except BaseException:
             if publish_dir.exists() or publish_dir.is_symlink():
                 current = self._fs._directory(publish_dir, purpose="artifact publish directory")
@@ -298,7 +298,7 @@ class ArtifactCache:
                         f"Artifact publish directory changed: {publish_dir}"
                     ) from None
                 self._io._verify_staging_marker(publish_dir, kind="publishing", token=token)
-                self._fs._safe_remove_tree(publish_dir)
+                self._fs._safe_remove_tree(publish_dir, expected_identity=publish_identity)
             try:
                 self._cleanup_orphan_blobs(self._records)
             except GoodnotesError:
@@ -322,7 +322,8 @@ class ArtifactCache:
             raise RuntimeError("ArtifactCache must be used inside a context manager")
         self._fs._verify_managed_directories()
 
-    def _renew_leases(self) -> None:
+    def renew_leases(self) -> None:
+        """Renew pinned results without releasing the session's artifact lock."""
         if self._fs._lock_fd is None or not self._pinned_keys:
             return
         self._fs._verify_managed_directories()
@@ -456,9 +457,9 @@ class ArtifactCache:
                 token, kind = publish_match.group(1), "publishing"
             if stat.S_ISLNK(entry.stat(follow_symlinks=False).st_mode):
                 raise GoodnotesError(f"Artifact staging path must not be a symlink: {path}")
-            self._fs._directory(path, purpose="artifact staging directory")
+            info = self._fs._directory(path, purpose="artifact staging directory")
             self._io._verify_staging_marker(path, kind=kind, token=token)
-            self._fs._safe_remove_tree(path)
+            self._fs._safe_remove_tree(path, expected_identity=self._fs._identity(info))
 
     def _make_room(
         self,
@@ -513,7 +514,7 @@ class ArtifactCache:
             verify_blobs=False,
             verify_files=False,
         )
-        self._fs._safe_remove_tree(record.directory)
+        self._fs._safe_remove_tree(record.directory, expected_identity=record.directory_identity)
         self._records.pop(record.key, None)
 
     def _cleanup_orphan_blobs(self, records: Mapping[str, _EntryRecord]) -> None:

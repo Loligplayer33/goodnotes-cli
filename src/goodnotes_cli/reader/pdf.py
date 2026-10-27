@@ -8,6 +8,7 @@ from typing import Any
 
 from ..errors import GoodnotesError
 from ..models import Item, Page, PageRef, SearchHit, TextPart
+from ..storage.paths import stat_key
 from . import bounded, index
 from . import text as text_index
 from .attachments import AttachmentResolver
@@ -225,13 +226,23 @@ class PdfTextReader:
                 return None, "The mapped copied attachment is missing from the sandbox.", False
             return None, "The copied PDF attachment is unavailable.", False
         try:
-            if safe_path.stat().st_size > _MAX_PDF_FALLBACK_BYTES:
+            expected = safe_path.stat()
+            if expected.st_size > _MAX_PDF_FALLBACK_BYTES:
                 return (
                     None,
                     "The copied PDF attachment exceeds the safe extraction size limit.",
                     False,
                 )
             with self._session.pdf_document(safe_path) as pdf:
+                checked_path, checked_status = self._attachments.resolve(
+                    page.attachment_path, for_read=True
+                )
+                if (
+                    checked_status != "available"
+                    or checked_path != safe_path
+                    or stat_key(safe_path.stat()) != stat_key(expected)
+                ):
+                    raise OSError("PDF attachment changed while opening")
                 if page.pdf_page > pdf.page_count:
                     return None, "The mapped PDF page is outside the copied attachment.", False
                 text = pdf.load_page(page.pdf_page - 1).get_text("text").strip()

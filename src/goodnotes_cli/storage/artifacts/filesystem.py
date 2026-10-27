@@ -433,18 +433,21 @@ class ArtifactFilesystem:
                     raise GoodnotesError(
                         f"Could not safely open artifact directory: {path}"
                     ) from exc
-                info = os.fstat(child)
-                if not stat.S_ISDIR(info.st_mode):
+                try:
+                    info = os.fstat(child)
+                    if not stat.S_ISDIR(info.st_mode):
+                        raise GoodnotesError(f"Artifact path component is not a directory: {path}")
+                    expected = self._managed_directory_identities.get(part)
+                    if expected is not None and self._identity(info) != expected:
+                        raise GoodnotesError(
+                            f"Managed artifact directory changed: {self.root / part}"
+                        )
+                    self._require_owner(info, purpose="artifact directory")
+                    if info.st_mode & 0o077:
+                        raise GoodnotesError(f"Artifact directory is not private: {path}")
+                except BaseException:
                     os.close(child)
-                    raise GoodnotesError(f"Artifact path component is not a directory: {path}")
-                expected = self._managed_directory_identities.get(part)
-                if expected is not None and self._identity(info) != expected:
-                    os.close(child)
-                    raise GoodnotesError(f"Managed artifact directory changed: {self.root / part}")
-                self._require_owner(info, purpose="artifact directory")
-                if info.st_mode & 0o077:
-                    os.close(child)
-                    raise GoodnotesError(f"Artifact directory is not private: {path}")
+                    raise
                 os.close(descriptor)
                 descriptor = child
             return descriptor
@@ -475,10 +478,12 @@ class ArtifactFilesystem:
             if exc.errno not in (errno.ENOTEMPTY, errno.EEXIST):
                 raise
 
-    def _safe_remove_tree(self, path: Path) -> None:
+    def _safe_remove_tree(
+        self, path: Path, *, expected_identity: tuple[int, int] | None = None
+    ) -> None:
         parent_fd = self._open_directory_fd(path.parent)
         try:
-            _remove_entry_at(parent_fd, path.name, path)
+            _remove_entry_at(parent_fd, path.name, path, expected_identity=expected_identity)
         finally:
             os.close(parent_fd)
 

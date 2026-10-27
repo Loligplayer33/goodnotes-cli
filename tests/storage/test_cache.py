@@ -32,7 +32,7 @@ from goodnotes_cli.errors import (
 )
 from goodnotes_cli.safety import Sandbox
 from goodnotes_cli.snapshot import _InventoryChanged
-from tests.support.library import make_library
+from tests.support.library import _create_snapshot, make_library
 
 
 def active_pointer(data_dir: Path) -> dict[str, Any]:
@@ -86,6 +86,50 @@ def test_refresh_skips_capture_when_source_inventory_is_unchanged(
     assert stats["source_captured_files"] == stats["source_captured_bytes"] == 0
     assert stats["cache_reused_files"] == stats["cache_reused_bytes"] == 0
     assert stats["source_bytes_hashed"] == stats["byte_copied_bytes"] == 0
+
+
+@pytest.mark.parametrize("force", [False, True])
+def test_nested_stale_marker_cannot_abort_refresh_after_publication(
+    tmp_path: Path, force: bool
+) -> None:
+    source = make_library(tmp_path / "source")
+    data_dir = tmp_path / "cache"
+    first = cache_module.refresh_cache(source, data_dir)
+    stale = data_dir / "snapshots" / "20000101T000000Z-00000000"
+    stale.mkdir()
+    marker = stale / "goodnotes-snapshot.json"
+    nested = b"[" * 10_000 + b"0" + b"]" * 10_000
+    marker.write_bytes(nested)
+
+    second = cache_module.refresh_cache(source, data_dir, force=force)
+
+    assert second["status"] == ("ready" if force else "unchanged")
+    assert active_pointer(data_dir)["snapshot_id"] == second["snapshot_id"]
+    assert Path(str(second["snapshot"])).is_dir()
+    if not force:
+        assert second["snapshot_id"] == first["snapshot_id"]
+    # Invalid metadata cannot establish ownership for automatic deletion.
+    assert marker.read_bytes() == nested
+
+
+@pytest.mark.parametrize("record", ["snapshot", "pointer"])
+def test_nested_cache_metadata_has_a_classified_failure(tmp_path: Path, record: str) -> None:
+    snapshot = _create_snapshot(tmp_path / "snapshot").root
+    data_dir = tmp_path / "cache"
+    data_dir.mkdir()
+    (data_dir / "snapshots").mkdir()
+    path = (
+        snapshot / "goodnotes-snapshot.json" if record == "snapshot" else data_dir / "active.json"
+    )
+    path.write_bytes(b"[" * 10_000 + b"0" + b"]" * 10_000)
+
+    if record == "snapshot":
+        with pytest.raises(GoodnotesError, match="marker is unreadable"):
+            Sandbox.load(snapshot)
+    else:
+        with pytest.raises(CacheAccessError) as error:
+            Settings(data_dir=data_dir).load_sandbox()
+        assert error.value.code == "cache_invalid"
 
 
 def test_missing_source_library_root_is_a_structured_input_error(tmp_path: Path) -> None:

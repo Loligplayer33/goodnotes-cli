@@ -178,3 +178,29 @@ are successful. Review CI through check runs or the workflow itself, pinned to t
 Installed-target receipts verify an external package origin and matching source/package fingerprints;
 the fixture harness may import repository helpers. Local independent agent reviews assess behavior
 and ownership; they do not constitute a GitHub approval review or human sign-off.
+
+## Deeper review follow-up
+
+The next function and cross-owner review identified eleven issues, seven inherited from main and
+four introduced during the refactor, plus a confinement-cache hardening case. The fixes stay within
+the existing owners and preserve successful output and format support.
+
+| Findings | Change |
+| --- | --- |
+| R01–R03 | Guard metadata and directory descriptor acquisition; retain the original error, close owned descriptors, and pass known directory identity through artifact removal. Unknown or replaced entries remain untouched. |
+| R04 | Pin the reserved bundle directory and parent, publish with descriptor-relative links, and roll back only matching owned entries. The manifest remains last. |
+| R05 | Charge each framed decompression block before expansion, so malformed later blocks cannot discard work from the page budget. |
+| R06 | Classify excessive metadata nesting and use a bounded, stable, strict UTF-8 annotated-PDF registry read. Missing records and access failures keep distinct handling. |
+| R07–R08 | Validate the page-number scope once per search, retain mutable-scope invalidation, and skip foreign-root documents before validating their page IDs. |
+| R09 | Hold artifact protection through response emission, with renewal before delivery and at session exit. A late renewal failure makes the command fail even if bytes were already delivered. |
+| R10–R11 | Serialize captured timeout bytes and label incomplete comparisons separately from completed-case differences. |
+| H01 | Revalidate attachment confinement and cached basename matches on PDF reads; invalidate changed PDF handles without eagerly loading whole files or discarding the session LRU. |
+
+The changes reuse the existing file-signature and SQL-budget helpers and combine identical native
+path radius checks. No production module, dependency, native schema, cache indexing subsystem, or
+new aggregate store-size policy is added. Generated regressions cover the reported transitions;
+the source Library remains outside development tests.
+
+Same-user filesystem mutation remains a qualified limit: identity checks do not make separate
+stat/unlink operations atomic. PDF reads continue to rely on immutable completed snapshots. These
+are targeted failures that can be rejected, not a new general tamper-proof storage contract.

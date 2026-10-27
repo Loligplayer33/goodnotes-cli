@@ -527,6 +527,60 @@ def test_aggregate_point_budget_is_enforced_across_objects(monkeypatch: pytest.M
         decode_native_records(records, ROOT_ID)
 
 
+def _budget_test_records(payloads: list[bytes]) -> list[tuple[bytes, bytes]]:
+    records: list[tuple[bytes, bytes]] = []
+    for index, payload in enumerate(payloads):
+        logical_id = f"00000000-0000-0000-0000-{index + 1000:012d}"
+        storage_id = f"00000000-0000-0000-0000-{index + 2000:012d}"
+        body = field(1, logical_id.encode()) + field(2, payload)
+        records.extend(
+            native_records(
+                storage_id=storage_id, logical_id=logical_id, sequence=index + 1, body=body
+            )
+        )
+    return records
+
+
+def test_malformed_blocks_charge_page_budget_and_preserve_partial_coverage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Two valid blocks expand before an invalid next marker rejects each object.
+    block = framed(b"x" * 20, compressed=False)[:-4]
+    malformed = block + block + b"bad!"
+    valid = framed(tpl())
+    budget_class = records_module._DecodeBudget
+    total = 2 * 40 + len(tpl())
+    monkeypatch.setattr(object_module, "_DecodeBudget", lambda: budget_class(bytes_left=total))
+    objects, metadata = decode_native_objects(
+        _budget_test_records([malformed, valid, malformed]), ROOT_ID
+    )
+    assert len(objects) == 1
+    assert metadata["unsupported_objects"] == 2
+    assert metadata["coverage"] == "partial"
+
+    monkeypatch.setattr(object_module, "_DecodeBudget", lambda: budget_class(bytes_left=total - 1))
+    with pytest.raises(NativeError, match="decompressed-byte or point budget"):
+        decode_native_objects(_budget_test_records([malformed, valid, malformed]), ROOT_ID)
+
+
+def test_valid_multiple_objects_charge_each_block_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    data = tpl()
+    split = len(data) // 2
+    frame = framed(data[:split], compressed=False)[:-4] + framed(data[split:])
+    budget_class = records_module._DecodeBudget
+    monkeypatch.setattr(
+        object_module, "_DecodeBudget", lambda: budget_class(bytes_left=2 * len(data))
+    )
+    objects, metadata = decode_native_objects(_budget_test_records([frame, frame]), ROOT_ID)
+    assert len(objects) == 2
+    assert metadata["unsupported_objects"] == 0
+    monkeypatch.setattr(
+        object_module, "_DecodeBudget", lambda: budget_class(bytes_left=2 * len(data) - 1)
+    )
+    with pytest.raises(NativeError, match="decompressed-byte or point budget"):
+        decode_native_objects(_budget_test_records([frame, frame]), ROOT_ID)
+
+
 def test_long_native_segment_is_preserved_instead_of_split_into_dots() -> None:
     body = decode_message(field(2, framed(tpl(points=[(10.0, 20.0), (500.0, 20.0)]))))
     inks = decode_ink(body)

@@ -433,6 +433,12 @@ class PageReader:
         assert self._page_numbers is not None
         return self._page_numbers.get((document_id, page_id))
 
+    def page_numbers(self, notebook_ids: set[str]) -> dict[tuple[str, str], int]:
+        """Validate the scope once and return its page number mapping."""
+        self._ensure_page_numbers(notebook_ids)
+        assert self._page_numbers is not None
+        return self._page_numbers
+
     def page_numbers_by_id(self, notebook_ids: set[str]) -> dict[str, int]:
         """Return active page ids for checking page-index metadata consistency."""
         self._ensure_page_numbers(notebook_ids)
@@ -453,10 +459,10 @@ class PageReader:
             ORDER BY document_id, position, id
             """
         ):
-            page_id = self._required_text(row["id"], "pages.id")
             document_id = self._required_text(row["document_id"], "pages.document_id")
             if document_id not in notebook_ids:
                 continue
+            page_id = self._required_text(row["id"], "pages.id")
             number = counts.get(document_id, 0) + 1
             counts[document_id] = number
             page_numbers[(document_id, page_id)] = number

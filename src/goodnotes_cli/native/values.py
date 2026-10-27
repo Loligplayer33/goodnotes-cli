@@ -98,12 +98,11 @@ def _decode_tpl_payload(
     payload = cast(bytes, _one(body, 2, bytes))
     if not payload.startswith((b"bv41", b"bv4-")):
         raise ValueError("Unsupported native annotation compression")
-    if budget.bytes_left <= 0:
-        budget.charge(byte_count=1)
     decompressed, consumed = decode_apple_lz4(
-        payload, max_output=min(4 * 1024 * 1024, budget.bytes_left)
+        payload,
+        max_output=4 * 1024 * 1024,
+        charge_block=lambda size: budget.charge(byte_count=size),
     )
-    budget.charge(byte_count=len(decompressed))
     if consumed != len(payload):
         raise ValueError("Unconsumed compressed native annotation bytes")
     format_end = decompressed.find(b"\0", 8, 256)

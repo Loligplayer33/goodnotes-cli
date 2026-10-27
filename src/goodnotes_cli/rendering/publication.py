@@ -38,24 +38,69 @@ def _publish_new_file(
         temporary.unlink(missing_ok=True)
 
 
+def _identity(info: os.stat_result) -> tuple[int, int]:
+    return info.st_dev, info.st_ino
+
+
 def publish_bundle(temporary: Path, destination: Path) -> None:
-    """Reserve the output directory and publish each file without replacing existing data."""
-    destination.mkdir(mode=0o700)
-    published: list[Path] = []
+    """Publish into the reserved directory and remove only entries we created on failure."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    parent_fd = os.open(destination.parent, flags)
+    directory_fd = -1
+    directory_identity: tuple[int, int] | None = None
+    published: list[tuple[str, tuple[int, int]]] = []
+    reserved = False
     try:
-        # Publish the manifest last; it describes the completed bundle.
+        parent_identity = _identity(os.fstat(parent_fd))
+        os.mkdir(destination.name, mode=0o700, dir_fd=parent_fd)
+        reserved = True
+        directory_identity = _identity(
+            os.stat(destination.name, dir_fd=parent_fd, follow_symlinks=False)
+        )
+        directory_fd = os.open(
+            destination.name, flags | getattr(os, "O_NOFOLLOW", 0), dir_fd=parent_fd
+        )
+        if _identity(os.fstat(directory_fd)) != directory_identity:
+            raise GoodnotesError("The bundle output directory changed during publication.")
         files = sorted(temporary.iterdir(), key=lambda path: path.name == "text.json")
         for source in files:
-            target = destination / source.name
-            os.link(source, target)
-            published.append(target)
+            identity = _identity(source.lstat())
+            os.link(source, source.name, dst_dir_fd=directory_fd, follow_symlinks=False)
+            published.append((source.name, identity))
+        if (
+            _identity(os.stat(destination.name, dir_fd=parent_fd, follow_symlinks=False))
+            != directory_identity
+        ):
+            raise GoodnotesError("The bundle output directory changed during publication.")
+        if _identity(destination.parent.stat()) != parent_identity:
+            raise GoodnotesError("The bundle output parent changed during publication.")
+        for name, identity in published:
+            if _identity(os.stat(name, dir_fd=directory_fd, follow_symlinks=False)) != identity:
+                raise GoodnotesError("A bundle output file changed during publication.")
     except BaseException:
-        for path in published:
-            path.unlink(missing_ok=True)
-        try:
-            destination.rmdir()
-        except OSError:
-            pass
+        if directory_fd >= 0:
+            for name, identity in published:
+                try:
+                    if (
+                        _identity(os.stat(name, dir_fd=directory_fd, follow_symlinks=False))
+                        == identity
+                    ):
+                        os.unlink(name, dir_fd=directory_fd)
+                except OSError:
+                    pass
+        if directory_identity is not None:
+            try:
+                if (
+                    _identity(os.stat(destination.name, dir_fd=parent_fd, follow_symlinks=False))
+                    == directory_identity
+                ):
+                    os.rmdir(destination.name, dir_fd=parent_fd)
+            except OSError:
+                pass
         raise
     finally:
-        shutil.rmtree(temporary, ignore_errors=True)
+        if directory_fd >= 0:
+            os.close(directory_fd)
+        os.close(parent_fd)
+        if reserved:
+            shutil.rmtree(temporary, ignore_errors=True)

@@ -15,7 +15,9 @@ import pymupdf as fitz
 
 from ..errors import FilesystemAccessError, GoodnotesError
 from ..models import Page
+from ..storage.metadata import CACHE_METADATA_LIMIT, read_json
 from ..storage.paths import _require_not_production
+from ..storage.paths import stat_key as _file_signature
 from ..storage.sandbox import open_database
 from .types import SandboxProtocol
 
@@ -230,17 +232,20 @@ def _validate_document_id(document_id: str) -> None:
 
 def _read_registry(path: Path, document_id: str) -> dict[str, object] | None:
     try:
-        info = path.lstat()
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            return None
         if not stat.S_ISREG(info.st_mode):
             raise GoodnotesError("The annotated-PDF record must be a regular file.")
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return None
+        raw = read_json(path, limit=CACHE_METADATA_LIMIT, encoding="utf-8")
+        if _file_signature(info) != _file_signature(path.lstat()):
+            raise ValueError("The annotated-PDF record changed while reading.")
     except OSError as exc:
         raise FilesystemAccessError.from_exception(
             exc, operation="read_annotated_pdf_record", path=path, kind="source"
         ) from exc
-    except json.JSONDecodeError as exc:
+    except ValueError as exc:
         raise GoodnotesError(f"Could not read the annotated-PDF record: {exc}") from exc
     if (
         not isinstance(raw, dict)
@@ -410,14 +415,3 @@ def _sha256_stable(path: Path) -> tuple[str, os.stat_result]:
         if descriptor >= 0:
             os.close(descriptor)
     return digest.hexdigest(), after_fd
-
-
-def _file_signature(info: os.stat_result) -> tuple[int, int, int, int, int, int]:
-    return (
-        info.st_dev,
-        info.st_ino,
-        info.st_mode,
-        info.st_size,
-        info.st_mtime_ns,
-        info.st_ctime_ns,
-    )

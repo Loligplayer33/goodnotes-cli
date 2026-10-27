@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ..errors import GoodnotesError
+from ..storage.paths import stat_key
 from ..storage.sandbox import open_database
 from .index import SchemaCache, table_columns, table_exists
 
@@ -32,20 +33,28 @@ class _PDFDocumentCache:
     def __init__(self, maximum: int = _MAX_OPEN_PDFS) -> None:
         self.maximum = maximum
         self.documents: OrderedDict[Path, Any] = OrderedDict()
+        self.identities: dict[Path, tuple[int, int, int, int, int, int]] = {}
 
     def get(self, path: Path) -> Any:
+        identity = stat_key(path.stat())
         document = self.documents.pop(path, None)
+        if document is not None and identity != self.identities.get(path):
+            document.close()
+            document = None
         if document is None:
             document = _pymupdf().open(path)
+        self.identities[path] = identity
         self.documents[path] = document
         while len(self.documents) > self.maximum:
-            _, evicted = self.documents.popitem(last=False)
+            evicted_path, evicted = self.documents.popitem(last=False)
+            self.identities.pop(evicted_path, None)
             evicted.close()
         return document
 
     def close(self) -> None:
         documents = list(reversed(self.documents.values()))
         self.documents.clear()
+        self.identities.clear()
         first_error: BaseException | None = None
         for document in documents:
             try:

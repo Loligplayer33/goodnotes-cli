@@ -93,7 +93,7 @@ class ArtifactIO:
                 raise GoodnotesError(f"{purpose.capitalize()} changed while being read: {path}")
             try:
                 return json.loads(data.decode("utf-8")), after
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
                 raise GoodnotesError(f"{purpose.capitalize()} is invalid: {path}") from exc
         finally:
             os.close(descriptor)
@@ -120,8 +120,9 @@ class ArtifactIO:
             )
         except OSError as exc:
             raise GoodnotesError(f"Could not create artifact metadata file: {path}") from exc
-        created_identity = self._fs._identity(os.fstat(descriptor))
+        created_identity = None
         try:
+            created_identity = self._fs._identity(os.fstat(descriptor))
             view = memoryview(encoded)
             while view:
                 written = os.write(descriptor, view)
@@ -129,18 +130,20 @@ class ArtifactIO:
             os.fchmod(descriptor, mode)
             os.fsync(descriptor)
         except BaseException:
-            os.close(descriptor)
             try:
+                if created_identity is None:
+                    created_identity = self._fs._identity(os.fstat(descriptor))
                 current = path.lstat() if dir_fd is None else self._fs._stat_at(dir_fd, path.name)
                 if current is not None and self._fs._identity(current) == created_identity:
                     if dir_fd is None:
                         path.unlink()
                     else:
                         os.unlink(path.name, dir_fd=dir_fd)
-            except OSError:
+            except BaseException:
                 pass
             raise
-        os.close(descriptor)
+        finally:
+            os.close(descriptor)
         return encoded
 
     @staticmethod
