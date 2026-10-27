@@ -81,15 +81,12 @@ def publish_bundle(
         files = sorted(os.listdir(source_fd), key=lambda name: name == "text.json")
         for name in files:
             identity = _identity(os.stat(name, dir_fd=source_fd, follow_symlinks=False))
+            os.link(
+                name, name, src_dir_fd=source_fd, dst_dir_fd=directory_fd, follow_symlinks=False
+            )
+            # An interrupted syscall has an unknown outcome. Only confirmed links
+            # belong to rollback, even if an uncertain entry matches the source inode.
             published.append((name, identity))
-            try:
-                os.link(
-                    name, name, src_dir_fd=source_fd, dst_dir_fd=directory_fd, follow_symlinks=False
-                )
-            except OSError:
-                # A failed no-overwrite link did not install an entry we own.
-                published.pop()
-                raise
         if (
             _identity(os.stat(destination.name, dir_fd=parent_fd, follow_symlinks=False))
             != directory_identity

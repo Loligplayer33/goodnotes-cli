@@ -136,21 +136,52 @@ def test_replaced_destination_rejected_before_success(
     assert not list(moved.iterdir())
 
 
-def test_interrupt_after_link_rolls_back_pending_entry(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("foreign", [False, True])
+def test_interrupted_link_preserves_uncertain_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, foreign: bool
 ) -> None:
     source = _sources(tmp_path)
     destination = tmp_path / "bundle"
     link = os.link
 
     def interrupted(*args: Any, **kwargs: Any) -> None:
-        link(*args, **kwargs)
+        if foreign:
+            # The operation cannot distinguish this collision from its own
+            # successful syscall followed by interruption before returning.
+            link(source / "page.png", destination / "page.png")
+        else:
+            link(*args, **kwargs)
         raise KeyboardInterrupt
 
     monkeypatch.setattr(os, "link", interrupted)
     with pytest.raises(KeyboardInterrupt):
         publish_bundle(source, destination)
-    assert not destination.exists()
+    assert (destination / "page.png").read_bytes() == b"image"
+    assert not (destination / "text.json").exists()
+    assert not source.exists()
+
+
+def test_interruption_rolls_back_confirmed_links_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _sources(tmp_path)
+    (source / "second.png").write_bytes(b"second image")
+    destination = tmp_path / "bundle"
+    link = os.link
+    installed: list[str] = []
+
+    def interrupted(*args: Any, **kwargs: Any) -> None:
+        link(*args, **kwargs)
+        installed.append(args[0])
+        if len(installed) == 2:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(os, "link", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        publish_bundle(source, destination)
+    assert not (destination / installed[0]).exists()
+    assert (destination / installed[1]).exists()
+    assert not (destination / "text.json").exists()
     assert not source.exists()
 
 

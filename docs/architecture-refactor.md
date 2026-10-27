@@ -208,7 +208,10 @@ are targeted failures that can be rejected, not a new general tamper-proof stora
 Strict Sol review then caught a remaining pathname cleanup of bundle staging and an interrupt
 between a completed link and its bookkeeping. Staging now retains its original parent descriptor
 and identity through the CLI/publication handoff; source listing, linking and cleanup use pinned
-descriptors. Pending links are tracked before the syscall, with ordinary failed links excluded
-from rollback. Oversized numeric artifact timestamps are classified as invalid metadata. The
+descriptors. Review of the complementary pre-syscall interrupt showed that matching inode identity
+cannot establish ownership of an uncertain link. Rollback therefore includes only calls that
+returned successfully. Interrupted explicit output may remain and requires inspection before retry;
+preserving unknown entries takes precedence over complete cleanup. Oversized numeric artifact
+timestamps are classified as invalid metadata. The
 review's small maintainability suggestions also removed repeated attachment classification and
 paired the PDF handle and its signature in one LRU entry.

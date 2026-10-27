@@ -100,7 +100,9 @@ rolls back only entries with the identities it created. These checks reject obse
 the operating system does not make separate identity-check and unlink/rmdir calls atomic against
 arbitrary same-user mutation.
 Its staging parent and source directory remain pinned through handoff, including cleanup after
-render failure. An interrupt after a link completes retains the pending link for owned rollback.
+render failure. Rollback owns only links whose calls returned successfully. An interrupted link
+has an uncertain outcome and remains untouched, even if it matches the source inode. The command
+fails; inspect and explicitly remove incomplete output or choose a new destination before retrying.
 
 ## Native and output limits
 
