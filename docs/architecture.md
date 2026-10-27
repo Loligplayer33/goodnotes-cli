@@ -25,7 +25,7 @@ snapshot was created; with `status: unchanged`, the prior snapshot is reused, so
 
 If a WAL changes while the main database stat signature stays the same, capture may reuse its saved source digest but still copies and checks the current main file. It never reuses the prior consolidated database for a changed SQLite family.
 
-SQLite may accept only a committed WAL prefix. A checkpoint, backup, or integrity check cannot prove a torn or reset tail held no more edits. See [snapshot tests](../tests/test_snapshot.py).
+SQLite may accept only a committed WAL prefix. A checkpoint, backup, or integrity check cannot prove a torn or reset tail held no more edits. See [snapshot tests](../tests/storage/test_snapshot.py).
 
 ## Mutable paths, readers, and locks
 
@@ -54,16 +54,40 @@ Render reuse checks snapshot, background/native inputs, page, layer, DPI, and re
 
 ## Package boundaries
 
-| Packages | Own |
+| Modules | Own |
 | --- | --- |
-| `models`, `errors` | Shared records and expected CLI failures. |
-| `safety`, `snapshot`, `cache` | Path validation, independent capture, active pointers, locks, and pruning. |
-| `library`, `text_index` | Read-only database sessions, page/text mapping, source labels, and batched index queries. `library` owns connections and result mapping. |
-| `documents` | PDF backgrounds, rendering, export, and bundles. Bundle, render, and export default to the native layer; `background` is explicit. |
-| `annotations`, `native`, `native_assets`, `native_render` | Bounded decoders, disposable native-store reads, copied image validation, drawing, and coverage. |
-| `artifacts` | Generated-output retention, deduplication, leases, and cleanup; no database reads or fidelity decisions. |
+| `models`, `errors`, `config` | Shared public records, expected failures and immutable path/option selection. |
+| `cli`, `presentation` | Typer adapters and command metadata; output contracts, projection, serialization and recommendations. |
+| `library`, `reader` | Public Library facade; fresh per-open catalog, page, index, text, search, scope and coverage collaborators. ReaderSession owns SQL connections and the session PDF LRU. |
+| `storage.paths`, `storage.sandbox`, `storage.locks`, `storage.inventory` | Containment, immutable-copy validation, reader/writer lock rules and fast refresh metadata. |
+| `storage.capture` | Independently copied staging, content inventory, copied-only SQLite consolidation and snapshot publication. |
+| `storage.cache` | Active-pointer validation, refresh/read-view orchestration, generation pruning and lock lifetime. |
+| `storage.artifacts` | Generated-output transactions, retained records, leases and accounting. Its private filesystem owner holds descriptors and the artifact lock; helpers borrow them within the session. |
+| `native` | Optional ABI/runtime, disposable store reads, bounded values/ink/path/object decoding and copied-image/raster validation. |
+| `rendering` | Background and registered-PDF handles, native overlay/SVG, page rendering, managed cache, bundle, export and no-overwrite publication. |
 | `watch`, `diagnostics` | Metadata polling and access/runtime reporting without permission changes. |
-| `cli`, `output` | Command behavior and structured response formatting. |
+| `_vendor` | Attributed bounded wire, TPL and compression parsers. |
+
+A Library open creates fresh collaborators and one ReaderSession. The session closes PDFs before
+its index and projection connections; every PDF close is attempted even when one fails. Optional
+index initialization owns a provisional connection until schema and casefold setup succeed. Readers
+borrow PDF handles until Library closes. The caller's shared view lock encloses this full lifetime.
+Reader algorithms return domain records; the public Library boundary formats coverage recommendations.
+
+ArtifactCache enters its private filesystem owner once and keeps all borrowed descriptors inside the
+session. Stages, pins and publication state belong to the transaction owner. Retention accounting
+never bypasses identity checks at deletion. Native scratch encloses every engine and iterator handle.
+
+Snapshot markers contain the captured file inventory and are limited to 64 MiB. If the generated
+marker exceeds this limit, capture fails before publication and removes its staging copy; the
+previous active snapshot remains available.
+
+Capture statistics count planned source inputs. The final snapshot manifest describes the copied
+files after SQLite sidecar consolidation, so its file and byte totals can differ from those inputs.
+
+See [refactor acceptance](architecture-refactor.md) for the reviewed scope and explicit changes to
+exceptional outcomes. Existing late registered-source mutation errors can leave an already-published
+output; publication does not provide rollback against a concurrent path replacement.
 
 ## Native and output limits
 

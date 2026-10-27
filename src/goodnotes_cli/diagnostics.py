@@ -16,6 +16,7 @@ from .errors import (
     GoodnotesError,
     _permission_denied,
 )
+from .storage.paths import trusted_macos_alias
 
 
 def _failure(
@@ -190,7 +191,10 @@ def _nearest_existing_artifact_directory(path: Path) -> tuple[Path, bool]:
         except FileNotFoundError:
             return current, False
         if stat.S_ISLNK(info.st_mode):
-            raise ValueError("The artifact directory path must not contain symlinks.")
+            if candidate == path or trusted_macos_alias(candidate) is None:
+                raise ValueError("The artifact directory path must not contain symlinks.")
+            current = candidate
+            continue
         if not stat.S_ISDIR(info.st_mode):
             raise ValueError("An artifact directory path component is not a directory.")
         current = candidate

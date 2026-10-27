@@ -7,9 +7,10 @@ import time
 from collections.abc import Generator
 from pathlib import Path
 
-from .cache import _input_signature, refresh_cache
 from .errors import FilesystemAccessError, GoodnotesError, _permission_denied
-from .snapshot import _InventoryChanged
+from .storage.cache.lifecycle import refresh_cache
+from .storage.capture.types import _InventoryChanged
+from .storage.inventory import _input_signature
 
 
 def _validate_options(interval: float, debounce: float, iterations: int | None) -> None:

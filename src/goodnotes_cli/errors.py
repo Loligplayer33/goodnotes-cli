@@ -23,9 +23,18 @@ def _os_cause(exc: BaseException) -> OSError | None:
     """Return the underlying filesystem error from one existing exception chain."""
 
     cause: BaseException | None = exc
-    while cause is not None and not isinstance(cause, OSError):
-        cause = cause.__cause__
-    return cause
+    visited: set[int] = set()
+    while cause is not None and id(cause) not in visited:
+        if isinstance(cause, OSError):
+            return cause
+        visited.add(id(cause))
+        if cause.__cause__ is not None:
+            cause = cause.__cause__
+        elif not cause.__suppress_context__:
+            cause = cause.__context__
+        else:
+            cause = None
+    return None
 
 
 def _permission_denied(exc: BaseException) -> bool:
@@ -177,7 +186,14 @@ class CacheAccessError(GoodnotesError):
             code = "cache_not_initialized"
         else:
             code = "cache_invalid"
-        failed_path = getattr(os_error, "filename", None) if os_error is not None else None
+        # pathlib can wrap an ELOOP OSError in RuntimeError on some Python versions.
+        # Its internal context names an intermediate component, while the public
+        # failure path for the resolution operation is the requested path.
+        failed_path = (
+            getattr(os_error, "filename", None)
+            if os_error is not None and not isinstance(exc, RuntimeError)
+            else None
+        )
         if isinstance(failed_path, bytes):
             failed_path = os.fsdecode(failed_path)
         return cls(
