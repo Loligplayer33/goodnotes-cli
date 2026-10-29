@@ -36,7 +36,7 @@ from .types import SandboxProtocol
 if TYPE_CHECKING:
     from ..native import NativeError
     from ..storage.artifacts import ArtifactCache
-_RENDER_CACHE_VERSION = 5
+_RENDER_CACHE_VERSION = 8
 
 
 def cached_render_pages(
@@ -73,6 +73,28 @@ def cached_render_pages(
     rendered: list[dict[str, object]] = []
     first_page_error: NativeError | None = None
 
+    def background_identity(page: Page) -> object:
+        if layer == "annotated":
+            if page.document_id not in registered:
+                verified = _open_registered_pdf(sandbox, page.document_id)
+                try:
+                    _check_registered_page_count(sandbox, page.document_id, verified.entry)
+                except BaseException:
+                    verified.close()
+                    raise
+                registered[page.document_id] = verified
+            verified = registered[page.document_id]
+            verified.ensure_unchanged()
+            _check_annotated_page_number(page, _registered_page_count(verified.entry))
+            return verified.entry, verified.signature
+        attachment = page.attachment_path or ""
+        if attachment not in attachments:
+            attachments[attachment] = _resolve_attachment_path(sandbox, page)
+        path = attachments[attachment]
+        if path not in signatures:
+            signatures[path] = _pdf_source_signature(path)
+        return str(path), signatures[path]
+
     def check_inputs() -> None:
         for path, expected in signatures.items():
             if _pdf_source_signature(path) != expected:
@@ -90,6 +112,27 @@ def cached_render_pages(
             pdf_cache = resources.enter_context(_PdfDocumentCache())
             record_reader: Callable[[str], list[tuple[bytes, bytes]]] | None = None
             pending: list[tuple[int, str, Path, dict[str, object]]] = []
+
+            def render_staged_page(page: Page) -> tuple[Path, dict[str, object]]:
+                stage_resources = ExitStack()
+                try:
+                    stage = stage_resources.enter_context(cache.staging())
+                    result = _render_page_with_resources(
+                        sandbox,
+                        page,
+                        sandbox.ensure_output(stage / "page.png"),
+                        layer=layer,
+                        dpi=dpi,
+                        pdf_cache=pdf_cache,
+                        registered=registered,
+                        record_reader=record_reader,
+                    )
+                except BaseException:
+                    stage_resources.close()
+                    raise
+                resources.callback(stage_resources.close)
+                return stage, result
+
             snapshot = (
                 str(sandbox.root),
                 stat_key(sandbox.root.lstat()),
@@ -101,27 +144,7 @@ def cached_render_pages(
                     native_attachments[page.document_id] = native_attachment_fingerprint(
                         sandbox, page.document_id
                     )
-                if layer == "annotated":
-                    if page.document_id not in registered:
-                        verified = _open_registered_pdf(sandbox, page.document_id)
-                        try:
-                            _check_registered_page_count(sandbox, page.document_id, verified.entry)
-                        except BaseException:
-                            verified.close()
-                            raise
-                        registered[page.document_id] = verified
-                    verified = registered[page.document_id]
-                    verified.ensure_unchanged()
-                    _check_annotated_page_number(page, _registered_page_count(verified.entry))
-                    background: object = (verified.entry, verified.signature)
-                else:
-                    attachment = page.attachment_path or ""
-                    if attachment not in attachments:
-                        attachments[attachment] = _resolve_attachment_path(sandbox, page)
-                    path = attachments[attachment]
-                    if path not in signatures:
-                        signatures[path] = _pdf_source_signature(path)
-                    background = (str(path), signatures[path])
+                background = background_identity(page)
                 key = artifact_key(
                     {
                         "renderer": _RENDER_CACHE_VERSION,
@@ -141,30 +164,14 @@ def cached_render_pages(
                 else:
                     if layer == "native" and record_reader is None:
                         record_reader = resources.enter_context(_native_record_reader(sandbox))
-                    stage_resources = ExitStack()
                     try:
-                        stage = stage_resources.enter_context(cache.staging())
-                        result = _render_page_with_resources(
-                            sandbox,
-                            page,
-                            sandbox.ensure_output(stage / "page.png"),
-                            layer=layer,
-                            dpi=dpi,
-                            pdf_cache=pdf_cache,
-                            registered=registered,
-                            record_reader=record_reader,
-                        )
+                        stage, result = render_staged_page(page)
                     except NativeError as exc:
-                        stage_resources.close()
                         if not allow_partial_native_errors or not _is_page_local_native_error(exc):
                             raise
                         first_page_error = first_page_error or exc
                         rendered.append(_native_render_error(page, exc))
                         continue
-                    except BaseException:
-                        stage_resources.close()
-                        raise
-                    resources.callback(stage_resources.close)
                     result["path"] = str(cache.destination(key) / "page.png")
                     pending.append((len(rendered), key, stage, result))
                 if result.get("document_id") != page.document_id:

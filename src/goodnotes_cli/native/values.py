@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import struct
+from enum import IntEnum
 from typing import cast
 from uuid import UUID
 
@@ -14,6 +15,43 @@ from ..native.records import (
     _UnsupportedNativeVariant,
     _UnsupportedReason,
 )
+
+# Native-unit policy and observed drawing-envelope selectors.
+MAX_NATIVE_COORDINATE = 100_000
+
+MIN_PEN_WIDTH = 0.05
+
+MAX_PEN_WIDTH = 100
+
+MAX_PAYLOAD_DECODE_BYTES = 4 * 1024 * 1024
+
+MAX_OPAQUE_METADATA_BYTES = 64
+
+_TPL_HEADER_BYTES = 8
+
+_TPL_FORMAT_SCAN_END = 256
+
+
+class NativeObjectType(IntEnum):
+    STANDARD = 24
+    VARIABLE_BRUSH = 25
+    PATTERN_FILL = 28
+
+
+class DrawingField(IntEnum):
+    """Observed pen/path envelope tags, not image or fill envelope tags."""
+
+    ID = 1
+    TPL = 2
+    VARIANT = 3
+    COLOR = 4
+    STYLE = 5
+    TRANSLATION = 6
+    OPAQUE_7 = 7
+    GEOMETRY = 9
+    OPAQUE_15 = 15
+    METADATA = 20
+    OBJECT_TYPE = 21
 
 
 def _one(message: Message, field: int, kind: type, *, required: bool = True) -> bytes | int | None:
@@ -45,7 +83,7 @@ def _float(value: int) -> float:
 
 def _point(x: int, y: int) -> tuple[float, float]:
     point = (_float(x), _float(y))
-    if not all(math.isfinite(value) and abs(value) <= 100_000 for value in point):
+    if not all(math.isfinite(value) and abs(value) <= MAX_NATIVE_COORDINATE for value in point):
         raise ValueError("Invalid native ink coordinate")
     return point
 
@@ -83,7 +121,7 @@ def _native_translation(
         raise ValueError(unsupported_message)
     dx = _fixed(offset_message, 1, 0.0)
     dy = _fixed(offset_message, 2, 0.0)
-    if abs(dx) > 100_000 or abs(dy) > 100_000:
+    if abs(dx) > MAX_NATIVE_COORDINATE or abs(dy) > MAX_NATIVE_COORDINATE:
         raise ValueError("Native translation exceeds coordinate bounds")
     return dx, dy
 
@@ -100,18 +138,18 @@ def _decode_tpl_payload(
         raise ValueError("Unsupported native annotation compression")
     decompressed, consumed = decode_apple_lz4(
         payload,
-        max_output=4 * 1024 * 1024,
+        max_output=MAX_PAYLOAD_DECODE_BYTES,
         charge_block=lambda size: budget.charge(byte_count=size),
     )
     if consumed != len(payload):
         raise ValueError("Unconsumed compressed native annotation bytes")
-    format_end = decompressed.find(b"\0", 8, 256)
+    format_end = decompressed.find(b"\0", _TPL_HEADER_BYTES, _TPL_FORMAT_SCAN_END)
     if format_end < 0:
         raise ValueError("Missing native annotation TPL format")
     if expected_format is not None:
         expected = {expected_format} if isinstance(expected_format, str) else expected_format
         try:
-            found_format = decompressed[8:format_end].decode("ascii")
+            found_format = decompressed[_TPL_HEADER_BYTES:format_end].decode("ascii")
         except UnicodeDecodeError as error:
             raise ValueError("Unsupported native annotation TPL format encoding") from error
         if found_format not in expected:
@@ -120,7 +158,7 @@ def _decode_tpl_payload(
 
 
 def _native_float(
-    value: float, *, label: str, limit: float = 100_000, reason: str = "decode-failed"
+    value: float, *, label: str, limit: float = MAX_NATIVE_COORDINATE, reason: str = "decode-failed"
 ) -> float:
     result = value
     if not math.isfinite(result) or abs(result) > limit:
@@ -129,13 +167,15 @@ def _native_float(
 
 
 def _tpl_float(
-    value: int, *, label: str, limit: float = 100_000, reason: str = "decode-failed"
+    value: int, *, label: str, limit: float = MAX_NATIVE_COORDINATE, reason: str = "decode-failed"
 ) -> float:
     return _native_float(_float(value), label=label, limit=limit, reason=reason)
 
 
-def _rgb_alpha(body: Message, *, required: bool = False) -> tuple[str, float]:
-    payload = _one(body, 4, bytes, required=required)
+def _rgb_alpha(
+    body: Message, *, required: bool = False, field_number: int = 4
+) -> tuple[str, float]:
+    payload = _one(body, field_number, bytes, required=required)
     color_message = decode_message(payload) if isinstance(payload, bytes) else None
     if color_message and any(item.number not in {1, 2, 3, 4} for item in color_message.fields):
         raise ValueError("Unsupported native color field")
@@ -149,3 +189,14 @@ def _rgb_alpha(body: Message, *, required: bool = False) -> tuple[str, float]:
         raise ValueError("Native RGBA value is outside 0..1")
     color = "#" + "".join(f"{round(channel * 255):02x}" for channel in channels)
     return color, alpha
+
+
+def _fixed_point(payload: bytes) -> tuple[float, float]:
+    message = decode_message(payload)
+    if len(message.fields) != 2 or {item.number for item in message.fields} != {1, 2}:
+        raise ValueError("Invalid native image point or size")
+    x = _fixed(message, 1, 0.0)
+    y = _fixed(message, 2, 0.0)
+    if abs(x) > MAX_NATIVE_COORDINATE or abs(y) > MAX_NATIVE_COORDINATE:
+        raise ValueError("Native image geometry exceeds coordinate bounds")
+    return x, y

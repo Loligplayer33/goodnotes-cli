@@ -113,16 +113,25 @@ def _native_ink_records(
     translation: tuple[float, float] = (0.0, 0.0),
     highlighter_style: bool = False,
     direct_identity: bool = False,
+    quadratic: bool = False,
 ) -> dict[bytes, bytes]:
     """Encode a generated pen/highlighter body from known point and style values."""
     if len(points) < 2:
         raise ValueError("Generated native ink requires at least two points")
-    schema = b"vuA(v)A(S(uu))A(S(uuuu))\0"
-    values = struct.pack("<HfI", 0, width, 0)
+    if quadratic and len(points) % 2 != 1:
+        raise ValueError("Generated quadratic ink requires control/end pairs")
+    schema = b"vuA(v)A(S(uu))A(S(uuuu))" + (b"vA(f)" if quadratic else b"") + b"\0"
+    values = struct.pack("<HfI", 2 if quadratic else 0, width, 0)
     values += struct.pack("<Iff", 1, *points[0])
-    segments = tuple(zip(points[:-1], points[1:], strict=True))
+    segments = tuple(
+        zip(points[1::2], points[2::2], strict=True)
+        if quadratic
+        else zip(points[:-1], points[1:], strict=True)
+    )
     values += struct.pack("<I", len(segments))
     values += b"".join(struct.pack("<ffff", *start, *end) for start, end in segments)
+    if quadratic:
+        values += struct.pack("<HI", 1, 0)
     tpl = b"tpl\0" + struct.pack("<I", 8 + len(schema) + len(values)) + schema + values
     frame = b"bv4-" + struct.pack("<II", len(tpl), len(tpl)) + tpl + b"bv4$"
     body = _field(1, VARIANT_LOGICAL_ID.encode()) + _field(2, frame) + _field(4, _rgba(*color))
@@ -212,8 +221,8 @@ def _native_variable_brush_records(page_id: str) -> dict[bytes, bytes]:
     format_string = b"vuA(v)A(S(uuuuu))A(S(uuuuuuuuuuu))A(S(uu))A(v)A(S(uu))A(S(uuuu))A(u)"
     flags = (0, 1)
     start = (100.0, 130.0, 0.0, -1.0, 1.0)
-    sample = (0.0, 120.0, 130.0, 0.0, 1.0, 2.0, 160.0, 130.0, 0.0, 1.0, 4.0)
-    values = struct.pack("<HII", 1, _float_bits(2.0), len(flags))
+    sample = (0.0, 130.0, 130.0, 0.0, 1.0, 2.5, 160.0, 130.0, 0.0, 1.0, 4.0)
+    values = struct.pack("<HII", 1, _float_bits(4.0), len(flags))
     values += b"".join(struct.pack("<H", flag) for flag in flags)
     values += struct.pack("<I", 1) + struct.pack("<5I", *(_float_bits(value) for value in start))
     values += struct.pack("<I", 1) + struct.pack("<11I", *(_float_bits(value) for value in sample))
@@ -332,7 +341,11 @@ def _native_image_layout_records(
 
 def _native_variant_records(page_id: str, variant: str) -> dict[bytes, bytes]:
     """Encode one named generated native variant or the ellipse control."""
-    if variant not in {*GENERATED_NATIVE_VARIANT_CASES, "supported-ellipse-control"}:
+    if variant not in {
+        *GENERATED_NATIVE_VARIANT_CASES,
+        "supported-ellipse-control",
+        "translated-ellipse-control",
+    }:
         raise ValueError(f"Unknown generated native variant: {variant}")
 
     root = str(UUID(int=UUID(page_id).int + 1)).upper()
@@ -381,7 +394,7 @@ def _native_variant_records(page_id: str, variant: str) -> dict[bytes, bytes]:
         item = _field(1, body)
     else:
         # A generated, known observed ellipse control. The two unsupported
-        # geometry cases mutate only the auxiliary envelope or opaque field 6.
+        # geometry cases mutate only the auxiliary envelope or translation field 6.
         format_string = b"vuA(v)A(S(uu))A(S(uuuu))vA(f)"
         values = (
             struct.pack("<HfI", 2, 2.0, 0)
@@ -417,7 +430,9 @@ def _native_variant_records(page_id: str, variant: str) -> dict[bytes, bytes]:
             + _field(21, 24)
         )
         if variant == "shape-with-transform":
-            body += _field(6, _fixed(1, 1.0) + _fixed(2, 2.0))
+            body += _field(6, _fixed(1, 1.0) + _fixed(2, 2.0) + _fixed(3, 1.0))
+        elif variant == "translated-ellipse-control":
+            body += _field(6, _fixed(1, 20.0) + _fixed(2, 25.0))
         descriptor = descriptor_prefix + _field(6, storage_id.encode()) + actor_sequence
         record_storage_id = storage_id
         item = _field(7, body)

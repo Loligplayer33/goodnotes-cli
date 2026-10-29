@@ -270,10 +270,13 @@ def _assert_evidence(evidence: dict[str, Any], page_id: str, *, strokes: int, im
 
 _NATIVE_SCHEMA_CASES = (
     "translated-ink",
+    "quadratic-ink",
+    "translated-quadratic-ink",
     "highlighter-style-ink",
     "direct-identity-ink",
     "filled-path",
     "outlined-ellipse",
+    "translated-outlined-ellipse",
     "open-two-point-shape",
     "translated-open-two-point-shape",
     "variable-brush",
@@ -316,10 +319,24 @@ def _install_native_schema_case(source: Path, store: GeneratedNativeStore, case:
             color=(0.5, 0.0, 0.5, 1.0),
             direct_identity=True,
         )
+    elif case in {"quadratic-ink", "translated-quadratic-ink"}:
+        records = _native_ink_records(
+            PAGE_IDS[0],
+            points=((110.0, 120.0), (145.0, 65.0), (180.0, 120.0)),
+            width=4.0,
+            color=(0.5, 0.0, 0.5, 1.0),
+            translation=(20.0, 25.0) if case == "translated-quadratic-ink" else (0.0, 0.0),
+            quadratic=True,
+        )
     elif case == "filled-path":
         records = _native_filled_path_records(PAGE_IDS[0])
-    elif case == "outlined-ellipse":
-        records = _native_variant_records(PAGE_IDS[0], "supported-ellipse-control")
+    elif case in {"outlined-ellipse", "translated-outlined-ellipse"}:
+        variant = (
+            "translated-ellipse-control"
+            if case == "translated-outlined-ellipse"
+            else "supported-ellipse-control"
+        )
+        records = _native_variant_records(PAGE_IDS[0], variant)
     elif case in {"open-two-point-shape", "translated-open-two-point-shape"}:
         records = _native_open_two_point_shape_records(
             PAGE_IDS[0],
@@ -399,8 +416,9 @@ def _draw_reference_case(page: fitz.Page, case: str, *, include_case: bool = Tru
             fill=(0.1, 0.7, 0.2),
             fill_opacity=0.8,
         )
-    elif case == "outlined-ellipse":
-        center_x, center_y, radius_x, radius_y = 170.0, 115.0, 25.0, 15.0
+    elif case in {"outlined-ellipse", "translated-outlined-ellipse"}:
+        dx, dy = (20.0, 25.0) if case == "translated-outlined-ellipse" else (0.0, 0.0)
+        center_x, center_y, radius_x, radius_y = 170.0 + dx, 115.0 + dy, 25.0, 15.0
         page.draw_oval(
             fitz.Rect(
                 (center_x - radius_y) * _SCALE,
@@ -422,9 +440,22 @@ def _draw_reference_case(page: fitz.Page, case: str, *, include_case: bool = Tru
             lineCap=1,
             stroke_opacity=0.75,
         )
+    elif case in {"quadratic-ink", "translated-quadratic-ink"}:
+        dx, dy = (20.0, 25.0) if case == "translated-quadratic-ink" else (0.0, 0.0)
+        # Independently specified cubic form of this generated quadratic.
+        page.draw_bezier(
+            ((110 + dx) * _SCALE, (120 + dy) * _SCALE),
+            ((400 / 3 + dx) * _SCALE, (250 / 3 + dy) * _SCALE),
+            ((470 / 3 + dx) * _SCALE, (250 / 3 + dy) * _SCALE),
+            ((180 + dx) * _SCALE, (120 + dy) * _SCALE),
+            color=(0.5, 0.0, 0.5),
+            width=4 * _SCALE,
+            lineCap=1,
+        )
     elif case == "variable-brush":
-        points = ((100.0, 130.0), (120.0, 130.0), (160.0, 130.0))
-        widths = (2.0, 2.0, 4.0)
+        # Linear position and dynamics form an independently drawn taper.
+        points = ((100.0, 130.0), (160.0, 130.0))
+        widths = (1.0, 4.0)
         left = tuple(
             (x * _SCALE, (y + width / 2) * _SCALE)
             for (x, y), width in zip(points, widths, strict=True)
@@ -486,10 +517,13 @@ def _schema_regions(case: str, page: int) -> list[dict[str, Any]]:
         return [_region([0.10, 0.47, 0.40, 0.54])]
     case_boxes = {
         "translated-ink": [0.28, 0.25, 0.47, 0.30],
+        "quadratic-ink": [0.24, 0.24, 0.43, 0.39],
+        "translated-quadratic-ink": [0.28, 0.33, 0.47, 0.48],
         "highlighter-style-ink": [0.23, 0.36, 0.43, 0.46],
         "direct-identity-ink": [0.23, 0.30, 0.43, 0.37],
         "filled-path": [0.30, 0.25, 0.43, 0.38],
         "outlined-ellipse": [0.34, 0.26, 0.44, 0.44],
+        "translated-outlined-ellipse": [0.36, 0.31, 0.49, 0.55],
         "open-two-point-shape": [0.25, 0.33, 0.40, 0.36],
         "translated-open-two-point-shape": [0.28, 0.43, 0.47, 0.46],
         "variable-brush": [0.21, 0.36, 0.39, 0.42],
@@ -784,6 +818,7 @@ def test_study_supported_native_schema_matrix_matches_independent_references(
     path_case = case in {
         "filled-path",
         "outlined-ellipse",
+        "translated-outlined-ellipse",
         "open-two-point-shape",
         "translated-open-two-point-shape",
     }

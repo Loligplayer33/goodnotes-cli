@@ -10,14 +10,28 @@ from ..models import Page
 from ..native import NativeError, SnapshotProtocol, read_page_records
 from ..native.assets import AttachmentSandbox, NativeImageData, load_native_image
 from ..native.objects import decode_native_objects
-from ..native.records import DecodedNativeObject, NativeImage, NativeOverlay
-from ..rendering.ink_svg import _svg
+from ..native.records import (
+    DecodedNativeObject,
+    NativeImage,
+    NativeOverlay,
+    NativePath,
+    NativePayload,
+)
+from .ink_svg import _svg
 
 _COORDINATE_SCALE = 72 / 132
 
 _MAX_PAGE_IMAGE_BYTES = 16 * 1024 * 1024
 
 _MAX_PAGE_IMAGE_PIXELS = 25_000_000
+
+
+def _object_attachment(payload: NativePayload) -> str | None:
+    if isinstance(payload, NativeImage):
+        return payload.attachment_id
+    if isinstance(payload, NativePath) and payload.pattern is not None:
+        return payload.pattern.attachment_id
+    return None
 
 
 def _resolve_native_images(
@@ -32,16 +46,17 @@ def _resolve_native_images(
     failures: Counter[str] = Counter()
     total_bytes = total_pixels = 0
     for native_object in objects:
-        image = native_object.payload
-        if not isinstance(image, NativeImage):
+        payload = native_object.payload
+        attachment_id = _object_attachment(payload)
+        if attachment_id is None:
             included.append(native_object)
             continue
-        attachment_id = image.attachment_id
+        kind = "native-image" if isinstance(payload, NativeImage) else "native-pattern"
         if attachment_id in unavailable:
-            failures["native-image-unavailable"] += 1
+            failures[f"{kind}-unavailable"] += 1
             continue
         if attachment_id in over_budget:
-            failures["native-image-budget-exceeded"] += 1
+            failures[f"{kind}-budget-exceeded"] += 1
             continue
         raster = resolved.get(attachment_id)
         if raster is None:
@@ -49,14 +64,14 @@ def _resolve_native_images(
                 raster = load_native_image(sandbox, page.document_id, attachment_id)
             except NativeError:
                 unavailable.add(attachment_id)
-                failures["native-image-unavailable"] += 1
+                failures[f"{kind}-unavailable"] += 1
                 continue
 
         next_bytes = total_bytes + len(raster.data)
         next_pixels = total_pixels + raster.width * raster.height
         if next_bytes > _MAX_PAGE_IMAGE_BYTES or next_pixels > _MAX_PAGE_IMAGE_PIXELS:
             over_budget.add(attachment_id)
-            failures["native-image-budget-exceeded"] += 1
+            failures[f"{kind}-budget-exceeded"] += 1
             continue
         total_bytes, total_pixels = next_bytes, next_pixels
         resolved[attachment_id] = raster
@@ -71,9 +86,15 @@ def _record_image_failures(metadata: dict[str, object], failures: Counter[str]) 
     metadata["rendered_objects"] = max(
         0, cast(int, metadata.get("rendered_objects", 0)) - failed_count
     )
-    metadata["rendered_images"] = max(
-        0, cast(int, metadata.get("rendered_images", 0)) - failed_count
+    failed_images = sum(
+        count for reason, count in failures.items() if reason.startswith("native-image-")
     )
+    failed_patterns = failed_count - failed_images
+    metadata["rendered_images"] = max(
+        0, cast(int, metadata.get("rendered_images", 0)) - failed_images
+    )
+    for key in ("rendered_paths", "rendered_strokes"):
+        metadata[key] = max(0, cast(int, metadata.get(key, 0)) - failed_patterns)
     metadata["unsupported_objects"] = (
         cast(int, metadata.get("unsupported_objects", 0)) + failed_count
     )
@@ -85,7 +106,8 @@ def _record_image_failures(metadata: dict[str, object], failures: Counter[str]) 
     warnings = metadata.get("warnings")
     updated_warnings = list(warnings) if isinstance(warnings, list) else []
     updated_warnings.append(
-        "Some copied native images were unavailable or exceeded the page image budget. "
+        "Some copied native images or pattern resources were unavailable or exceeded "
+        "the page image budget. "
         "Their pixels were omitted from this partial reconstruction."
     )
     metadata["warnings"] = updated_warnings
@@ -161,9 +183,9 @@ def render_native_overlay(
     objects, image_data, image_failures = _resolve_native_images(sandbox, page, objects)
     _record_image_failures(metadata, image_failures)
     image_integrity = Counter(
-        image_data[native_object.payload.attachment_id].integrity
+        image_data[attachment_id].integrity
         for native_object in objects
-        if isinstance(native_object.payload, NativeImage)
+        if (attachment_id := _object_attachment(native_object.payload)) is not None
     )
     if image_integrity:
         metadata["image_integrity"] = dict(image_integrity)

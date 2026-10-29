@@ -123,7 +123,20 @@ PDF fallback revalidates attachment confinement at each read and invalidates cha
 while retaining the session LRU. Completed snapshots must remain immutable; these checks do not
 promise protection against every concurrent replacement of a path or its ancestors.
 
-Observed support includes pen/highlighter records, filled paths, one ellipse form, variable-width pencil, one open-line form, and some linked PNG/JPEG images. Pencil texture is approximate. Unknown visibility, geometry, transforms, and records stay unknown or reduce coverage. A successful lookup with no page records reports `native-no-records-observed` / `no-native-records-observed` and warns that absence is unverified. Missing stores, runtime failures, and record-read errors remain errors. Generated tests do not prove Goodnotes compatibility or full rendering fidelity.
+Native envelopes compile into shared move/line/quadratic/cubic drawing records. Ink commands retain disconnected runs; filled arrays retain subpath boundaries. Circular and rotated elliptical arcs compile directly to cubic controls. Shapes share geometry, style and translation decoding; images preserve local size and rotation while validating their stored bounding boxes.
+
+| Owner | Implementation |
+| --- | --- |
+| `native.records`, `native.values` | Shared drawing records, structured decode issues, bounded wire/TPL helpers and scalar policies. |
+| `native.ink`, `native.paths`, `native.geometry` | Ink commands, filled path arrays, patterns, shapes, fills and image transforms. |
+| `native.objects` | Pairing, identity, ordering, partial observations and coverage. |
+| `native.assets`, `native.raster` | Copied resource binding, stable reads and raster validation. |
+| `rendering.ink_svg`, `rendering.svg` | Stroke sampling, validated SVG primitives and bounded pattern composition. |
+| `rendering.overlay` | Page mapping, resource resolution and overlay error translation. |
+
+Decoders use the shared drawing records without importing rendering. Rendering uses those records; overlay combines decoding, copied resources and drawing. Generated wire/TPL builders remain independent of production format constants in `tests/support/native_oracle.py`.
+
+Observed support includes variable-width pencils and scale-1 patterned fills. Pencil decoding retains the configured width and relative sample dynamics. Rendered tone, stroke width, taper, contours, absolute pressure response and texture remain approximate. Faint gray details around some fill edges remain unverified. Patterns use the observed six raster pixels per native unit and brush anchoring; other resources' resolution remains unverified. Bounded raster masks implement pattern clipping because the SVG backend does not implement pattern paints or clip paths. Unknown visibility, geometry, transforms, and records stay unknown or reduce coverage. A successful lookup with no page records reports `native-no-records-observed` / `no-native-records-observed` and warns that absence is unverified. Missing stores, runtime failures, and record-read errors remain errors. Generated tests do not prove Goodnotes compatibility or full rendering fidelity.
 
 Public page numbers are one-based. Keep unknown/unavailable distinct from absent, false, or zero; preserve source labels, warnings, coverage, and annotation status. Annotated-PDF registration checks path, digest, and page count, but not page order or annotation inclusion; it adds no text ingestion.
 

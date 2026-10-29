@@ -3,7 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-from ..native import NativeError
+from .errors import NativeError
+
+# Cumulative record limits are independent of per-payload and raster budgets.
+_MAX_PAGE_DECODE_BYTES = 16 * 1024 * 1024
+_MAX_PAGE_DECODE_POINTS = 100_000
 
 _UnsupportedReason = Literal[
     "unsupported-native-image-field-6",
@@ -44,12 +48,20 @@ class Ink:
     alpha: float
     dash: tuple[float, ...] = ()
     widths: tuple[float, ...] = ()
+    quadratic: bool = False
 
 
 @dataclass(frozen=True)
 class NativePathCommand:
-    op: Literal["M", "C", "A", "Z"]
+    op: Literal["M", "L", "Q", "C", "A", "Z"]
     values: tuple[float, ...] = ()
+
+
+@dataclass(frozen=True)
+class NativePattern:
+    attachment_id: str
+    x: float
+    y: float
 
 
 @dataclass(frozen=True)
@@ -61,6 +73,7 @@ class NativePath:
     stroke_color: str | None = None
     stroke_width: float = 0.0
     stroke_alpha: float = 1.0
+    pattern: NativePattern | None = None
 
 
 @dataclass(frozen=True)
@@ -70,6 +83,10 @@ class NativeImage:
     y: float
     width: float
     height: float
+    rotation: float = 0.0
+
+
+NativePayload = Ink | NativePath | NativeImage
 
 
 @dataclass(frozen=True)
@@ -77,14 +94,14 @@ class DecodedNativeObject:
     actor: int
     sequence: int
     logical_id: str
-    payload: Ink | NativePath | NativeImage
+    payload: NativePayload
     part_index: int = 0
 
 
 @dataclass
 class _DecodeBudget:
-    bytes_left: int = 16 * 1024 * 1024
-    points_left: int = 100_000
+    bytes_left: int = _MAX_PAGE_DECODE_BYTES
+    points_left: int = _MAX_PAGE_DECODE_POINTS
 
     def charge(self, *, byte_count: int = 0, point_count: int = 0) -> None:
         self.bytes_left -= byte_count

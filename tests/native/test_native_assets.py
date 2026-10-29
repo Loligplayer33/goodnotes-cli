@@ -98,14 +98,6 @@ def _baseline_jpeg() -> bytes:
     )
 
 
-def _insert(sandbox: FakeSandbox, *rows: tuple[object, ...]) -> None:
-    with sqlite3.connect(sandbox.projection_path) as connection:
-        connection.executemany(
-            "INSERT INTO attachments(id, path, available, document_id) VALUES (?, ?, ?, ?)",
-            rows,
-        )
-
-
 def test_loads_verified_png_and_jpeg_with_dimensions_and_content_mime(tmp_path: Path) -> None:
     png_bytes = _png()
     jpeg_bytes = _jpeg()
