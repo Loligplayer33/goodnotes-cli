@@ -8,7 +8,7 @@ import os
 import stat
 from collections.abc import Callable, Iterable
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 import pytest
 
@@ -437,6 +437,64 @@ def test_failure_after_marker_publication_removes_owned_snapshot(
         create_snapshot(source, destination)
 
     assert caught.value is error
+    assert not destination.exists()
+    _assert_closed(descriptors)
+
+
+@pytest.mark.parametrize("body_type", [GoodnotesError, KeyboardInterrupt, None])
+@pytest.mark.parametrize("close_type", [OSError, KeyboardInterrupt])
+def test_marker_stream_close_preserves_body_error_or_propagates_its_own_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    body_type: type[BaseException] | None,
+    close_type: type[BaseException],
+) -> None:
+    source = make_library(tmp_path / "source")
+    destination = tmp_path / "snapshot"
+    body_error = body_type("generated marker write failure") if body_type else None
+    close_error = close_type("generated marker close failure")
+    expected = body_error if body_error is not None else close_error
+    original_fdopen = os.fdopen
+    descriptors = _record_directory_opens(monkeypatch)
+    marker_streams: list[BinaryIO] = []
+
+    class FailingClose:
+        def __init__(self, stream: BinaryIO) -> None:
+            self.stream = stream
+
+        def write(self, data: bytes) -> int:
+            if body_error is not None:
+                raise body_error
+            return self.stream.write(data)
+
+        def close(self) -> None:
+            self.stream.close()
+            raise close_error
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self.stream, name)
+
+        def __enter__(self) -> FailingClose:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            self.close()
+
+    def marker_fdopen(descriptor: int, *args: Any, **kwargs: Any) -> Any:
+        stream = original_fdopen(descriptor, *args, **kwargs)
+        if args == ("wb",) and list(destination.glob(".snapshot-marker-*")):
+            marker_streams.append(stream)
+            descriptors.append(descriptor)
+            return FailingClose(stream)
+        return stream
+
+    monkeypatch.setattr(os, "fdopen", marker_fdopen)
+    with pytest.raises(BaseException) as caught:
+        create_snapshot(source, destination)
+
+    assert caught.value is expected
+    assert len(marker_streams) == 1
+    assert marker_streams[0].closed
     assert not destination.exists()
     _assert_closed(descriptors)
 

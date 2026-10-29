@@ -160,8 +160,16 @@ class _CaptureStaging:
             self._temporary_marker = name, identity
             stream = os.fdopen(descriptor, "wb")
             descriptor = -1
-            with stream:
+            try:
                 yield stream
+            except BaseException:
+                try:
+                    stream.close()
+                except BaseException:
+                    pass
+                raise
+            else:
+                stream.close()
             self.validate()
             self._validate_entry(name, identity)
             os.replace(name, SNAPSHOT_MARKER, src_dir_fd=self._root_fd, dst_dir_fd=self._root_fd)
