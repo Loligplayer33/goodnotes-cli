@@ -8,10 +8,20 @@ Tests use generated databases, PDFs, and attachments, not a live Goodnotes Libra
 | --- | --- |
 | Source changes during capture | Try at most three captures; if none succeeds, fail and keep the previous active pointer. |
 | Final inventory differs during this refresh | Publish the validated copy with `source_changed_during_refresh: true` and `captured_at`; next sync captures again. `false` means no change was detected during this refresh, not that no edits happened since the prior sync. Matching inventories do not guarantee freshness at return. |
-| Interrupt during capture | Ctrl-C removes staging and preserves the pointer. Next sync removes staging left by a killed process. |
+| Interrupt during capture | Ctrl-C removes known-owned staging and preserves the pointer. Observed replacements and uncertain interrupted publication may leave a tree. Next sync removes entries in the reserved abandoned-staging namespace. |
 | Reader overlaps refresh | Shared `.view.lock` retains its snapshot through the last read. Sync captures without it and waits for exclusive access to publish/prune. |
 
 The app does not participate in locks. A changing source can exhaust retries. Tests simulate interruption, not OS SIGKILL; clone-specific tests skip when clone support is unavailable.
+
+Capture cleanup retains the created root, attempt Library and marker identities. A replacement
+root or Library stops cleanup and retry; unknown root children prevent final `rmdir`. Cleanup
+errors do not replace the triggering failure or interrupt. Retry reset failures remain expected
+CLI errors with the original source-change cause. Normal capture followed by failed cache
+publication uses the same owner, so the cache caller cannot rediscover and remove a replacement.
+This protection lasts for the current operation. Later abandoned-staging cleanup uses the reserved
+`.staging-<uuid>` namespace and may remove a replacement left there. No persistent ownership
+journal or per-file creation ledger is kept. No-follow recursion preserves nested symlink targets;
+separate identity checks and deletion calls are not atomic against arbitrary same-user mutation.
 
 | Tests | Scenarios |
 | --- | --- |

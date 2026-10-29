@@ -86,6 +86,17 @@ Snapshot markers contain the captured file inventory and are limited to 64 MiB. 
 marker exceeds this limit, capture fails before publication and removes its staging copy; the
 previous active snapshot remains available.
 
+Capture retains one owner for its created root, each attempt's `Library`, and marker files.
+It pins the parent and root descriptors through managed generation and active-pointer publication.
+Failure cleanup checks those retained identities, removes known children relative to the pinned
+root, and finishes with `rmdir`. It does not recursively delete the root or adopt replacement
+entries found after failure. Uncertain interrupted publication can leave an unreferenced tree.
+The existing later abandoned-staging cleaner still authorizes the reserved `.staging-<uuid>`
+namespace; a replacement preserved during one call can be removed by a later refresh. Capture
+does not maintain a persistent identity journal or a creation ledger for every nested file.
+Identity checks reject observed replacements but do not make separate stat/unlink/rmdir calls
+atomic against arbitrary same-user mutation.
+
 Metadata readers classify excessive JSON nesting as invalid input. Annotated-PDF registry records
 use a stable, no-follow read capped at 1 MiB and preserve strict UTF-8 decoding.
 

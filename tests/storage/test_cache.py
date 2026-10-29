@@ -31,7 +31,9 @@ from goodnotes_cli.errors import (
     StaleSnapshotError,
 )
 from goodnotes_cli.safety import Sandbox
-from goodnotes_cli.snapshot import _InventoryChanged
+from goodnotes_cli.snapshot import _InventoryChanged, create_snapshot
+from goodnotes_cli.storage.capture import copy as capture_copy
+from goodnotes_cli.storage.capture.staging import _CaptureStaging
 from tests.support.library import _create_snapshot, make_library
 
 
@@ -73,7 +75,7 @@ def test_refresh_skips_capture_when_source_inventory_is_unchanged(
     def fail_if_captured(*args: object, **kwargs: object) -> Path:
         raise AssertionError("unchanged refresh should not capture a snapshot")
 
-    monkeypatch.setattr(cache_lifecycle, "create_snapshot", fail_if_captured)
+    monkeypatch.setattr(cache_lifecycle, "_capture_snapshot", fail_if_captured)
     second = cache_module.refresh_cache(source, data_dir)
 
     assert first["status"] == "ready"
@@ -391,25 +393,26 @@ def test_source_change_during_refresh_is_reported_with_snapshot_time(
     source = make_library(tmp_path / "source")
     attachment = source / "Attachments" / "page.pdf"
     before_capture = attachment.read_bytes()
-    original_create = cache_lifecycle.create_snapshot
+    original_capture = cache_lifecycle._capture_snapshot
 
+    @contextmanager
     def capture_then_advance(
         source_library: str | Path,
         destination: str | Path,
         *,
         max_attempts: int = 3,
         previous_snapshot: Path | None = None,
-    ) -> Path:
-        snapshot = original_create(
+    ) -> Generator[_CaptureStaging, None, None]:
+        with original_capture(
             source_library,
             destination,
             max_attempts=max_attempts,
             previous_snapshot=previous_snapshot,
-        )
-        attachment.write_bytes(b"source advanced after capture")
-        return snapshot
+        ) as staging:
+            attachment.write_bytes(b"source advanced after capture")
+            yield staging
 
-    monkeypatch.setattr(cache_lifecycle, "create_snapshot", capture_then_advance)
+    monkeypatch.setattr(cache_lifecycle, "_capture_snapshot", capture_then_advance)
     result = cache_module.refresh_cache(source, tmp_path / "cache")
     root = Path(str(result["snapshot"]))
     pointer = active_pointer(tmp_path / "cache")
@@ -638,11 +641,11 @@ def test_failed_force_refresh_preserves_the_active_pointer(
     first = cache_module.refresh_cache(source, data_dir)
     old_pointer = (data_dir / "active.json").read_bytes()
 
-    def fail_capture(source_library: Path, destination: Path, *, max_attempts: int = 3) -> Path:
-        del source_library, destination, max_attempts
+    def fail_capture(source_library: Path, destination: Path, **kwargs: object) -> Path:
+        del source_library, destination, kwargs
         raise GoodnotesError("generated capture failure")
 
-    monkeypatch.setattr(cache_lifecycle, "create_snapshot", fail_capture)
+    monkeypatch.setattr(cache_lifecycle, "_capture_snapshot", fail_capture)
     with pytest.raises(GoodnotesError, match="capture failure"):
         cache_module.refresh_cache(source, data_dir, force=True)
 
@@ -673,23 +676,24 @@ def _refresh_waiting_to_publish(
     complete: SyncEvent,
     output: str,
 ) -> None:
-    original_create = cache_lifecycle.create_snapshot
+    original_capture = cache_lifecycle._capture_snapshot
 
+    @contextmanager
     def capture_then_signal(
         source_library: str | Path,
         destination: str | Path,
         *,
         max_attempts: int = 3,
         previous_snapshot: Path | None = None,
-    ) -> Path:
-        result = original_create(
+    ) -> Generator[_CaptureStaging, None, None]:
+        with original_capture(
             source_library,
             destination,
             max_attempts=max_attempts,
             previous_snapshot=previous_snapshot,
-        )
-        captured.set()
-        return result
+        ) as staging:
+            captured.set()
+            yield staging
 
     original_lock = cache_lifecycle._file_lock
 
@@ -702,7 +706,7 @@ def _refresh_waiting_to_publish(
         with original_lock(path, exclusive=exclusive, create=create):
             yield
 
-    vars(cache_lifecycle)["create_snapshot"] = capture_then_signal
+    vars(cache_lifecycle)["_capture_snapshot"] = capture_then_signal
     cache_lifecycle._file_lock = observe_exclusive_view_lock
     try:
         result = cache_module.refresh_cache(Path(source), Path(data_dir))
@@ -885,7 +889,7 @@ def test_settings_load_uses_canonical_pointer_validation_and_relative_cache_path
     loaded = Settings(data_dir=Path("./cache")).load_sandbox()
     assert loaded.root == Path(str(first["snapshot"]))
 
-    outside = cache_lifecycle.create_snapshot(source, tmp_path / "outside")
+    outside = create_snapshot(source, tmp_path / "outside")
     pointer_path = cache / "active.json"
     pointer = active_pointer(cache)
     pointer["snapshot"] = str(outside)
@@ -1231,13 +1235,11 @@ def test_interrupted_capture_cleans_partial_staging_and_preserves_pointer(
     old_pointer = (data_dir / "active.json").read_bytes()
     (source / "Attachments" / "page.pdf").write_bytes(b"changed source")
 
-    def interrupt(source_path: Path, destination: Path, **kwargs: object) -> Path:
-        del source_path, kwargs
-        destination.mkdir()
-        (destination / "partial.bin").write_bytes(b"interrupted staging fixture")
+    def interrupt(source_path: Path, destination: Path, expected: object) -> bool:
+        del source_path, destination, expected
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(cache_lifecycle, "create_snapshot", interrupt)
+    monkeypatch.setattr(capture_copy, "_copy_regular_file", interrupt)
     with pytest.raises(KeyboardInterrupt):
         cache_module.refresh_cache(source, data_dir)
 

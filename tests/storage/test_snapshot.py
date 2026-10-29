@@ -16,13 +16,14 @@ import pytest
 import goodnotes_cli.config as config_module
 from goodnotes_cli import build_info
 from goodnotes_cli.errors import GoodnotesError
-from goodnotes_cli.safety import Sandbox, open_database
+from goodnotes_cli.safety import Sandbox, open_database, safe_remove_tree
 from goodnotes_cli.snapshot import create_snapshot
 from goodnotes_cli.storage.capture import copy as copy_module
 from goodnotes_cli.storage.capture import inventory as inventory_module
 from goodnotes_cli.storage.capture import lifecycle as lifecycle_module
 from goodnotes_cli.storage.capture import sqlite as sqlite_module
 from goodnotes_cli.storage.capture import types as capture_types
+from goodnotes_cli.storage.capture.staging import _CaptureStaging
 
 
 def make_library(root: Path, *, wal: bool = False) -> Path:
@@ -140,7 +141,7 @@ def test_snapshot_rejects_unsafe_native_inputs(tmp_path: Path, unsafe: str) -> N
     elif unsafe == "fifo":
         os.mkfifo(native / "pipe")
     else:
-        lifecycle_module._make_writable_and_remove(native)
+        safe_remove_tree(native)
         native.write_bytes(b"not a native directory")
     destination = tmp_path / "snapshot"
     with pytest.raises(GoodnotesError):
@@ -1314,17 +1315,20 @@ def test_marker_writer_enforces_exact_byte_limit(
     first = tmp_path / "first"
     exact = tmp_path / "exact"
     too_small = tmp_path / "too-small"
-    for destination in (first, exact, too_small):
-        destination.mkdir()
-    lifecycle_module._write_marker(first, [])
+    with _CaptureStaging(first) as staging:
+        lifecycle_module._write_marker(staging, [])
+        staging.release()
     marker = (first / "goodnotes-snapshot.json").read_bytes()
     monkeypatch.setattr(metadata, "SNAPSHOT_MARKER_LIMIT", len(marker))
-    lifecycle_module._write_marker(exact, [])
+    with _CaptureStaging(exact) as staging:
+        lifecycle_module._write_marker(staging, [])
+        staging.release()
     assert (exact / "goodnotes-snapshot.json").read_bytes() == marker
     monkeypatch.setattr(metadata, "SNAPSHOT_MARKER_LIMIT", len(marker) - 1)
-    with pytest.raises(GoodnotesError, match="inventory exceeds.*marker size"):
-        lifecycle_module._write_marker(too_small, [])
-    assert list(too_small.iterdir()) == []
+    with _CaptureStaging(too_small) as staging:
+        with pytest.raises(GoodnotesError, match="inventory exceeds.*marker size"):
+            lifecycle_module._write_marker(staging, [])
+        assert list(too_small.iterdir()) == []
 
 
 def test_oversized_marker_preserves_active_snapshot_and_removes_staging(

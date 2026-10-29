@@ -6,9 +6,9 @@ import json
 import os
 import plistlib
 import stat
-import tempfile
 import time
-from collections.abc import Iterable
+from collections.abc import Generator, Iterable
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -16,10 +16,7 @@ from typing import Any
 from ... import build_info
 from ...errors import FilesystemAccessError, GoodnotesError, _permission_denied
 from .. import metadata
-from ..paths import (
-    _is_production_goodnotes_path,
-    safe_remove_tree,
-)
+from ..paths import _is_production_goodnotes_path
 from ..paths import (
     paths_overlap as _paths_overlap,
 )
@@ -32,6 +29,7 @@ from .sqlite import (
     _read_projection_library_format,
     _validate_projection_database,
 )
+from .staging import _CaptureStaging
 from .types import _DATABASE_NAMES, _Entry, _SourceChanged
 
 _GOODNOTES_BUNDLE_IDENTIFIER = "com.goodnotesapp.x"
@@ -51,7 +49,7 @@ def _read_installed_goodnotes_info() -> dict[str, str | None] | None:
         try:
             descriptor = os.open(
                 info_path,
-                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
             )
             try:
                 info = os.fstat(descriptor)
@@ -149,7 +147,7 @@ def _final_manifest(library: Path, planned: list[_Entry]) -> list[_Entry]:
 
 
 def _write_marker(
-    destination: Path,
+    staging: _CaptureStaging,
     entries: Iterable[_Entry],
     *,
     source: Path | None = None,
@@ -157,6 +155,8 @@ def _write_marker(
     capture_stats: dict[str, Any] | None = None,
     projection_library_format: dict[str, int] | None = None,
 ) -> None:
+    staging.validate()
+    destination = staging.path
     entries = list(entries)
     # Freeze files before recording their metadata, so subsequent refreshes can
     # distinguish cache damage from files whose digest was already verified.
@@ -204,27 +204,20 @@ def _write_marker(
             "sha256": projection.sha256,
             "library_format": projection_library_format,
         }
-    marker = destination / SNAPSHOT_MARKER
-    fd, temporary_name = tempfile.mkstemp(prefix=".snapshot-marker-", dir=destination)
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(fd, "wb") as stream:
-            encoder = json.JSONEncoder(separators=(",", ":"), sort_keys=True)
-            size = 0
-            for chunk in encoder.iterencode(marker_data):
-                encoded = chunk.encode("utf-8")
-                size += len(encoded)
-                if size > metadata.SNAPSHOT_MARKER_LIMIT:
-                    raise GoodnotesError(
-                        "Snapshot inventory exceeds the supported snapshot marker size "
-                        f"({metadata.SNAPSHOT_MARKER_LIMIT} bytes)."
-                    )
-                stream.write(encoded)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, marker)
-    finally:
-        temporary.unlink(missing_ok=True)
+    with staging.marker_file() as stream:
+        encoder = json.JSONEncoder(separators=(",", ":"), sort_keys=True)
+        size = 0
+        for chunk in encoder.iterencode(marker_data):
+            encoded = chunk.encode("utf-8")
+            size += len(encoded)
+            if size > metadata.SNAPSHOT_MARKER_LIMIT:
+                raise GoodnotesError(
+                    "Snapshot inventory exceeds the supported snapshot marker size "
+                    f"({metadata.SNAPSHOT_MARKER_LIMIT} bytes)."
+                )
+            stream.write(encoded)
+        stream.flush()
+        os.fsync(stream.fileno())
 
 
 def _make_read_only(destination: Path, entries: Iterable[_Entry]) -> None:
@@ -237,12 +230,6 @@ def _make_read_only(destination: Path, entries: Iterable[_Entry]) -> None:
     (destination / "Library").chmod(0o555)
     (destination / SNAPSHOT_MARKER).chmod(0o444)
     destination.chmod(0o555)
-
-
-def _make_writable_and_remove(path: Path) -> None:
-    if path.is_symlink():
-        return
-    safe_remove_tree(path)
 
 
 def create_snapshot(
@@ -258,6 +245,23 @@ def create_snapshot(
     at the source path, which preserves the production databases byte-for-byte.
     A bounded manifest comparison detects changes that overlap the copy window.
     """
+
+    with _capture_snapshot(
+        source_library, destination, max_attempts=max_attempts, previous_snapshot=previous_snapshot
+    ) as staging:
+        staging.release()
+        return staging.path
+
+
+@contextmanager
+def _capture_snapshot(
+    source_library: str | Path,
+    destination: str | Path,
+    *,
+    max_attempts: int = 3,
+    previous_snapshot: Path | None = None,
+) -> Generator[_CaptureStaging, None, None]:
+    """Retain created-tree ownership until the caller confirms publication."""
 
     if max_attempts < 1:
         raise ValueError("max_attempts must be at least one")
@@ -291,24 +295,15 @@ def create_snapshot(
     if _paths_overlap(source, target):
         raise GoodnotesError("Snapshot source and destination must not overlap.")
 
-    try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.mkdir(mode=0o700)
-    except FileExistsError as exc:
-        raise GoodnotesError(
-            f"Refusing to overwrite an existing snapshot destination: {target}"
-        ) from exc
-    except OSError as exc:
-        raise GoodnotesError(f"Could not create snapshot destination: {target}") from exc
-
-    started = time.monotonic()
-    try:
+    with _CaptureStaging(target) as staging:
+        started = time.monotonic()
         for attempt in range(max_attempts):
             try:
                 manifest_before = _collect_manifest(source, hash_contents=False)
                 planned, source_files = _plan_capture(source, manifest_before, previous_snapshot)
-                library_destination = target / "Library"
+                library_destination = staging.create_library()
                 copy_metrics = _copy_snapshot_tree(source, library_destination, planned)
+                staging.validate()
                 manifest_after = _collect_manifest(source, hash_contents=False)
                 if manifest_before != manifest_after:
                     raise _SourceChanged("Source files changed during snapshot copy.")
@@ -337,29 +332,27 @@ def create_snapshot(
                 capture_stats["attempts"] = attempt + 1
                 capture_stats["capture_seconds"] = round(time.monotonic() - started, 6)
                 _write_marker(
-                    target,
+                    staging,
                     final_manifest,
                     source=source,
                     source_entries=source_files,
                     capture_stats=capture_stats,
                     projection_library_format=projection_library_format,
                 )
+                staging.validate()
                 _make_read_only(target, final_manifest)
-                return target
+                staging.validate()
+                break
             except _SourceChanged as exc:
-                _make_writable_and_remove(target / "Library")
+                try:
+                    staging.remove_library()
+                except (GoodnotesError, OSError):
+                    raise GoodnotesError(
+                        "Source changed during snapshot capture and staging could not be "
+                        "safely reset."
+                    ) from exc
                 if attempt + 1 >= max_attempts:
                     raise GoodnotesError(
                         f"Source kept changing after {max_attempts} snapshot attempts."
                     ) from exc
-    except BaseException:
-        try:
-            _make_writable_and_remove(target)
-        except GoodnotesError:
-            # Preserve the original capture failure. Unsafe staging is left in
-            # place for inspection rather than following links during cleanup.
-            pass
-        raise
-
-    # The loop returns on success or raises on its final failed attempt.
-    raise GoodnotesError("Snapshot creation failed without a stable source copy.")
+        yield staging

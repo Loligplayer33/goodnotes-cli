@@ -136,7 +136,6 @@ def _copy_regular_file(source: Path, destination: Path, expected: _Entry) -> boo
 def _copy_snapshot_tree(
     source_library: Path, destination_library: Path, entries: Iterable[_Entry]
 ) -> dict[str, int]:
-    destination_library.mkdir(mode=0o700)
     all_entries = list(entries)
     directories = sorted(
         (entry for entry in all_entries if entry.is_directory),
