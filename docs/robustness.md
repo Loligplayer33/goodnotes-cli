@@ -23,7 +23,7 @@ The app does not participate in locks. A changing source can exhaust retries. Te
 
 RocksDB opens only on disposable scratch copied from a validated snapshot. Fresh options keep writes in scratch; copied `OPTIONS` files are not loaded. Scratch is removed after extraction, and byte-copy fallback is limited to 64 MiB per extraction.
 
-Unknown visibility, geometry, transforms, versions, and records remain unknown or reduce coverage. A successful lookup that finds no records reports `native-no-records-observed` / `no-native-records-observed` and an unverified-absence warning; it does not prove a blank page. Missing stores, runtime failures, and read errors remain errors. Native rendering never silently falls back to the background. Pencil widths preserve the configured width and relative sample dynamics; absolute pressure response and texture are approximate. Generated tests do not establish full Goodnotes compatibility or rendering fidelity.
+Unknown visibility, geometry, transforms, versions, and records remain unknown or reduce coverage. A successful lookup that finds no records reports `native-no-records-observed` / `no-native-records-observed` and an unverified-absence warning; it does not prove a blank page. Missing stores, runtime failures, and read errors remain errors. Native rendering never silently falls back to the background. Pencil decoding preserves the configured width and relative sample dynamics. Rendered tone, stroke width, taper, contours, absolute pressure response and texture remain approximate. Faint gray details around some fill edges remain unverified. Generated tests do not establish full Goodnotes compatibility or rendering fidelity.
 
 | Tests | Coverage |
 | --- | --- |

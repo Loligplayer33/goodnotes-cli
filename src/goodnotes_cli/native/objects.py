@@ -165,7 +165,9 @@ def _decode_pair(
         if _uuid(_one(body, 1, bytes)) != logical_id:
             raise ValueError("Annotation logical identity mismatch")
         fill = _decode_native_fill(body, budget)
-        observations.unmodeled_body_fields.update({2, 3, 5, 15})
+        observations.unmodeled_body_fields.update(
+            {2, 3, 5, 15}.intersection(field.number for field in body.fields)
+        )
         observations.descriptor_variants["filled-geometry"] += 1
         return _Candidate(actor, sequence, logical_id, [fill])
     elif item_numbers == {_ItemEnvelope.ANNOTATION}:

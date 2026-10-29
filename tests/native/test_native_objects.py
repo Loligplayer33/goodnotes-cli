@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import struct
+from itertools import combinations
 from typing import Any, cast
 
 import pytest
@@ -15,6 +16,7 @@ from goodnotes_cli.native.objects import decode_native_objects
 from goodnotes_cli.native.records import Ink, NativeImage, NativePath, _DecodeBudget
 from tests.support.native_oracle import (
     ATTACHMENT_ID,
+    LOGICAL_ID,
     RESOURCE_ID,
     ROOT_ID,
     _ellipse_body,
@@ -96,6 +98,70 @@ def test_ellipse_translation_uses_the_shared_shape_transform() -> None:
     assert isinstance(objects[0].payload, NativePath)
     assert objects[0].payload.commands[0].values == pytest.approx((31, 50), abs=1e-5)
     assert metadata["unsupported_reasons"] == {}
+
+
+@pytest.mark.parametrize(
+    "optional_fields",
+    [fields for count in range(5) for fields in combinations((2, 3, 5, 15), count)],
+)
+@pytest.mark.parametrize("opaque_bytes", [b"", b"synthetic-metadata"])
+def test_native_fill_reports_only_present_optional_fields(
+    optional_fields: tuple[int, ...], opaque_bytes: bytes
+) -> None:
+    center = field(1, 10.0) + field(2, 20.0)
+    radii = field(1, 3.0) + field(2, 2.0)
+    ellipse = field(1, center) + field(2, radii) + field(3, 0.0)
+    base = (
+        field(1, LOGICAL_ID.encode())
+        + field(4, field(4, ellipse))
+        + field(7, field(1, 1.0) + field(4, 0.5))
+        + field(18, 24)
+    )
+    bounds = field(1, field(1, 7.0) + field(2, 18.0)) + field(2, field(1, 6.0) + field(2, 4.0))
+    optional_values = {2: bounds, 3: opaque_bytes, 5: RESOURCE_ID.encode(), 15: opaque_bytes}
+    body = base + b"".join(field(number, optional_values[number]) for number in optional_fields)
+    records = native_records(body=body)
+    records[1] = (records[1][0], field(9, body))
+
+    objects, metadata = decode_native_objects(records, ROOT_ID)
+    baseline, _ = decode_native_objects([records[0], (records[1][0], field(9, base))], ROOT_ID)
+
+    assert objects == baseline
+    assert len(objects) == 1
+    path = objects[0].payload
+    assert isinstance(path, NativePath)
+    assert [command.op for command in path.commands] == ["M", "C", "C", "C", "C"]
+    assert [path.commands[0].values, *[command.values[-2:] for command in path.commands[1:]]] == [
+        (13.0, 20.0),
+        (10.0, 22.0),
+        (7.0, 20.0),
+        (10.0, 18.0),
+        (13.0, 20.0),
+    ]
+    assert path.fill_color == "#ff0000" and path.fill_alpha == 0.5
+    assert path.stroke_color is None
+    assert metadata["unmodeled_body_fields"] == list(optional_fields)
+    assert metadata["coverage"] == ("partial" if optional_fields else "supported-native-records")
+    assert metadata["annotation_status"] == "native-reconstructed-approximate"
+    assert metadata["full_fidelity_verified"] is False
+    assert metadata["unsupported_objects"] == 0
+    assert metadata["unsupported_reasons"] == {}
+    assert metadata["rendered_paths"] == 1
+    assert metadata["descriptor_variants"] == {"filled-geometry": 1}
+    body_warnings = [
+        warning
+        for warning in cast(list[str], metadata["warnings"])
+        if warning.startswith("Observed native body fields ")
+    ]
+    assert body_warnings == (
+        [
+            "Observed native body fields "
+            + ", ".join(str(number) for number in optional_fields)
+            + " include values whose independent rendering effect is unverified."
+        ]
+        if optional_fields
+        else []
+    )
 
 
 @pytest.mark.parametrize(

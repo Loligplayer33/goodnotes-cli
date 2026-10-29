@@ -39,7 +39,7 @@ Notable changes to the project are recorded here. Versions follow Semantic Versi
 
 ### Fixed
 
-- Decode shared move/quadratic command streams, disconnected sections, filled subpaths and rotated arc controls. Shape styles/translations, rotated images, translucent fills and observed scale-1 patterns retain their content. Pencil pressure/texture and other pattern resolutions remain approximate; unknown formats still report partial coverage.
+- Decode shared move/quadratic command streams, disconnected sections, filled subpaths and rotated arc controls. Shape styles/translations, rotated images, translucent fills and observed scale-1 patterns retain their content. Pencil tone, stroke width, taper, contours, pressure response and texture remain approximate. Faint gray details around some fill edges remain unverified. Other pattern resolutions remain approximate; unknown formats still report partial coverage.
 
 - Separate catalog root namespaces before navigation and search. A cache-local root selection keeps unrelated libraries out of normal browsing, preserves exact selectors, and avoids cross-library path collisions without folder-name rules.
 
