@@ -122,6 +122,12 @@ The runner uses only the marked copy through `--sandbox`. It does not register P
 
 The corpus fingerprint covers the manifest, reference PDFs, and snapshot-marker bytes. If any changes during verification, the result fails. The aggregate receipt stores case outcomes and opaque fingerprints. It omits selectors, private paths, note text, CLI output, and image diffs. Without `--private-corpus`, private-corpus evidence is `unverified`.
 
+### Expand a private reference
+
+Keep each version outside the checkout with its frozen snapshot, independent PDF export, manifests and receipts. Preserve old versions. A new capture requires explicit authorization and the file-copy-only workflow; verification never refreshes the copy. Match notebook and reference page order.
+
+Exercise combinations of disconnected/repeated points, open/closed paths, curves, transforms, opacity, fills, patterns, images and nearby text. Add an omission control for every defect class. Keep strict pixel results separate from qualitative checks that allow pencil texture differences. Do not loosen thresholds to hide missing content. Add generated fixtures for established format rules and keep real notebook contents private.
+
 ## What the evidence establishes
 
 Generated journeys test selected-page retrieval across edits, page movement/deletion, stale snapshots, artifact expiry, and unavailable native evidence. The schema matrix compares observed object layouts with independent references; omission controls must fail their region. See [study journeys](../tests/journeys/test_study_journeys.py) and [reference checks](../tests/verification/test_verification_reference.py).

@@ -22,38 +22,9 @@ from goodnotes_cli.native.records import (
     NativePathCommand,
 )
 from goodnotes_cli.rendering import overlay as annotation_module
-from goodnotes_cli.rendering.ink_svg import _svg, _variable_width_outline
+from goodnotes_cli.rendering.ink_svg import _quadratic_width_samples, _svg, _variable_width_outline
 from goodnotes_cli.rendering.overlay import _record_image_failures, _resolve_native_images
 from goodnotes_cli.rendering.svg import native_image_element, native_path_element
-
-
-@dataclass(frozen=True)
-class PathCommandFixture:
-    op: str
-    values: tuple[float, ...]
-
-
-@dataclass(frozen=True)
-class NativePathFixture:
-    commands: tuple[PathCommandFixture, ...]
-    fill_rule: str
-    fill_color: str | None
-    fill_alpha: float
-    stroke_color: str | None = None
-    stroke_alpha: float = 0
-    stroke_width: float = 0
-    dash: tuple[float, ...] = ()
-    line_cap: str = "round"
-    line_join: str = "round"
-
-
-@dataclass(frozen=True)
-class NativeImageFixture:
-    attachment_id: str
-    x: float
-    y: float
-    width: float
-    height: float
 
 
 @dataclass(frozen=True)
@@ -130,12 +101,12 @@ def test_variable_width_outline_coalesces_repeated_samples() -> None:
 
 
 def test_native_path_commands_are_scaled_and_styles_are_explicit() -> None:
-    path = NativePathFixture(
+    path = NativePath(
         commands=(
-            PathCommandFixture("M", (10, 20)),
-            PathCommandFixture("C", (10, 30, 20, 30, 20, 20)),
-            PathCommandFixture("A", (5, 5, 0, 0, 1, 30, 20)),
-            PathCommandFixture("Z", ()),
+            NativePathCommand("M", (10, 20)),
+            NativePathCommand("C", (10, 30, 20, 30, 20, 20)),
+            NativePathCommand("A", (5, 5, 0, 0, 1, 30, 20)),
+            NativePathCommand("Z", ()),
         ),
         fill_rule="nonzero",
         fill_color="#ef514a",
@@ -152,11 +123,11 @@ def test_native_path_commands_are_scaled_and_styles_are_explicit() -> None:
 
 
 def test_native_path_supports_stroke_only_geometry_with_rounded_joins() -> None:
-    path = NativePathFixture(
+    path = NativePath(
         commands=(
-            PathCommandFixture("M", (10, 10)),
-            PathCommandFixture("C", (10, 20, 20, 20, 20, 10)),
-            PathCommandFixture("C", (20, 0, 10, 0, 10, 10)),
+            NativePathCommand("M", (10, 10)),
+            NativePathCommand("C", (10, 20, 20, 20, 20, 10)),
+            NativePathCommand("C", (20, 0, 10, 0, 10, 10)),
         ),
         fill_rule="nonzero",
         fill_color=None,
@@ -203,8 +174,8 @@ def test_native_stroke_path_renders_as_a_green_outline() -> None:
 
 
 def test_native_path_rejects_invalid_svg_values() -> None:
-    path = NativePathFixture(
-        commands=(PathCommandFixture("M", (0, 0)), PathCommandFixture("Z", ())),
+    path = NativePath(
+        commands=(NativePathCommand("M", (0, 0)), NativePathCommand("Z", ())),
         fill_rule="nonzero",
         fill_color='"/><script/>',
         fill_alpha=1,
@@ -215,7 +186,7 @@ def test_native_path_rejects_invalid_svg_values() -> None:
 
 
 def test_native_image_is_embedded_as_verified_png_data_uri() -> None:
-    image = NativeImageFixture("generated-image-id", 10, 20, 30, 40)
+    image = NativeImage("generated-image-id", 10, 20, 30, 40)
     raster = RasterFixture(_png_fixture(), "image/png", 1, 1)
 
     element = native_image_element(image, raster, scale=0.5)
@@ -226,7 +197,7 @@ def test_native_image_is_embedded_as_verified_png_data_uri() -> None:
 
 
 def test_native_image_rejects_mismatched_mime_and_excessive_pixels() -> None:
-    image = NativeImageFixture("generated-image-id", 0, 0, 10, 10)
+    image = NativeImage("generated-image-id", 0, 0, 10, 10)
     with pytest.raises(ValueError, match="MIME type"):
         native_image_element(image, RasterFixture(b"not-png", "image/png", 1, 1), 1)
     with pytest.raises(ValueError, match="pixel limit"):
@@ -383,3 +354,71 @@ def test_page_image_pixel_budget_and_unavailable_image_counts_are_partial(
     assert metadata["coverage"] == "partial"
     assert metadata["unsupported_reasons"] == failures
     assert any("page image budget" in warning for warning in metadata["warnings"])
+
+
+def test_quadratic_width_outline_follows_the_curve_and_tapers() -> None:
+    ink = Ink(
+        points=((5, 30), (25, 10), (45, 30)),
+        width=8,
+        color="#000000",
+        alpha=1,
+        widths=(0, 4, 8),
+        quadratic=True,
+    )
+    points, widths = _quadratic_width_samples(ink)
+    assert points[0] == (5, 30)
+    assert points[-1] == (45, 30)
+    assert widths[0] == 0
+    assert widths[-1] == 8
+    svg = _svg([ink], width=50, height=40, scale=1)
+    with fitz.open(stream=svg, filetype="svg") as vector:
+        with fitz.open(stream=vector.convert_to_pdf()) as document:
+            pixmap = document[0].get_pixmap(alpha=False)
+    assert pixmap.pixel(25, 20)[:3] == (0, 0, 0)
+    assert pixmap.pixel(25, 10)[:3] == (255, 255, 255)
+    assert _dark_pixels_at_x(svg, 43) > _dark_pixels_at_x(svg, 7)
+
+
+@pytest.mark.parametrize("stationary", [False, True])
+def test_quadratic_outline_retains_pressure_bulge_with_zero_endpoint_widths(
+    stationary: bool,
+) -> None:
+    points = ((25.0, 20.0),) * 3 if stationary else ((5.0, 20.0), (25.0, 20.0), (45.0, 20.0))
+    ink = Ink(points, 8, "#000000", 1, widths=(0, 8, 0), quadratic=True)
+    svg = _svg([ink], width=50, height=40, scale=1)
+    assert _dark_pixels_at_x(svg, 25) >= 2
+
+
+@pytest.mark.parametrize("x", [1.0, 100_000.0, -100_000.0])
+def test_quadratic_interpolation_preserves_valid_coordinate_and_width_limits(x: float) -> None:
+    ink = Ink(
+        ((x, 1), (x + 0 if abs(x) == 100_000 else 20, 50), (x, 50)),
+        100,
+        "#000000",
+        1,
+        widths=(100, 100, 100),
+        quadratic=True,
+    )
+    points, widths = _quadratic_width_samples(ink)
+    assert all(width == 100 for width in widths)
+    assert all(abs(value) <= 100_000 for point in points for value in point)
+    assert _svg([ink], width=60, height=60, scale=1).startswith(b"<svg")
+
+
+@pytest.mark.parametrize("width", [-1.0, math.nan, math.inf, 101.0])
+def test_quadratic_outline_validates_control_width_before_interpolation(width: float) -> None:
+    ink = Ink(((5, 30), (25, 10), (45, 30)), 8, "#000000", 1, widths=(8, width, 8))
+    with pytest.raises(ValueError, match="supported range"):
+        _quadratic_width_samples(ink)
+
+
+def test_quadratic_outline_sampling_is_bounded() -> None:
+    ink = Ink(
+        ((0.0, 0.0), *((1000.0, 1000.0), (0.0, 0.0)) * 4000),
+        1,
+        "#000000",
+        1,
+        widths=(1.0,) * 8001,
+    )
+    with pytest.raises(ValueError, match="sampling budget"):
+        _quadratic_width_samples(ink)
