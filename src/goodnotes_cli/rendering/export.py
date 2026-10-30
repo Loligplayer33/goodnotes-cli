@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
+from collections.abc import Generator
+from contextlib import contextmanager
 from pathlib import Path
 
 import pymupdf as fitz
 
 from ..errors import GoodnotesError
 from ..models import Page
+from ..native import NativeError
 from .backgrounds import (
+    _MAX_OPEN_PDF_SOURCES,
     _append_background_page,
-    _pdf_final_use_flags,
+    _pdf_source_signature,
     _PdfDocumentCache,
     _resolve_attachment_path,
 )
@@ -32,6 +37,57 @@ from .registered import (
     _RegisteredPdf,
 )
 from .types import SandboxProtocol
+
+
+@contextmanager
+def _export_page(page: Page) -> Generator[None, None, None]:
+    """Attach the selected public page while preserving structured native failures."""
+    try:
+        yield
+    except NativeError as exc:
+        exc.details["page"] = page.number
+        raise
+    except Exception as exc:
+        raise GoodnotesError(f"Could not export page {page.number}: {exc}") from exc
+
+
+def _export_sources(sandbox: SandboxProtocol, pages: list[Page]) -> list[Path]:
+    paths = []
+    for page in pages:
+        with _export_page(page):
+            paths.append(_resolve_attachment_path(sandbox, page))
+    return paths
+
+
+def _pdf_final_use_flags(
+    paths: list[Path], pages: list[Page], capacity: int = _MAX_OPEN_PDF_SOURCES
+) -> list[bool]:
+    """Mark each cached PDF handle's last insertion before reuse ends or eviction."""
+    cache: OrderedDict[tuple[int, int], int] = OrderedDict()
+    handles: list[int] = []
+    last_use: dict[int, int] = {}
+    signatures: dict[tuple[int, int], tuple[int, int, int, int, int, int]] = {}
+    next_handle = 0
+    for index, (path, page) in enumerate(zip(paths, pages, strict=True)):
+        with _export_page(page):
+            signature = _pdf_source_signature(path)
+            identity = signature[0], signature[1]
+            previous = signatures.get(identity)
+            if previous is not None and previous != signature:
+                raise GoodnotesError("A page background changed during the rendering operation.")
+            signatures[identity] = signature
+            handle = cache.get(identity)
+            if handle is None:
+                if len(cache) >= capacity:
+                    cache.popitem(last=False)
+                handle = next_handle
+                next_handle += 1
+                cache[identity] = handle
+            else:
+                cache.move_to_end(identity)
+            handles.append(handle)
+            last_use[handle] = index
+    return [last_use[handle] == index for index, handle in enumerate(handles)]
 
 
 def export_pdf(
@@ -59,41 +115,43 @@ def export_pdf(
     registered_pdf: _RegisteredPdf | None = None
     try:
         if layer == "background":
-            source_paths = [_resolve_attachment_path(sandbox, page) for page in ordered]
-            final_uses = _pdf_final_use_flags(source_paths)
+            source_paths = _export_sources(sandbox, ordered)
+            final_uses = _pdf_final_use_flags(source_paths, ordered)
             with _PdfDocumentCache() as pdf_cache:
                 for page, source_path, final in zip(ordered, source_paths, final_uses, strict=True):
-                    source_doc = pdf_cache.open(source_path)
-                    _append_background_page(
-                        result_doc,
-                        page,
-                        source_path,
-                        source_doc=source_doc,
-                        final=final,
-                    )
+                    with _export_page(page):
+                        source_doc = pdf_cache.open(source_path)
+                        _append_background_page(
+                            result_doc,
+                            page,
+                            source_path,
+                            source_doc=source_doc,
+                            final=final,
+                        )
             includes_handwriting = False
             annotation_status = "not-included"
             warnings = [_BACKGROUND_WARNING]
             source = "per-page-background-attachments"
         elif layer == "native":
-            source_paths = [_resolve_attachment_path(sandbox, page) for page in ordered]
-            final_uses = _pdf_final_use_flags(source_paths)
+            source_paths = _export_sources(sandbox, ordered)
+            final_uses = _pdf_final_use_flags(source_paths, ordered)
             with _native_record_reader(sandbox) as record_reader:
                 with _PdfDocumentCache() as pdf_cache:
                     for page, source_path, final in zip(
                         ordered, source_paths, final_uses, strict=True
                     ):
-                        native_annotations.append(
-                            _append_native_page(
-                                result_doc,
-                                sandbox,
-                                page,
-                                pdf_cache=pdf_cache,
-                                record_reader=record_reader,
-                                source_path=source_path,
-                                final=final,
+                        with _export_page(page):
+                            native_annotations.append(
+                                _append_native_page(
+                                    result_doc,
+                                    sandbox,
+                                    page,
+                                    pdf_cache=pdf_cache,
+                                    record_reader=record_reader,
+                                    source_path=source_path,
+                                    final=final,
+                                )
                             )
-                        )
             includes_handwriting = any(
                 bool(entry.get("rendered_strokes")) for entry in native_annotations
             )
@@ -117,17 +175,18 @@ def export_pdf(
                 _check_registered_page_count(sandbox, ordered[0].document_id, registered_pdf.entry)
                 registered_pages = _registered_page_count(registered_pdf.entry)
                 for index, page in enumerate(ordered):
-                    registered_pdf.ensure_unchanged()
-                    source_page = page.number - 1
-                    _check_annotated_page_number(page, registered_pages)
-                    result_doc.insert_pdf(
-                        registered_pdf.document,
-                        from_page=source_page,
-                        to_page=source_page,
-                        annots=True,
-                        final=index == len(ordered) - 1,
-                    )
-                    registered_pdf.ensure_unchanged()
+                    with _export_page(page):
+                        registered_pdf.ensure_unchanged()
+                        source_page = page.number - 1
+                        _check_annotated_page_number(page, registered_pages)
+                        result_doc.insert_pdf(
+                            registered_pdf.document,
+                            from_page=source_page,
+                            to_page=source_page,
+                            annots=True,
+                            final=index == len(ordered) - 1,
+                        )
+                        registered_pdf.ensure_unchanged()
             finally:
                 registered_pdf.close()
             includes_handwriting = None

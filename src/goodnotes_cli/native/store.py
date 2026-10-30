@@ -12,7 +12,7 @@ import tempfile
 from collections.abc import Generator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Literal, Protocol
+from typing import Any, BinaryIO, Literal, Protocol
 
 from ..errors import GoodnotesError
 from ..storage.capture.copy import _clone_file_from_fd
@@ -36,24 +36,36 @@ class SnapshotProtocol(Protocol):
 
 
 def _inventory(path: Path) -> dict[str, tuple[int, int, int, int, int, int]]:
-    if path.is_symlink() or not path.is_dir():
-        raise NativeError(
-            "native_data_unavailable",
-            "The copied native store is missing or unsafe.",
-            operation="inspect_native_store",
-            path=path,
-        )
-    entries = {}
-    for child in sorted(path.iterdir()):
-        info = child.lstat()
-        if not stat.S_ISREG(info.st_mode):
+    failed_path = path
+    try:
+        if not stat.S_ISDIR(path.lstat().st_mode):
             raise NativeError(
                 "native_data_unavailable",
-                "The native store contains a symlink or nonregular entry.",
+                "The copied native store is missing or unsafe.",
                 operation="inspect_native_store",
-                path=child,
+                path=path,
             )
-        entries[child.name] = stat_key(info)
+        entries = {}
+        for child in sorted(path.iterdir()):
+            failed_path = child
+            info = child.lstat()
+            if not stat.S_ISREG(info.st_mode):
+                raise NativeError(
+                    "native_data_unavailable",
+                    "The native store contains a symlink or nonregular entry.",
+                    operation="inspect_native_store",
+                    path=child,
+                )
+            entries[child.name] = stat_key(info)
+    except OSError as exc:
+        message = (
+            "The copied native store is missing or unsafe."
+            if failed_path == path and isinstance(exc, FileNotFoundError)
+            else str(exc)
+        )
+        raise NativeError(
+            "native_data_unavailable", message, operation="inspect_native_store", path=failed_path
+        ) from exc
     if not entries or "CURRENT" not in entries:
         raise NativeError(
             "native_data_unavailable",
@@ -64,26 +76,45 @@ def _inventory(path: Path) -> dict[str, tuple[int, int, int, int, int, int]]:
     return entries
 
 
-def _read_small_regular(path: Path, expected: tuple[int, ...], limit: int) -> bytes:
-    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+@contextmanager
+def _duplicate_reader(fd: int) -> Generator[BinaryIO, None, None]:
+    """Borrow an original descriptor and own its duplicate until a stream adopts it."""
+    duplicate = os.dup(fd)
     try:
-        if stat_key(os.fstat(fd)) != expected or expected[3] > limit:
-            raise ValueError("Native metadata changed or exceeds its read budget")
-        with os.fdopen(os.dup(fd), "rb") as stream:
-            data = stream.read(limit + 1)
-        if (
-            len(data) != expected[3]
-            or stat_key(os.fstat(fd)) != expected
-            or stat_key(path.lstat()) != expected
-        ):
-            raise ValueError("Native metadata changed while reading")
-        return data
+        stream = os.fdopen(duplicate, "rb")
+    except BaseException:
+        try:
+            os.close(duplicate)
+        except OSError:
+            pass
+        raise
+    with stream:
+        yield stream
+
+
+def _read_small_regular(path: Path, expected: tuple[int, ...], limit: int) -> bytes:
+    try:
+        fd = os.open(
+            path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        )
+        try:
+            if stat_key(os.fstat(fd)) != expected or expected[3] > limit:
+                raise ValueError("Native metadata changed or exceeds its read budget")
+            with _duplicate_reader(fd) as stream:
+                data = stream.read(limit + 1)
+            if (
+                len(data) != expected[3]
+                or stat_key(os.fstat(fd)) != expected
+                or stat_key(path.lstat()) != expected
+            ):
+                raise ValueError("Native metadata changed while reading")
+            return data
+        finally:
+            os.close(fd)
     except (OSError, ValueError) as exc:
         raise NativeError(
             "native_data_unavailable", str(exc), operation="inspect_native_store", path=path
         ) from exc
-    finally:
-        os.close(fd)
 
 
 def _validate_options(source: Path, entries: Mapping[str, tuple[int, ...]]) -> None:
@@ -168,6 +199,84 @@ def native_store_fingerprint(
     return _validated_inventory(source)
 
 
+def _copy_store_file(
+    source: Path, copied: Path, expected: tuple[int, ...], copy_budget: int
+) -> int:
+    """Create one independent scratch file and charge only fallback byte copies."""
+    failed_path = source
+    try:
+        fd = os.open(
+            source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        )
+        try:
+            info = os.fstat(fd)
+            if stat_key(info) != expected:
+                raise NativeError(
+                    "native_data_unavailable",
+                    "The snapshot native store changed during capture.",
+                    operation="clone_native_store",
+                    path=source.parent,
+                )
+            failed_path = copied
+            try:
+                cloned_ok = _clone_file_from_fd(fd, copied)
+            except OSError as exc:
+                if exc.errno not in {
+                    errno.EXDEV,
+                    errno.ENOTSUP,
+                    errno.EOPNOTSUPP,
+                    errno.ENOSYS,
+                    errno.EINVAL,
+                }:
+                    raise NativeError(
+                        "native_data_unavailable",
+                        f"Could not clone native scratch: {exc}",
+                        operation="clone_native_store",
+                        path=copied,
+                    ) from exc
+                cloned_ok = False
+            if not cloned_ok:
+                if expected[3] > copy_budget:
+                    raise NativeError(
+                        "native_data_unavailable",
+                        "Native scratch requires "
+                        "copy-on-write support for stores larger than 64 MiB.",
+                        operation="clone_native_store",
+                        path=source.parent,
+                    )
+                copy_budget -= expected[3]
+                failed_path = source
+                with _duplicate_reader(fd) as reader:
+                    failed_path = copied
+                    with copied.open("xb") as writer:
+                        shutil.copyfileobj(reader, writer)
+            failed_path = copied
+            copied.chmod(0o600)
+            cloned = copied.stat()
+            failed_path = source
+            if (
+                (cloned.st_dev, cloned.st_ino) == (info.st_dev, info.st_ino)
+                or cloned.st_size != info.st_size
+                or stat_key(os.fstat(fd)) != expected
+            ):
+                raise NativeError(
+                    "native_data_unavailable",
+                    "Native scratch is not an independent stable copy.",
+                    operation="clone_native_store",
+                    path=source.parent,
+                )
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        raise NativeError(
+            "native_data_unavailable",
+            str(exc),
+            operation="clone_native_store",
+            path=exc.filename or failed_path,
+        ) from exc
+    return copy_budget
+
+
 @contextmanager
 def _scratch_store(
     source: Path, protection: OutputProtection, scratch_dir: Path | str | None = None
@@ -202,70 +311,17 @@ def _scratch_store(
                 path=temporary.name,
             ) from exc
         target = Path(temporary.name) / "store"
-        target.mkdir(mode=0o700)
+        try:
+            target.mkdir(mode=0o700)
+        except OSError as exc:
+            raise NativeError(
+                "native_data_unavailable", str(exc), operation="clone_native_store", path=target
+            ) from exc
         copy_budget = _MAX_COPY_FALLBACK
         for name, expected in before.items():
             # Validate the copied options above, but never copy them into engine scratch.
-            if name.startswith("OPTIONS-"):
-                continue
-            fd = os.open(
-                source / name,
-                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
-            )
-            try:
-                info = os.fstat(fd)
-                if stat_key(info) != expected:
-                    raise NativeError(
-                        "native_data_unavailable",
-                        "The snapshot native store changed during capture.",
-                        operation="clone_native_store",
-                        path=source,
-                    )
-                copied = target / name
-                try:
-                    cloned_ok = _clone_file_from_fd(fd, copied)
-                except OSError as exc:
-                    if exc.errno not in {
-                        errno.EXDEV,
-                        errno.ENOTSUP,
-                        errno.EOPNOTSUPP,
-                        errno.ENOSYS,
-                        errno.EINVAL,
-                    }:
-                        raise NativeError(
-                            "native_data_unavailable",
-                            f"Could not clone native scratch: {exc}",
-                            operation="clone_native_store",
-                            path=copied,
-                        ) from exc
-                    cloned_ok = False
-                if not cloned_ok:
-                    if expected[3] > copy_budget:
-                        raise NativeError(
-                            "native_data_unavailable",
-                            "Native scratch requires "
-                            "copy-on-write support for stores larger than 64 MiB.",
-                            operation="clone_native_store",
-                            path=source,
-                        )
-                    copy_budget -= expected[3]
-                    with os.fdopen(os.dup(fd), "rb") as reader, copied.open("xb") as writer:
-                        shutil.copyfileobj(reader, writer)
-                copied.chmod(0o600)
-                cloned = copied.stat()
-                if (
-                    (cloned.st_dev, cloned.st_ino) == (info.st_dev, info.st_ino)
-                    or cloned.st_size != info.st_size
-                    or stat_key(os.fstat(fd)) != expected
-                ):
-                    raise NativeError(
-                        "native_data_unavailable",
-                        "Native scratch is not an independent stable copy.",
-                        operation="clone_native_store",
-                        path=source,
-                    )
-            finally:
-                os.close(fd)
+            if not name.startswith("OPTIONS-"):
+                copy_budget = _copy_store_file(source / name, target / name, expected, copy_budget)
         if _inventory(source) != before:
             raise NativeError(
                 "native_data_unavailable",

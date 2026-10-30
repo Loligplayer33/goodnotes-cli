@@ -6,17 +6,14 @@ import sqlite3
 
 from ..errors import GoodnotesError
 from ..models import TextPart
+from .validation import required_integer
 
 
 def validate_metadata(
     row: sqlite3.Row, table: str, *, pdf: bool = False, handwriting: bool = False
 ) -> tuple[int, str | None, str | None]:
-    text_id = row["text_id"]
-    if (
-        not isinstance(text_id, int)
-        or isinstance(text_id, bool)
-        or (pdf and row["text_id_type"] != "integer")
-    ):
+    required_integer(row["text_id"], f"{table}.text_id")
+    if pdf and row["text_id_type"] != "integer":
         raise GoodnotesError(f"Search index has an invalid `{table}.text_id`; expected an integer.")
     if row["text_type"] != "text":
         raise GoodnotesError(f"Search index has an invalid `{table}.text` value; expected text.")

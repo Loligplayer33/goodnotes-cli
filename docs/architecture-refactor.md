@@ -77,6 +77,22 @@ safely rolled back with a stat-then-unlink check.
 
 ## Verification
 
+Follow-up reader and rendering corrections preserve successful output while tightening malformed
+input and failure behavior. Searches validate pages within their requested notebook scope and
+close source cursors before the session ends. Stored PDF page identity requires an actual positive
+integer; invalid candidate text metadata reached within the requested budget is rejected rather
+than disappearing in a join. The generic TPL parser rejects cumulative logical expansion above
+1,000,000 units, including nested and optimized arrays, while retaining its existing grammar and
+separate byte/nesting limits. This intentionally rejects some previously accepted oversized generic
+images; it is not a claim of an arbitrary-format CLI attack.
+
+Copied native-store filesystem errors retain their native operation and cause. Explicit bundle
+staging has one rendering owner across the CLI handoff, with a local completion flag that survives
+a later close failure. Present malformed render-error rows cannot become successful images, while
+valid page-only partial errors retain their existing shape. Selected-page export failures include
+their public page number, including source planning and PDF opening failures. These changes do not
+alter the documented late registered-source mutation or non-atomic filesystem limits.
+
 Use generated fixtures, a frozen baseline comparison, targeted failure injection and independently
 encoded native/reference data. Reorganize tests with their modules and shared generated support;
 keep acceptance discovery, dynamic imports, documentation and CI consistent.

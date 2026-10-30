@@ -1348,16 +1348,14 @@ def test_bundle_budget_and_published_paths(library_copy: Path, tmp_path: Path) -
 
 
 def test_bundle_publisher_does_not_replace_racing_directory(tmp_path: Path) -> None:
-    from goodnotes_cli.rendering.publication import publish_bundle
+    from goodnotes_cli.rendering.publication import bundle_stage, publish_bundle
 
-    temporary = tmp_path / "temporary"
-    temporary.mkdir()
-    (temporary / "text.json").write_text("{}")
     destination = tmp_path / "output"
     destination.mkdir()
     original_inode = destination.stat().st_ino
-    with pytest.raises(FileExistsError):
-        publish_bundle(temporary, destination)
+    with pytest.raises(FileExistsError), bundle_stage(destination) as stage:
+        (stage.path / "text.json").write_text("{}")
+        publish_bundle(stage, destination)
     assert destination.stat().st_ino == original_inode
     assert not list(destination.iterdir())
 

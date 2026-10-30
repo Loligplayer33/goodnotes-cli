@@ -744,3 +744,41 @@ def test_bundle_evidence_rejects_missing_or_mixed_render_identity(identity: str 
     rendered: dict[str, object] = {"document_id": identity} if identity else {}
     with pytest.raises(GoodnotesError, match="render has missing or inconsistent"):
         _bundle_content(texts, "expected", [1], [rendered], 100)
+
+
+@pytest.mark.parametrize("verbose", [False, True])
+@pytest.mark.parametrize("selection", ["1,2", "3,2"])
+def test_corrupt_selected_export_reports_public_page_without_publishing(
+    generated_copy: Path, tmp_path: Path, verbose: bool, selection: str
+) -> None:
+    attachments = generated_copy / "Library" / "Attachments"
+    (attachments / "corrupt.pdf").write_bytes(b"generated corrupt PDF")
+    with sqlite3.connect(generated_copy / "Library" / "Databases" / "projection.sqlite") as db:
+        db.execute("UPDATE attachments SET path = 'corrupt.pdf' WHERE id = 'attachment-unsafe'")
+    before = _tree_manifest(generated_copy)
+    output = tmp_path / "output" / "failed.pdf"
+
+    result = invoke_full(
+        [
+            "export",
+            "doc-hostile",
+            "--pages",
+            selection,
+            "--layer",
+            "background",
+            "--output",
+            str(output),
+        ],
+        tmp_path,
+        sandbox=generated_copy,
+        verbose=verbose,
+    )
+
+    assert result.returncode == 1
+    assert result.stdout == ""
+    error = json.loads(result.stderr)["error"]
+    assert error["code"] == "operation_failed"
+    assert "page 2" in error["message"]
+    assert not output.exists()
+    assert not list(output.parent.glob(".*.tmp-*"))
+    assert _tree_manifest(generated_copy) == before

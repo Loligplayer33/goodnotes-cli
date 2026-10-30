@@ -239,7 +239,7 @@ class PageTextReader:
                         ELSE instr(content.text, char(0))
                    END AS contains_nul
             FROM candidates
-            JOIN {table} AS content
+            LEFT JOIN {table} AS content
               ON content.text_id = candidates.text_id AND content.page_id = ?
             WHERE ? IS NULL OR candidates.prior_length < ?
             ORDER BY {result_ordering}

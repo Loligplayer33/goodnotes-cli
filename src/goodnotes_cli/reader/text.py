@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Iterator, Mapping
+from collections.abc import Generator
+from contextlib import closing
 from typing import Any, Literal, NotRequired, TypedDict
 
 from ..errors import GoodnotesError
@@ -20,12 +21,7 @@ from .index import (
     table_columns,
     table_exists,
 )
-
-
-def _required_integer(value: Any, field: str) -> int:
-    if not isinstance(value, int) or isinstance(value, bool):
-        raise GoodnotesError(f"Search index has an invalid `{field}`; expected an integer.")
-    return value
+from .validation import matches_pdf_identity, required_integer
 
 
 def _nonempty_text_counts(
@@ -52,7 +48,7 @@ def _nonempty_text_counts(
 
 
 def _pdf_text_length(row: sqlite3.Row) -> int:
-    length = _required_integer(row["text_length"], "pdf_text_content.text length")
+    length = required_integer(row["text_length"], "pdf_text_content.text length")
     if length < 0:
         raise GoodnotesError(
             "Search index has an invalid `pdf_text_content.text` length; "
@@ -189,21 +185,6 @@ def recognition_status(
     return result
 
 
-def matches_pdf_identity(row: Mapping[str, Any], page_ref: PageRef) -> bool:
-    """Match one stored PDF row to the identity derived from the projection."""
-    if not page_ref.attachment_id or page_ref.pdf_page_no is None:
-        return False
-    try:
-        content_page = int(row["pdf_page_no"])
-    except (KeyError, TypeError, ValueError):
-        return False
-    return (
-        row["document_id"] == page_ref.document_id
-        and row["attachment_id"] == page_ref.attachment_id
-        and content_page == page_ref.pdf_page_no
-    )
-
-
 def pdf_page_bindings(
     fts: sqlite3.Connection | None,
     page_refs: list[PageRef],
@@ -287,7 +268,7 @@ def pdf_page_bindings(
         binding["reason"] = None
         eligible[page_ref.page_id] = page_ref
         if direct_id is not None:
-            direct_id = _required_integer(direct_id, "page_meta.pdf_text_id")
+            direct_id = required_integer(direct_id, "page_meta.pdf_text_id")
             direct_id_to_pages.setdefault(direct_id, []).append(page_ref)
 
     candidate_lengths: dict[str, dict[int, int]] = {page_id: {} for page_id in eligible}
@@ -305,14 +286,14 @@ def pdf_page_bindings(
         ).fetchall()
         rows_by_id: dict[int, sqlite3.Row] = {}
         for row in direct_rows:
-            text_id = _required_integer(row["text_id"], "pdf_text_content.text_id")
+            text_id = required_integer(row["text_id"], "pdf_text_content.text_id")
             _pdf_text_length(row)
             rows_by_id[text_id] = row
         for direct_id in direct_id_batch:
             row = rows_by_id.get(direct_id)
             for page_ref in direct_id_to_pages[direct_id]:
                 if row is not None and matches_pdf_identity(dict(row), page_ref):
-                    text_length = _required_integer(
+                    text_length = required_integer(
                         row["text_length"], "pdf_text_content.text length"
                     )
                     if text_length:
@@ -361,7 +342,7 @@ def pdf_page_bindings(
             if candidate_page_ref is not None and matches_pdf_identity(
                 dict(row), candidate_page_ref
             ):
-                text_id = _required_integer(row["text_id"], "pdf_text_content.text_id")
+                text_id = required_integer(row["text_id"], "pdf_text_content.text_id")
                 text_length = _pdf_text_length(row)
                 candidate_lengths[candidate_page_ref.page_id][text_id] = text_length
 
@@ -574,7 +555,7 @@ def search_pdf_rows(
     binding_result: _PDFPageBindings,
     folded_query: str,
     document_ids: list[str] | None = None,
-) -> Iterator[sqlite3.Row]:
+) -> Generator[sqlite3.Row, None, None]:
     """Search only rows already bound to projection-derived page identities."""
     if not binding_result["available"]:
         return
@@ -596,8 +577,9 @@ def search_pdf_rows(
     for batch in batches(bound_rows, batch_size):
         values_sql = ", ".join("(?, ?, ?, ?, ?)" for _ in batch)
         parameters = tuple(value for row in batch for value in row) + (folded_query,)
-        yield from fts.execute(
-            f"""
+        with closing(
+            fts.execute(
+                f"""
             WITH bound_rows(page_id, document_id, attachment_id, pdf_page_no, text_id)
                 AS (VALUES {values_sql})
             SELECT bound.document_id, bound.page_id, content.text,
@@ -611,6 +593,10 @@ def search_pdf_rows(
             WHERE COALESCE(content.text, '') <> ''
               AND instr(casefold(content.text), ?) > 0
             ORDER BY content.text_id
-            """,
-            parameters,
-        )
+                """,
+                parameters,
+            )
+        ) as cursor:
+            # yield from would delegate a second cursor close on GeneratorExit.
+            for row in cursor:  # noqa: UP028
+                yield row

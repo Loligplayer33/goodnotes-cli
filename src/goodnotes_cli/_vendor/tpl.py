@@ -12,6 +12,25 @@ class TplDecodeError(ValueError):
     """Raised for malformed or unsupported TPL images."""
 
 
+_MAX_WORK = 1_000_000
+
+
+class _WorkBudget:
+    """Count retained schema nodes, decoded values and their tuple/list containers.
+
+    This is logical expansion, not bytes or every transient Python allocation.
+    Both root tuples count; a group schema counts its node and children tuples.
+    """
+
+    def __init__(self) -> None:
+        self.remaining = _MAX_WORK
+
+    def charge(self, count: int = 1) -> None:
+        if count > self.remaining:
+            raise TplDecodeError("TPL cumulative work exceeds budget")
+        self.remaining -= count
+
+
 if sys.version_info >= (3, 10):
     from typing import TypeAlias
 
@@ -31,9 +50,10 @@ class TplImage:
 
 
 class _Cursor:
-    def __init__(self, data: bytes, position: int) -> None:
+    def __init__(self, data: bytes, position: int, budget: _WorkBudget) -> None:
         self.data = data
         self.position = position
+        self.budget = budget
 
     def take(self, size: int) -> bytes:
         end = self.position + size
@@ -65,16 +85,19 @@ def _decode_fixed_array(
     """Use ``struct.iter_unpack`` for arrays of fixed-width scalar records."""
     if len(children) == 1 and isinstance(children[0], str) and children[0] in _FIXED_FORMATS:
         formats = _FIXED_FORMATS[children[0]]
+        cursor.budget.charge(count)
         raw = cursor.take(count * struct.calcsize("<" + formats))
         return [row[0] for row in struct.iter_unpack("<" + formats, raw)]
     if len(children) == 1 and isinstance(children[0], tuple) and children[0][0] == "S":
         fields = children[0][1]
         formats = _fixed_formats(fields) if fields else None
         if formats is not None:
+            cursor.budget.charge(count * (len(fields) + 1))
             raw = cursor.take(count * struct.calcsize("<" + formats))
             return [row for row in struct.iter_unpack("<" + formats, raw)]
     formats = _fixed_formats(children) if children else None
     if formats is not None:
+        cursor.budget.charge(count * (len(children) + 1))
         raw = cursor.take(count * struct.calcsize("<" + formats))
         return [row for row in struct.iter_unpack("<" + formats, raw)]
     return None
@@ -93,13 +116,14 @@ def _fixed_formats(children: tuple[_FormatNode, ...]) -> str | None:
     return "".join(formats)
 
 
-def _parse_format(format_string: str) -> tuple[_FormatNode, ...]:
+def _parse_format(format_string: str, budget: _WorkBudget) -> tuple[_FormatNode, ...]:
     position = 0
 
     def group(terminator: str | None = None, depth: int = 0) -> tuple[_FormatNode, ...]:
         nonlocal position
         if depth > 32:
             raise TplDecodeError("TPL format nesting exceeds budget")
+        budget.charge()  # The child sequence, including the root and empty groups.
         nodes: list[_FormatNode] = []
         while position < len(format_string):
             token = format_string[position]
@@ -112,8 +136,10 @@ def _parse_format(format_string: str) -> tuple[_FormatNode, ...]:
                 if position >= len(format_string) or format_string[position] != "(":
                     raise TplDecodeError(f"TPL {token} requires a parenthesized group")
                 position += 1
+                budget.charge()  # The group node tuple.
                 nodes.append((token, group(")", depth + 1)))
             elif token in "jviuIUcsfB":
+                budget.charge()
                 nodes.append(token)
             else:
                 raise TplDecodeError(f"unsupported TPL format token {token!r}")
@@ -125,6 +151,7 @@ def _parse_format(format_string: str) -> tuple[_FormatNode, ...]:
 
 
 def _decode_value(node: _FormatNode, cursor: _Cursor) -> TplValue:
+    cursor.budget.charge()
     if isinstance(node, tuple):
         kind, children = node
         if kind == "S":
@@ -137,7 +164,11 @@ def _decode_value(node: _FormatNode, cursor: _Cursor) -> TplValue:
             return fixed_values
         if len(children) == 1:
             return [_decode_value(children[0], cursor) for _ in range(count)]
-        return [tuple(_decode_value(child, cursor) for child in children) for _ in range(count)]
+        values: list[TplValue] = []
+        for _ in range(count):
+            cursor.budget.charge()  # The implicit record tuple.
+            values.append(tuple(_decode_value(child, cursor) for child in children))
+        return values
     if node == "s":
         size = cursor.u32()
         raw = cursor.take(max(size - 1, 0))
@@ -165,8 +196,10 @@ def decode_tpl(data: bytes) -> TplImage:
         format_string = data[8:end].decode("ascii")
     except UnicodeDecodeError as error:
         raise TplDecodeError("non-ASCII TPL format string") from error
-    nodes = _parse_format(format_string)
-    cursor = _Cursor(data, end + 1)
+    budget = _WorkBudget()
+    nodes = _parse_format(format_string, budget)
+    cursor = _Cursor(data, end + 1, budget)
+    budget.charge()  # The root values tuple.
     values = tuple(_decode_value(node, cursor) for node in nodes)
     if cursor.position != len(data):
         raise TplDecodeError(f"unconsumed TPL bytes: {len(data) - cursor.position}")

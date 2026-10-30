@@ -91,3 +91,33 @@ def test_foreign_invalid_page_id_does_not_break_selected_root(tmp_path: Path) ->
         with Library(sandbox, root_folder_id=root) as library:
             with pytest.raises(GoodnotesError, match="invalid pages.id"):
                 library.search("recognized", source="handwriting")
+
+
+def test_search_ignores_invalid_page_in_another_requested_root_notebook(tmp_path: Path) -> None:
+    sandbox = _create_snapshot(tmp_path)
+    with sqlite3.connect(sandbox.projection_path) as connection:
+        connection.execute(
+            "INSERT INTO pages VALUES (?, ?, ?, ?, ?, ?)", ("", "doc-root", None, "01", None, 0)
+        )
+    with Library(sandbox, root_folder_id=ROOT_ID) as library:
+        hits = library.search("recognized", source="handwriting", notebook="doc-hostile")
+        assert [(hit.page, hit.text) for hit in hits] == [(2, "recognized handwritten words")]
+        assert (
+            library.search_coverage(source="handwriting", notebook="doc-hostile")["active_pages"]
+            == 3
+        )
+        with pytest.raises(GoodnotesError, match="invalid pages.id"):
+            library.search("recognized", source="handwriting", notebook="doc-root")
+
+
+def test_page_scope_excludes_foreign_blob_document_before_validation(tmp_path: Path) -> None:
+    sandbox = _create_snapshot(tmp_path)
+    with sqlite3.connect(sandbox.projection_path) as connection:
+        connection.execute(
+            "INSERT INTO pages VALUES (?, ?, ?, ?, ?, ?)",
+            ("foreign-page", sqlite3.Binary(b"foreign"), None, "01", None, 0),
+        )
+    with Library(sandbox, root_folder_id=ROOT_ID) as library:
+        assert library.search("recognized", source="handwriting", notebook="doc-hostile")
+        assert len(library._pages.page_numbers({"doc-hostile"})) == 3
+        assert library._pages.page_numbers(set()) == {}
