@@ -23,14 +23,19 @@ equivalence. Its exit status reports capture completion; inspect `comparison_sta
 | Status | Meaning |
 | --- | --- |
 | `pass` | The selected check ran and met its acceptance rule. |
-| `fail` | A check found a mismatch, the tree changed, or receipt writing failed. |
+| `fail` | A check found a mismatch, the source or target changed, or receipt writing failed. |
 | `blocked` | A requested check could not run to completion. |
 | `unverified` | Optional evidence was not requested or exercised. |
 
-The receipt records the source commit, dirty state, content fingerprint, target, environment, selected checks, executed checks, and journey metrics. The runner compares source contents and Git status before and after the run. Report the commit and fingerprint with any claim about what passed.
+The receipt records the source commit, dirty state, content fingerprint, target, environment, selected checks, executed checks, and journey metrics. The runner compares source contents, Git status and selected target identity before and after the run. A passing receipt requires both `tree_integrity.status` and `target_integrity.status` to be `pass`. Report the commit and fingerprint with any claim about what passed.
 
-With `--cli`, the runner invokes an absolute executable outside the checkout and isolates inherited Goodnotes configuration, Python and pytest settings. It preserves an explicitly selected
-`GOODNOTES_ROCKSDB_LIBRARY` and applies the requested verification target controls. It resolves the console script's interpreter and verifies that the imported package is outside the checkout and matches the current source package. The receipt records version and package fingerprints, not local executable or import paths.
+With `--cli`, the runner invokes an absolute executable whose resolved location is outside the checkout and isolates inherited Goodnotes configuration, Python and pytest settings. It preserves an explicitly selected `GOODNOTES_ROCKSDB_LIBRARY` and applies the requested verification target controls.
+
+The selected interpreter must import an external package matching current source. Its installed distribution must declare `goodnotes = goodnotes_cli.cli:main` and contain one RECORD entry for the resolved executable with a matching SHA256 hash. The actual executable's `schema` must then report the same version and full source fingerprint. Missing or unsupported metadata and launcher forms block verification. Interpreter discovery supports Python shebangs and the observed uv shell trampoline for environment paths containing spaces; discovery reads the header without executing shell code.
+
+After all selected checks, the runner revalidates the original CLI selection, including a supplied symlink alias. A changed resolved target, launcher, interpreter, package or reported build fails target integrity. A known change remains a failure if a later validation step cannot complete; unavailable revalidation without a proven change is `blocked`. Receipts store version, opaque launcher/package fingerprints and the binding basis, without executable, interpreter or import paths or raw probe output. These checks establish local installation consistency; local RECORD metadata and command output are not adversarial authentication.
+
+The default target verifies the prepared source-editable environment. An explicit external editable installation can qualify if its package is outside this checkout and all binding checks pass. This does not establish wheel or sdist installation evidence; use the fresh-artifact workflow below for that claim.
 
 ## Installed build and snapshot provenance
 
@@ -76,6 +81,8 @@ dependency synchronization and does not install or verify dependencies.
 ## Receipt path restrictions
 
 `--report` may target the default `.local/verification/report.json`, an untracked path under repository `.local/`, or a path outside the repository. The runner rejects tracked repository paths and repository paths outside `.local/`.
+
+Repository-local admission requires a successful literal Git lookup proving the destination is untracked. Git errors, inability to start and timeouts fail before directories or temporary receipts are created.
 
 It also rejects a destination inside or below an ancestor containing `goodnotes-snapshot.json` or a `Databases` directory. This prevents writing into a snapshot or Library. The default receipt is allowed only when repository `.local/` is not a symlink and resolves inside the checkout.
 

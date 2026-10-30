@@ -256,6 +256,9 @@ def test_repeated_unstable_inventories_attempt_capture_at_maximum_delay(
     observations: list[str | _InventoryChanged] = [
         "a",
         *[_InventoryChanged("Generated inventory changed mid-scan") for _ in range(11)],
+        "a",
+        "a",
+        "a",
     ]
     refreshes: list[float] = []
 
@@ -273,13 +276,73 @@ def test_repeated_unstable_inventories_attempt_capture_at_maximum_delay(
     monkeypatch.setattr(watch_module, "refresh_cache", refresh)
     events = list(
         watch_module.watch_library(
-            Path("source"), Path("cache"), interval=1, debounce=2, iterations=12
+            Path("source"), Path("cache"), interval=1, debounce=2, iterations=15
         )
     )
 
-    assert refreshes == [0, 11]
-    assert [event["event"] for event in events] == ["ready", "updated"]
-    assert events[-1]["iteration"] == 12
+    assert refreshes == [0, 11, 12]
+    assert [event["event"] for event in events] == ["ready", "updated", "updated"]
+    assert events[-1]["iteration"] == 13
+
+
+def test_unknown_signature_capture_does_not_hide_restored_source_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    timer = clock(monkeypatch)
+    source = make_library(tmp_path / "source")
+    alternate = make_library(tmp_path / "alternate")
+    relative = Path("Attachments/page.pdf")
+    (alternate / relative).write_bytes(b"generated alternate attachment")
+    original_bytes = (source / relative).read_bytes()
+    original_signature = watch_module._input_signature
+    baseline = original_signature(source)
+    saved_source = tmp_path / "saved-source"
+    saved_alternate = tmp_path / "saved-alternate"
+    state = tmp_path / "cache"
+    actual_refresh = watch_module.refresh_cache
+    polls = 0
+    refreshes: list[float] = []
+
+    def signature(path: Path) -> str:
+        nonlocal polls
+        polls += 1
+        if polls == 2:
+            source.rename(saved_source)
+            alternate.rename(source)
+        if 2 <= polls <= 12:
+            raise _InventoryChanged("Generated inventory changed mid-scan")
+        return original_signature(path)
+
+    def refresh(path: Path, destination: Path) -> dict[str, object]:
+        refreshes.append(timer.now)
+        return actual_refresh(path, destination)
+
+    monkeypatch.setattr(watch_module, "_input_signature", signature)
+    monkeypatch.setattr(watch_module, "refresh_cache", refresh)
+    watcher = watch_module.watch_library(source, state, interval=1, debounce=2, iterations=15)
+    ready = next(watcher)
+    updated = next(watcher)
+    assert (Path(str(updated["snapshot"])) / "Library" / relative).read_bytes() == (
+        b"generated alternate attachment"
+    )
+    assert ready["source_changed_during_refresh"] is False
+    assert updated["source_changed_during_refresh"] is False
+
+    source.rename(saved_alternate)
+    saved_source.rename(source)
+    # Restoring the original tree preserves the inventoried child metadata. An
+    # in-place content revert would change ctime and would not prove this case.
+    assert original_signature(source) == baseline
+    remaining = list(watcher)
+
+    assert refreshes == [0, 11, 12]
+    assert [event["event"] for event in remaining] == ["updated"]
+    assert remaining[0]["iteration"] == 13
+    assert remaining[0]["source_changed_during_refresh"] is False
+    active = json.loads((state / "active.json").read_text())
+    assert (Path(active["snapshot"]) / "Library" / relative).read_bytes() == original_bytes
+    assert original_signature(source) == baseline
+    assert (saved_alternate / relative).read_bytes() == b"generated alternate attachment"
 
 
 def test_unstable_capture_restarts_coalescing_without_failure_backoff(

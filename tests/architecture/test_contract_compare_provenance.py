@@ -6,6 +6,7 @@ import importlib.util
 import os
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -125,6 +126,13 @@ def test_timeout_output_is_decoded_and_serializable(
         ({"timeout": True}, {"timeout": True}, "incomplete", ["case"], 0),
         ({"timeout": True}, {"exit_code": 0}, "incomplete", ["case"], 0),
         ({"exit_code": 0}, {"exit_code": 0}, "equivalent", [], 0),
+        (
+            {"exit_code": 1, "stderr": "generated error"},
+            {"exit_code": 1, "stderr": "generated error"},
+            "equivalent",
+            [],
+            0,
+        ),
         ({"exit_code": 0}, {"exit_code": 1}, "differences_require_review", [], 1),
     ],
 )
@@ -198,3 +206,153 @@ def test_incomplete_and_semantic_differences_are_both_reported(
     assert receipt["comparison_state"] == "incomplete"
     assert receipt["incomplete_cases"] == ["timeout"]
     assert [difference["case"] for difference in receipt["differences"]] == ["difference"]
+
+
+def test_comparator_runs_intended_success_under_hostile_inherited_configuration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, sandbox, _ = _RUNNER._create_fixture(tmp_path / "fixture")
+    for key, value in {
+        "GOODNOTES_LIBRARY_ROOT": "unrelated-catalog-root",
+        "GOODNOTES_SANDBOX": str(tmp_path / "unrelated-snapshot"),
+        "GOODNOTES_DATA_DIR": str(tmp_path / "unrelated-data"),
+        "GOODNOTES_SCRATCH_DIR": str(tmp_path / "unrelated-scratch"),
+        "GOODNOTES_ROCKSDB_LIBRARY": "/generated/selected-rocksdb",
+        "PYTHONHOME": str(tmp_path / "unrelated-python"),
+        "PYTHONPATH": str(tmp_path / "unrelated-imports"),
+        "PYTEST_ADDOPTS": "--unrelated-option",
+    }.items():
+        monkeypatch.setenv(key, value)
+    parent = dict(os.environ)
+    seen: dict[str, str] = {}
+    original_run = subprocess.run
+
+    def run(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        seen.update(kwargs["env"])
+        return original_run(*args, **kwargs)
+
+    monkeypatch.setattr(_RUNNER.subprocess, "run", run)
+    result = _RUNNER._run_case(
+        root=_RUNNER_PATH.parents[2],
+        output=tmp_path,
+        run_root=tmp_path / "run",
+        sandbox=sandbox,
+        source=source,
+        name="intended-ls",
+        arguments=["ls"],
+    )
+
+    assert result["exit_code"] == 0, result
+    assert result["stderr"] == ""
+    assert {item["id"] for item in result["stdout"]["items"]} >= {
+        "folder-a",
+        "folder-b",
+        "doc-root",
+    }
+    assert result["source_unchanged"] is True
+    assert seen["GOODNOTES_ROCKSDB_LIBRARY"] == "/generated/selected-rocksdb"
+    assert seen["GOODNOTES_DATA_DIR"] == str(tmp_path / "run" / "state" / "intended-ls")
+    assert seen["GOODNOTES_SCRATCH_DIR"] == str(tmp_path / "run" / "scratch")
+    assert {key for key in seen if key.startswith("PYTHON")} == {"PYTHONPATH", "PYTHONNOUSERSITE"}
+    assert seen["PYTHONPATH"] == str(_RUNNER_PATH.parents[2] / "src")
+    assert seen["PYTHONNOUSERSITE"] == "1"
+    assert "GOODNOTES_LIBRARY_ROOT" not in seen
+    assert not any(key.startswith("PYTEST_") for key in seen)
+    assert dict(os.environ) == parent
+
+
+def test_explicit_sandbox_sync_conflict_uses_common_completed_record(tmp_path: Path) -> None:
+    source, sandbox, _ = _RUNNER._create_fixture(tmp_path / "fixture")
+    arguments = ["--sandbox", str(sandbox), "sync", "--library", str(source)]
+
+    result = _RUNNER._run_case(
+        root=_RUNNER_PATH.parents[2],
+        output=tmp_path,
+        run_root=tmp_path / "run",
+        sandbox=sandbox,
+        source=source,
+        name="error/sync-with-sandbox",
+        arguments=arguments,
+    )
+
+    assert result["exit_code"] == 1
+    assert "--sandbox" in result["stderr"]["error"]["message"]
+    assert result["command"].count("--sandbox") == 1
+    assert result["source_unchanged"] is True
+    assert result["files"] == []
+
+
+@pytest.mark.parametrize(
+    ("capture", "timeout_sides"),
+    [("candidate", {"candidate"}), ("both", {"candidate"}), ("both", {"baseline", "candidate"})],
+    ids=["single", "paired-one-timeout", "paired-matching-timeouts"],
+)
+def test_sync_conflict_timeout_uses_common_owner_and_writes_incomplete_receipts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capture: str,
+    timeout_sides: set[str],
+) -> None:
+    import json
+    import sys
+
+    case_name = "error/sync-with-sandbox"
+    calls: list[str] = []
+    original_case = _RUNNER._run_case
+    provenance = {"revision": "generated"}
+    monkeypatch.setattr(_RUNNER, "_verify_baseline_package", lambda *args: provenance)
+
+    def only_conflict(**kwargs: Any) -> dict[str, Any]:
+        if kwargs["name"] != case_name:
+            return {"exit_code": 0, "stdout": {}}
+        return original_case(**kwargs)
+
+    def run(arguments: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        label = kwargs["cwd"].name
+        calls.append(label)
+        assert arguments.count("--sandbox") == 1
+        assert arguments[3] == "--sandbox"
+        assert "sync" in arguments
+        if label in timeout_sides:
+            raise subprocess.TimeoutExpired(arguments, 45, output=b"partial\xff", stderr=b"err\xfe")
+        return subprocess.CompletedProcess(arguments, 1, "", '{"error":{"message":"conflict"}}')
+
+    monkeypatch.setattr(_RUNNER, "_run_case", only_conflict)
+    monkeypatch.setattr(_RUNNER.subprocess, "run", run)
+    output = tmp_path / "output"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "runner",
+            "--baseline",
+            str(tmp_path / "baseline"),
+            "--candidate",
+            str(tmp_path / "candidate"),
+            "--output",
+            str(output),
+            "--capture",
+            capture,
+        ],
+    )
+
+    assert _RUNNER.main() == 0
+    assert calls == (["candidate"] if capture == "candidate" else ["baseline", "candidate"])
+    if capture == "both":
+        summary = json.loads((output / "diff.json").read_text())
+        assert summary["comparison_state"] == "incomplete"
+        assert summary["difference_count"] == 0
+        assert summary["incomplete_case_count"] == 1
+        receipt = output / "candidate.json"
+    else:
+        summary = json.loads(next(output.glob("capture-*.json")).read_text())
+        assert summary["comparison_state"] == "not_compared"
+        receipt = Path(summary["receipt"])
+    assert summary["capture_complete"] is True
+    assert summary["incomplete_cases"] == [case_name]
+    assert summary["exit_status_policy"] == "capture-completion-only"
+    record = json.loads(receipt.read_text())["records"][case_name]
+    assert record["timeout"] is True
+    assert record["stdout"] == "partial\ufffd"
+    assert record["stderr"] == "err\ufffd"
+    assert "source_unchanged" not in record

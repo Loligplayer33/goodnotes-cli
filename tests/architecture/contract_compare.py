@@ -19,7 +19,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import re
 import shutil
 import sqlite3
@@ -30,6 +29,11 @@ from pathlib import Path
 from typing import Any
 
 import pymupdf
+
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from scripts.verification.environment import isolated_environment  # noqa: E402
 
 BASELINE_REVISION = "0dc897713694326f9b00ef200cc77c2aeb601870"
 PACKAGE_SOURCE = "src/goodnotes_cli"
@@ -409,12 +413,14 @@ def _run_case(
 ) -> dict[str, Any]:
     data_dir = run_root / "state" / (data_group or name.replace("/", "-"))
     data_dir.parent.mkdir(parents=True, exist_ok=True)
-    environment = dict(os.environ)
-    environment.pop("GOODNOTES_SANDBOX", None)
-    environment["GOODNOTES_DATA_DIR"] = str(data_dir)
-    environment["GOODNOTES_SCRATCH_DIR"] = str(run_root / "scratch")
-    environment["PYTHONPATH"] = str(root / "src")
-    environment["PYTHONNOUSERSITE"] = "1"
+    environment = isolated_environment(
+        {
+            "GOODNOTES_DATA_DIR": str(data_dir),
+            "GOODNOTES_SCRATCH_DIR": str(run_root / "scratch"),
+            "PYTHONPATH": str(root / "src"),
+            "PYTHONNOUSERSITE": "1",
+        }
+    )
     (run_root / "scratch").mkdir(parents=True, exist_ok=True)
 
     global_options: list[str] = []
@@ -822,30 +828,7 @@ def _run_side(
         ("sync-with-sandbox", ["--sandbox", str(sandbox), "sync", "--library", str(source)]),
     ]
     for name, arguments in errors:
-        if arguments[0] == "--sandbox":
-            # The general invoker adds sandbox before all non-mutating commands;
-            # keep this dedicated conflict invocation free of duplicate options.
-            env = dict(os.environ)
-            env.pop("GOODNOTES_SANDBOX", None)
-            env["GOODNOTES_DATA_DIR"] = str(run_root / "state" / name)
-            env["PYTHONPATH"] = str(root / "src")
-            completed = subprocess.run(
-                [sys.executable, "-m", "goodnotes_cli", *arguments],
-                cwd=root,
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=45,
-                check=False,
-            )
-            records[f"error/{name}"] = {
-                "command": _normalise(arguments, run_root, output),
-                "exit_code": completed.returncode,
-                "stdout": _normalise(_parse_output(completed.stdout), run_root, output),
-                "stderr": _normalise(_parse_output(completed.stderr), run_root, output),
-            }
-        else:
-            record(f"error/{name}", arguments)
+        record(f"error/{name}", arguments)
 
     return {
         "root_label": label,

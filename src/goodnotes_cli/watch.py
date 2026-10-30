@@ -163,9 +163,9 @@ def watch_library(
             recovered = failures > 0
             failures = 0
             delay = interval
-            if result.get("source_changed_during_refresh") is True:
+            if result.get("source_changed_during_refresh") is True or signature is None:
                 baseline = None
-            elif signature is not None:
+            else:
                 baseline = signature
             candidate = None
             inventory_unsettled = False

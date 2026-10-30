@@ -14,12 +14,13 @@ from goodnotes_cli.errors import (
     _os_cause,
     _permission_denied,
 )
-from goodnotes_cli.storage.capture.types import _InventoryChanged
+from goodnotes_cli.storage.capture.types import (
+    _DATABASE_NAMES,
+    _DATABASE_SIDECAR_SUFFIXES,
+    _NATIVE_STORE_NAMES,
+    _InventoryChanged,
+)
 from goodnotes_cli.storage.paths import stat_key as _stat_key
-
-_DATABASES = ("projection.sqlite", "fts.sqlite")
-_DATABASE_SIDECARS = ("-wal", "-shm", "-journal")
-_NATIVE_STORES = ("notes_main.db",)
 
 
 def _lstat(path: Path) -> os.stat_result:
@@ -122,7 +123,7 @@ def _input_signature(source: Path, *, include_root: bool = False) -> str:
         ) from exc
     names = {entry.name for entry in database_children}
     malformed_entries: list[str] = []
-    for database_name in _DATABASES:
+    for database_name in _DATABASE_NAMES:
         database_path = database_dir / database_name
         if database_name in names:
             add(database_path, Path("Databases") / database_name, directory=False)
@@ -132,7 +133,9 @@ def _input_signature(source: Path, *, include_root: bool = False) -> str:
                 f"SQLite sidecars exist without their database: {database_path}"
             )
         for sidecar_name in sidecars:
-            if not any(sidecar_name == database_name + suffix for suffix in _DATABASE_SIDECARS):
+            if not any(
+                sidecar_name == database_name + suffix for suffix in _DATABASE_SIDECAR_SUFFIXES
+            ):
                 malformed_entries.append(
                     f"Unsupported SQLite sidecar: {database_dir / sidecar_name}"
                 )
@@ -177,7 +180,7 @@ def _input_signature(source: Path, *, include_root: bool = False) -> str:
             raise _InventoryChanged(f"Source directory changed while it was inspected: {directory}")
 
     scan(attachments_dir, Path("Attachments"))
-    for name in _NATIVE_STORES:
+    for name in _NATIVE_STORE_NAMES:
         if name in names:
             scan(database_dir / name, Path("Databases") / name)
     database_dir_after = _source_lstat(database_dir)

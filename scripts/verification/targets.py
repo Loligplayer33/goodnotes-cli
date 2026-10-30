@@ -10,11 +10,23 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+from base64 import urlsafe_b64encode
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .environment import isolated_environment
 from .paths import inside, temporary_parent
+
+
+@dataclass(frozen=True)
+class Target:
+    """Selected command and internal locations, separate from its public receipt."""
+
+    path: Path | None
+    receipt: dict[str, Any]
+    interpreter: Path | None = None
+    package: Path | None = None
 
 
 def _package_version() -> str | None:
@@ -48,6 +60,11 @@ def _executable(path: Path) -> bool:
         return False
 
 
+def _file_fingerprint(path: Path) -> str:
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
 def _env_shebang(tokens: list[str]) -> tuple[Path, list[str]]:
     if not tokens:
         raise ValueError("interpreter_missing")
@@ -70,6 +87,19 @@ def _env_shebang(tokens: list[str]) -> tuple[Path, list[str]]:
 def _shebang_interpreter(executable: Path) -> tuple[Path, list[str]]:
     with executable.open("rb") as stream:
         line = stream.readline(4097)
+        if line.rstrip(b"\r\n") == b"#!/bin/sh":
+            # uv's quoted Python trampoline for installation paths containing spaces.
+            trampoline = stream.readline(4097)
+            if len(trampoline) > 4096 or stream.readline(4097).rstrip(b"\r\n") != b"' '''":
+                raise ValueError("python_shebang_required")
+            prefix, suffix = b"'''exec' ", b' "$0" "$@"'
+            body = trampoline.rstrip(b"\r\n")
+            if not body.startswith(prefix) or not body.endswith(suffix):
+                raise ValueError("python_shebang_required")
+            tokens = shlex.split(body[len(prefix) : -len(suffix)].decode("utf-8", "strict"))
+            if len(tokens) != 1:
+                raise ValueError("python_shebang_required")
+            line = b"#!" + tokens[0].encode("utf-8")
     if len(line) > 4096 or not line.startswith(b"#!"):
         raise ValueError("python_shebang_required")
     raw = line[2:].decode("utf-8", "strict").strip()
@@ -101,17 +131,36 @@ _PROBE_SOURCE = """\
 import importlib.metadata as metadata
 import importlib.util
 import json
+import pathlib
+import sys
 try:
-    version = metadata.version('goodnotes-local-cli')
+    distribution = metadata.distribution('goodnotes-local-cli')
+    version = distribution.version
 except metadata.PackageNotFoundError:
+    distribution = None
     version = None
 spec = importlib.util.find_spec('goodnotes_cli')
 origin = spec.origin if spec is not None else None
-print(json.dumps({'version': version, 'origin': origin}, separators=(',', ':')))
+result = {'version': version, 'origin': origin}
+if len(sys.argv) > 1 and distribution is not None:
+    executable = pathlib.Path(sys.argv[1]).resolve()
+    entries = [entry.value for entry in distribution.entry_points
+               if entry.group == 'console_scripts' and entry.name == 'goodnotes']
+    records = [record for record in distribution.files or []
+               if pathlib.Path(distribution.locate_file(record)).resolve() == executable]
+    record_hash = records[0].hash if len(records) == 1 else None
+    result['launcher'] = {
+        'entries': entries, 'records': len(records),
+        'hash_mode': record_hash.mode if record_hash else None,
+        'hash_value': record_hash.value if record_hash else None,
+    }
+print(json.dumps(result, separators=(',', ':')))
 """
 
 
-def _probe_package(interpreter: Path, shebang_args: list[str], root: Path) -> dict[str, Any]:
+def _probe_package(
+    interpreter: Path, shebang_args: list[str], root: Path, executable: Path | None = None
+) -> dict[str, Any]:
     try:
         try:
             parent = temporary_parent(root)
@@ -122,7 +171,14 @@ def _probe_package(interpreter: Path, shebang_args: list[str], root: Path) -> di
                 {key: directory for key in ("TMPDIR", "TEMP", "TMP")}
             )
             result = subprocess.run(
-                [str(interpreter), *shebang_args, "-I", "-c", _PROBE_SOURCE],
+                [
+                    str(interpreter),
+                    *shebang_args,
+                    "-I",
+                    "-c",
+                    _PROBE_SOURCE,
+                    *([str(executable)] if executable is not None else []),
+                ],
                 cwd=directory,
                 env=environment,
                 capture_output=True,
@@ -139,7 +195,12 @@ def _probe_package(interpreter: Path, shebang_args: list[str], root: Path) -> di
         origin = value.get("origin")
         if not isinstance(version, str) or not version or not isinstance(origin, str) or not origin:
             return {"status": "blocked", "reason": "package_not_found"}
-        return {"status": "pass", "version": version, "origin": origin}
+        return {
+            "status": "pass",
+            "version": version,
+            "origin": origin,
+            "launcher": value.get("launcher"),
+        }
     except (
         OSError,
         RuntimeError,
@@ -151,50 +212,95 @@ def _probe_package(interpreter: Path, shebang_args: list[str], root: Path) -> di
         return {"status": "blocked", "reason": "package_probe_failed"}
 
 
-def _probe_installed_cli(executable: Path, root: Path) -> dict[str, Any]:
+def _probe_cli_build(executable: Path, root: Path) -> dict[str, Any]:
+    parent = temporary_parent(root)
+    with tempfile.TemporaryDirectory(prefix="goodnotes-verify-cli-", dir=parent) as directory:
+        result = subprocess.run(
+            [str(executable), "schema"],
+            cwd=directory,
+            env=isolated_environment({key: directory for key in ("TMPDIR", "TEMP", "TMP")}),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=15,
+        )
+    if result.returncode:
+        raise ValueError("installed_cli_build_unavailable")
+    value = json.loads(result.stdout)
+    build = value.get("build") if isinstance(value, dict) else None
+    if not isinstance(build, dict):
+        raise ValueError("installed_cli_build_unavailable")
+    return build
+
+
+def _probe_installed_cli(executable: Path, root: Path) -> Target:
+    receipt: dict[str, Any] = {"status": "blocked", "reason": "installed_target_probe_failed"}
     try:
+        if inside(executable, root):
+            return Target(executable, {"status": "blocked", "reason": "executable_in_checkout"})
+        launcher_fingerprint = _file_fingerprint(executable)
         interpreter, shebang_args = _shebang_interpreter(executable)
-        probe = _probe_package(interpreter, shebang_args, root)
+        probe = _probe_package(interpreter, shebang_args, root, executable)
         if probe.get("status") != "pass":
             reason = probe.get("reason")
             if reason == "unsafe_temporary_root":
-                return probe
+                return Target(executable, probe)
             if reason == "package_not_found":
-                return {"status": "blocked", "reason": "installed_package_not_found"}
-            return {"status": "blocked", "reason": "installed_target_probe_failed"}
+                receipt["reason"] = "installed_package_not_found"
+            return Target(executable, receipt)
         version = probe["version"]
-        origin_path = Path(probe["origin"]).resolve()
+        origin_path = Path(probe["origin"]).resolve(strict=True)
         if inside(origin_path, root):
-            return {"status": "blocked", "reason": "package_origin_in_checkout"}
+            return Target(executable, {"status": "blocked", "reason": "package_origin_in_checkout"})
         installed_fingerprint = _python_package_fingerprint(origin_path.parent)
         source_fingerprint = _python_package_fingerprint(root / "src" / "goodnotes_cli")
         if installed_fingerprint is None or source_fingerprint is None:
-            return {"status": "blocked", "reason": "installed_package_fingerprint_unavailable"}
+            raise ValueError("installed_package_fingerprint_unavailable")
+        receipt.update(
+            version=version,
+            import_origin="external",
+            executable_fingerprint=launcher_fingerprint,
+            package_fingerprint=installed_fingerprint,
+            source_package_fingerprint=source_fingerprint,
+        )
         if installed_fingerprint != source_fingerprint:
-            return {
-                "status": "blocked",
-                "reason": "installed_package_out_of_sync",
-                "version": version,
-                "import_origin": "external",
-                "package_fingerprint": installed_fingerprint,
-                "source_package_fingerprint": source_fingerprint,
-            }
-        return {
-            "status": "pass",
-            "version": version,
-            "import_origin": "external",
-            "package_fingerprint": installed_fingerprint,
-            "source_package_fingerprint": source_fingerprint,
-        }
+            raise ValueError("installed_package_out_of_sync")
+        launcher = probe.get("launcher")
+        if not isinstance(launcher, dict) or launcher.get("records") != 1:
+            raise ValueError("installed_launcher_record_unavailable")
+        if launcher.get("entries") != ["goodnotes_cli.cli:main"]:
+            raise ValueError("installed_entry_point_mismatch")
+        if launcher.get("hash_mode") != "sha256" or not isinstance(launcher.get("hash_value"), str):
+            raise ValueError("installed_launcher_record_unavailable")
+        expected_hash = urlsafe_b64encode(bytes.fromhex(launcher_fingerprint)).decode().rstrip("=")
+        if launcher["hash_value"] != expected_hash:
+            raise ValueError("installed_launcher_hash_mismatch")
+        build = _probe_cli_build(executable, root)
+        if build.get("version") != version or build.get("source_sha256") != installed_fingerprint:
+            raise ValueError("installed_cli_build_mismatch")
+        receipt.pop("reason")
+        receipt.update(status="pass", binding_basis="distribution-record-and-schema")
+        return Target(executable, receipt, interpreter.resolve(strict=True), origin_path.parent)
+    except ValueError as exc:
+        if str(exc) in {
+            "unsafe_temporary_root",
+            "installed_package_fingerprint_unavailable",
+            "installed_package_out_of_sync",
+            "installed_launcher_record_unavailable",
+            "installed_entry_point_mismatch",
+            "installed_launcher_hash_mismatch",
+            "installed_cli_build_unavailable",
+            "installed_cli_build_mismatch",
+        }:
+            receipt["reason"] = str(exc)
     except (
         OSError,
         RuntimeError,
-        ValueError,
         UnicodeError,
-        json.JSONDecodeError,
         subprocess.TimeoutExpired,
     ):
-        return {"status": "blocked", "reason": "installed_target_probe_failed"}
+        pass
+    return Target(executable, receipt)
 
 
 def _probe_development_package(
@@ -229,45 +335,105 @@ def _probe_development_package(
         return {"status": "blocked", "reason": "development_target_probe_failed"}
 
 
-def _probe_development_cli(executable: Path, root: Path, expected_python: Path) -> dict[str, Any]:
+def _probe_development_cli(executable: Path, root: Path, expected_python: Path) -> Target:
     try:
         interpreter, shebang_args = _shebang_interpreter(executable)
         if interpreter.resolve(strict=True) != expected_python.resolve(strict=True):
-            return {"status": "blocked", "reason": "development_interpreter_mismatch"}
+            return Target(
+                executable, {"status": "blocked", "reason": "development_interpreter_mismatch"}
+            )
+        fingerprint = _file_fingerprint(executable)
+        receipt = _probe_development_package(interpreter, shebang_args, root)
+        package = root / "src" / "goodnotes_cli"
+        if receipt.get("status") == "pass":
+            package_fingerprint = _python_package_fingerprint(package)
+            if package_fingerprint is None:
+                raise ValueError("development_package_unavailable")
+            receipt.update(
+                executable_fingerprint=fingerprint, package_fingerprint=package_fingerprint
+            )
+        return Target(executable, receipt, interpreter.resolve(strict=True), package)
     except (OSError, RuntimeError, ValueError):
-        return {"status": "blocked", "reason": "development_interpreter_unavailable"}
-    return _probe_development_package(interpreter, shebang_args, root)
+        return Target(
+            executable, {"status": "blocked", "reason": "development_interpreter_unavailable"}
+        )
 
 
-def _select_target(cli: str | None, root: Path, python: Path) -> tuple[Path | None, dict[str, Any]]:
-    if cli is None:
-        candidate = python.with_name("goodnotes")
-        if not _executable(candidate):
-            return None, {
-                "scope": "source_editable",
+def _select_target(cli: str | None, root: Path, python: Path) -> Target:
+    scope = "source_editable" if cli is None else "installed_external"
+    try:
+        candidate = python.with_name("goodnotes") if cli is None else Path(cli).expanduser()
+        if not candidate.is_absolute() or not _executable(candidate):
+            raise ValueError("executable_unavailable")
+        candidate = candidate.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return Target(
+            None,
+            {
+                "scope": scope,
                 "status": "blocked",
-                "reason": "development_cli_missing",
-                "version": _package_version(),
-            }
-        candidate = candidate.resolve()
-        probe = _probe_development_cli(candidate, root, python)
-        return candidate, {
-            "scope": "source_editable",
-            **probe,
-            "version": probe.get("version"),
-        }
-    candidate = Path(cli).expanduser()
-    if not candidate.is_absolute() or not _executable(candidate):
-        return None, {
-            "scope": "installed_external",
-            "status": "blocked",
-            "reason": "installed_cli_must_be_absolute_executable",
-            "version": None,
-        }
-    candidate = candidate.resolve(strict=True)
-    probe = _probe_installed_cli(candidate, root)
-    return candidate, {
-        "scope": "installed_external",
-        **probe,
-        "version": probe.get("version"),
-    }
+                "reason": "development_cli_missing"
+                if cli is None
+                else "installed_cli_must_be_absolute_executable",
+                "version": _package_version() if cli is None else None,
+            },
+        )
+    probe = (
+        _probe_development_cli(candidate, root, python)
+        if cli is None
+        else _probe_installed_cli(candidate, root)
+    )
+    return Target(
+        candidate,
+        {
+            "scope": scope,
+            **probe.receipt,
+            "version": probe.receipt.get("version"),
+        },
+        probe.interpreter,
+        probe.package,
+    )
+
+
+def _check_target_integrity(
+    cli: str | None, root: Path, python: Path, start: Target
+) -> dict[str, Any]:
+    if start.receipt.get("status") != "pass":
+        return {"status": "unverified"}
+    changed = {"status": "fail", "unchanged": False, "reason": "target_changed"}
+    try:
+        selected = Path(cli).expanduser() if cli is not None else python.with_name("goodnotes")
+        if selected.resolve(strict=True) != start.path:
+            return changed
+        if _file_fingerprint(selected) != start.receipt["executable_fingerprint"]:
+            return changed
+        interpreter, _ = _shebang_interpreter(selected)
+        if interpreter.resolve(strict=True) != start.interpreter:
+            return changed
+        if start.package is not None:
+            start.package.stat()
+            if _python_package_fingerprint(start.package) != start.receipt["package_fingerprint"]:
+                return changed
+        end = _select_target(cli, root, python)
+        if end.receipt.get("status") != "pass":
+            if end.receipt.get("reason") in {
+                "package_origin_in_checkout",
+                "installed_package_out_of_sync",
+                "installed_launcher_hash_mismatch",
+                "installed_entry_point_mismatch",
+                "installed_cli_build_mismatch",
+            }:
+                return changed
+            return {"status": "blocked", "reason": "target_revalidation_unavailable"}
+        if (end.path, end.interpreter, end.package, end.receipt) != (
+            start.path,
+            start.interpreter,
+            start.package,
+            start.receipt,
+        ):
+            return changed
+        return {"status": "pass", "unchanged": True}
+    except FileNotFoundError:
+        return changed
+    except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired):
+        return {"status": "blocked", "reason": "target_revalidation_unavailable"}

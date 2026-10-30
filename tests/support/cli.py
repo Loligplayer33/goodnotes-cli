@@ -13,6 +13,7 @@ from pathlib import Path
 from typer.testing import CliRunner
 
 from goodnotes_cli.cli import app
+from scripts.verification.environment import isolated_environment
 
 
 def invoke_in_process(
@@ -24,10 +25,13 @@ def invoke_in_process(
     verbose: bool = True,
 ) -> subprocess.CompletedProcess[str]:
     """Run ordinary parser/schema checks without starting a Python subprocess."""
-    environment = {
-        "GOODNOTES_DATA_DIR": str(data_dir or tmp_path / "state"),
-        "GOODNOTES_SANDBOX": "",
+    child_environment = isolated_environment(
+        {"GOODNOTES_DATA_DIR": str(data_dir or tmp_path / "state")}
+    )
+    environment: dict[str, str | None] = {
+        key: None for key in os.environ if key not in child_environment
     }
+    environment.update(child_environment)
     prefix = ["--sandbox", str(sandbox)] if sandbox is not None else []
     if verbose:
         prefix.append("--verbose")
@@ -49,9 +53,7 @@ def invoke(
     verbose: bool = True,
 ) -> subprocess.CompletedProcess[str]:
     """Exercise the full response contract unless a test requests concise defaults."""
-    environment = dict(os.environ)
-    environment.pop("GOODNOTES_SANDBOX", None)
-    environment["GOODNOTES_DATA_DIR"] = str(data_dir or tmp_path / "state")
+    environment = isolated_environment({"GOODNOTES_DATA_DIR": str(data_dir or tmp_path / "state")})
     prefix = ["--sandbox", str(sandbox)] if sandbox is not None else []
     if verbose:
         prefix.append("--verbose")

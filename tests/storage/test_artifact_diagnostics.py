@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import json
 import os
+import sys
 from collections.abc import Iterator
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 
 from goodnotes_cli.cache import refresh_cache
 from goodnotes_cli.diagnostics import inspect_environment
+from goodnotes_cli.storage.artifacts import ArtifactCache
+from goodnotes_cli.storage.paths import safe_remove_tree
 from tests.support.cli import _tree_manifest
 from tests.support.library import make_library
 
@@ -175,7 +180,7 @@ def test_macos_system_alias_and_arbitrary_symlink_policy(
 
     if sys.platform == "darwin":
         path = Path("/tmp") / f"goodnotes-absent-{os.getpid()}" / "artifacts"
-        assert _nearest_existing_artifact_directory(path) == (Path("/tmp"), False)
+        assert _nearest_existing_artifact_directory(path) == (Path("/private/tmp"), False)
         with pytest.raises(ValueError, match="symlink"):
             _nearest_existing_artifact_directory(Path("/tmp"))
     target = tmp_path / "target"
@@ -185,6 +190,43 @@ def test_macos_system_alias_and_arbitrary_symlink_policy(
     monkeypatch.setattr(sys, "platform", "darwin")
     with pytest.raises(ValueError, match="symlink"):
         _nearest_existing_artifact_directory(link / "artifacts")
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS system aliases are platform-specific")
+@pytest.mark.parametrize("alias", [Path("/tmp"), Path("/var")])
+def test_artifact_diagnostics_probe_the_verified_alias_target_without_writes(
+    tmp_path: Path, alias: Path
+) -> None:
+    _, state = _initialized_cache(tmp_path)
+    parent = alias / f"goodnotes-generated-absent-{uuid4().hex}"
+    artifact_root = parent / "artifacts"
+    target = Path("/private") / alias.name
+    writable = os.access(target, os.W_OK | os.X_OK)
+    before = _tree_manifest(state)
+    assert not parent.exists()
+
+    result = inspect_environment(state, artifact_dir=artifact_root)
+
+    check = next(check for check in result["checks"] if check["name"] == "artifact_directory")
+    assert result["status"] == "ready"
+    assert result["artifact_dir"] == str(artifact_root)
+    assert check["status"] == ("ok" if writable else "denied")
+    assert check["required"] is False
+    assert check["planned_path"] == str(artifact_root)
+    assert check["access_path"] == str(target)
+    assert check["directory_exists"] is False
+    assert check["write_access_hint"] is writable
+    assert check["write_tested"] is False
+    assert not parent.exists()
+    assert _tree_manifest(state) == before
+
+    if alias == Path("/tmp") and writable:
+        snapshot = Path(json.loads((state / "active.json").read_text())["snapshot"])
+        try:
+            with ArtifactCache(artifact_root, snapshot):
+                assert artifact_root.is_dir()
+        finally:
+            safe_remove_tree(parent)
 
 
 def test_macos_alias_requires_expected_directory_identity(monkeypatch: pytest.MonkeyPatch) -> None:

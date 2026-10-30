@@ -232,6 +232,16 @@ def test_doctor_schema_documents_access_only_projection(tmp_path: Path) -> None:
     assert "status" not in output["variants"]["default"]["fields"]
     assert "status" in output["variants"]["access_only"]["fields"]
     assert "active_pages" not in output["variants"]["access_only"]["fields"]
+    for field in ("scope", "library"):
+        assert output["optional_fields"][field] == "Requires --access-only or --notebook"
+        assert field not in output["variants"]["default"]["fields"]
+        assert field in output["variants"]["access_only"]["fields"]
+        assert field in output["variants"]["notebook"]["fields"]
+    assert output["optional_fields"]["status"] == "Requires --access-only"
+    assert successful(
+        invoke_in_process(["--fields", "scope", "doctor", "--access-only"], tmp_path)
+    ) == {"scope": "filesystem-access"}
+    assert not (tmp_path / "state").exists()
 
 
 def test_doctor_access_only_fields_are_preflighted_and_projected(tmp_path: Path) -> None:
@@ -1038,11 +1048,28 @@ def test_read_reuses_one_pdf_document_across_selected_pages(
     assert opened[0].is_closed
 
 
-@pytest.mark.parametrize("expression", ["0", "1-30", "2-1", "1,1", "1,,2"])
+@pytest.mark.parametrize("expression", ["", " ", "0", "1-30", "2-1", "1,1", "1,,2"])
 def test_bad_page_ranges_fail(library_copy: Path, tmp_path: Path, expression: str) -> None:
     result = invoke(["read", "doc-hostile", "--pages", expression], tmp_path, sandbox=library_copy)
     assert result.returncode == 1
-    assert json.loads(result.stderr)["error"]["message"]
+    assert result.stdout == ""
+    assert "Select 1 to 20 distinct pages" in json.loads(result.stderr)["error"]["message"]
+
+
+@pytest.mark.parametrize("arguments, expected_page", [([], 1), (["--page", "2"], 2)])
+def test_read_defaults_only_when_pages_is_omitted(
+    library_copy: Path, tmp_path: Path, arguments: list[str], expected_page: int
+) -> None:
+    result = successful(invoke(["read", "doc-hostile", *arguments], tmp_path, sandbox=library_copy))
+    assert [page["page"] for page in result["pages"]] == [expected_page]
+
+
+def test_read_page_and_empty_pages_conflict_before_repository_access(tmp_path: Path) -> None:
+    result = invoke_in_process(["read", "doc-hostile", "--page", "2", "--pages", ""], tmp_path)
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert json.loads(result.stderr)["error"]["message"] == "Use --page or --pages, not both."
+    assert not (tmp_path / "state").exists()
 
 
 def test_background_render_and_bundle(library_copy: Path, tmp_path: Path) -> None:

@@ -145,7 +145,7 @@ def read_text(
         raise GoodnotesError("--source must be text, all, pdf, handwriting, or textbox.")
     with repository(ctx) as lib:
         all_pages = repository_query(ctx, lib, lib.pages, notebook)
-        selected = select_pages(pages or str(page or 1), len(all_pages))
+        selected = select_pages(pages if pages is not None else str(page or 1), len(all_pages))
         results = []
         remaining = max_chars
         for number in selected:

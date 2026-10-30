@@ -26,7 +26,7 @@ from .suites import (
     _read_metrics,
     _run_test_suite,
 )
-from .targets import _select_target
+from .targets import _check_target_integrity, _select_target
 
 
 def _private_result(manifest: Path, cli: Path, root: Path) -> dict[str, Any]:
@@ -105,7 +105,8 @@ def run_verification(
         }
         provenance_error = "source_provenance_unavailable"
 
-    target_path, target = _select_target(cli, root, python)
+    selected_target = _select_target(cli, root, python)
+    target_path, target = selected_target.path, selected_target.receipt
     checks: dict[str, Any] = {
         "generated_acceptance": {"status": "blocked", "suites": {}},
         "private_corpus": {
@@ -184,6 +185,8 @@ def run_verification(
                 private_corpus.expanduser(), target_path, root
             )
 
+    checks["target_integrity"] = _check_target_integrity(cli, root, python, selected_target)
+
     try:
         end_source = _source_snapshot(root)
         tree_unchanged = (
@@ -210,6 +213,7 @@ def run_verification(
         target.get("status"),
         checks["generated_acceptance"]["status"],
         checks["tree_integrity"]["status"],
+        checks["target_integrity"]["status"],
     ]
     if private_corpus is not None:
         statuses.append(checks["private_corpus"]["status"])

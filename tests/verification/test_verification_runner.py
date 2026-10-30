@@ -158,6 +158,7 @@ def test_receipt_has_source_provenance_and_sanitized_journey_aggregates(
         == receipt["provenance"]["content_fingerprint_end"]
     )
     assert receipt["checks"]["generated_acceptance"]["status"] == "pass"
+    assert receipt["checks"]["target_integrity"] == {"status": "pass", "unchanged": True}
     assert receipt["checks"]["private_corpus"]["status"] == "unverified"
     assert receipt["journey_metrics"]["journey_count"] == 1
     assert receipt["journey_metrics"]["journeys"][0]["journey"] == "journey_1"
@@ -401,7 +402,8 @@ def test_default_target_requires_the_expected_interpreter(tmp_path: Path, monkey
         lambda *args: (_ for _ in ()).throw(AssertionError("package probe must not run")),
     )
 
-    target_path, target = targets._select_target(None, root, python)
+    selection = targets._select_target(None, root, python)
+    target_path, target = selection.path, selection.receipt
 
     assert target_path == cli.resolve()
     assert target["scope"] == "source_editable"
@@ -465,7 +467,7 @@ def test_temporary_work_blocks_protected_tmpdir_without_filesystem_changes(
     monkeypatch.setattr(runner, "_source_snapshot", lambda project: source_snapshot)
     before = _filesystem_state(protected)
 
-    installed_result = targets._probe_installed_cli(installed_cli, root)
+    installed_result = targets._probe_installed_cli(installed_cli, root).receipt
     development_result = targets._probe_development_package(python, [], root)
     assert installed_result == {"status": "blocked", "reason": "unsafe_temporary_root"}
     assert development_result == {"status": "blocked", "reason": "unsafe_temporary_root"}
@@ -553,12 +555,14 @@ def test_report_path_git_timeout_returns_sanitized_failure_receipt(
     monkeypatch.setattr(
         runner,
         "_select_target",
-        lambda cli, root, python: (None, {"status": "blocked", "reason": "fixture_target"}),
+        lambda cli, root, python: targets.Target(
+            None, {"status": "blocked", "reason": "fixture_target"}
+        ),
     )
     real_run = report.subprocess.run
 
     def timeout_report_protection(command: list[str], **kwargs: Any) -> Any:
-        if command[:2] == ["git", "ls-files"] and "--error-unmatch" in command:
+        if command[0] == "git" and "ls-files" in command:
             raise subprocess.TimeoutExpired(command, kwargs["timeout"])
         return real_run(command, **kwargs)
 

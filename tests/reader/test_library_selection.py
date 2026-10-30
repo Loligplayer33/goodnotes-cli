@@ -10,6 +10,9 @@ import pytest
 
 from goodnotes_cli.config import Settings
 from goodnotes_cli.errors import CacheAccessError
+from goodnotes_cli.storage.cache.lifecycle import refresh_cache
+from tests.support.cli import _tree_manifest, invoke, successful
+from tests.support.library import _create_snapshot
 
 
 def test_cache_selection_precedence_and_snapshot_isolation(tmp_path: Path) -> None:
@@ -36,6 +39,41 @@ def test_invalid_selection_never_silently_restores_the_combined_library(
     with pytest.raises(CacheAccessError) as error:
         Settings(cache_dir=tmp_path).load_library_root()
     assert "--library-root all" in error.value.details["remedy"]
+
+
+def test_excessively_nested_selection_has_a_public_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("GOODNOTES_LIBRARY_ROOT", raising=False)
+    source = _create_snapshot(tmp_path / "source").root / "Library"
+    state = tmp_path / "state"
+    captured = refresh_cache(source, state)
+    snapshot_path = captured["snapshot"]
+    assert isinstance(snapshot_path, str)
+    snapshot = Path(snapshot_path)
+    selection = state / "library-root.json"
+    selection.write_text('{"root_folder_id":' + "[" * 1200 + "0" + "]" * 1200 + "}")
+    assert selection.stat().st_size == 2420
+    before_source = _tree_manifest(source)
+    before_snapshot = _tree_manifest(snapshot)
+    before_selection = selection.read_bytes()
+
+    result = invoke(["ls"], tmp_path, data_dir=state)
+
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert len(result.stderr.splitlines()) == 1
+    error = json.loads(result.stderr)["error"]
+    assert error["code"] == "cache_invalid"
+    assert error["details"]["operation"] == "read_library_selection"
+    assert error["details"]["path"] == str(selection)
+    assert "--library-root all" in error["details"]["remedy"]
+    assert "Traceback" not in result.stderr
+    assert successful(invoke(["--library-root", "all", "ls"], tmp_path, data_dir=state))["items"]
+    assert successful(invoke(["ls"], tmp_path, sandbox=snapshot, data_dir=state))["items"]
+    assert _tree_manifest(source) == before_source
+    assert _tree_manifest(snapshot) == before_snapshot
+    assert selection.read_bytes() == before_selection
 
 
 @pytest.mark.parametrize("kind", ["symlink", "directory", "fifo"])

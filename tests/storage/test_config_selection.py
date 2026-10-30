@@ -44,3 +44,27 @@ def test_library_selection_rejects_replaced_entry(
     monkeypatch.setattr(Path, "lstat", replaced)
     with pytest.raises(CacheAccessError, match="library root selection is invalid"):
         Settings(cache_dir=tmp_path).load_library_root()
+
+
+def test_library_selection_classifies_parser_nesting_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from goodnotes_cli import config
+
+    path = tmp_path / "library-root.json"
+    path.write_text('{"root_folder_id":"generated"}')
+
+    def nested(_raw: bytes) -> object:
+        raise RecursionError("Generated parser nesting limit")
+
+    with monkeypatch.context() as parser_patch:
+        parser_patch.setattr(config.json, "loads", nested)
+        with pytest.raises(CacheAccessError) as error:
+            Settings(cache_dir=tmp_path).load_library_root()
+
+    assert error.value.code == "cache_invalid"
+    assert error.value.details["operation"] == "read_library_selection"
+    assert error.value.details["path"] == str(path)
+    assert error.value.details["cache_dir"] == str(tmp_path)
+    assert "--library-root all" in error.value.details["remedy"]
+    assert isinstance(error.value.__cause__, RecursionError)
