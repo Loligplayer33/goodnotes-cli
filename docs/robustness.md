@@ -57,3 +57,11 @@ Unknown visibility, geometry, transforms, versions, and records remain unknown o
 Filesystem containment uses identity checks for aliases. Cleanup checks parent directories and unlinks symlinks without changing targets. See [test_safety.py](../tests/storage/test_safety.py), [test_library.py](../tests/reader/test_library.py), [test_documents.py](../tests/rendering/test_documents.py), and [test_agent_output.py](../tests/interface/test_agent_output.py).
 
 For cache bounds and leases, see [Architecture](architecture.md#artifact-cache) and [test_artifacts.py](../tests/storage/test_artifacts.py), [test_storage_workflow.py](../tests/journeys/test_storage_workflow.py).
+
+Artifact ownership regressions in [test_artifact_ownership.py](../tests/storage/test_artifact_ownership.py)
+and [test_artifact_orphans.py](../tests/storage/test_artifact_orphans.py) inject interruption, failed
+unlock/close, and orphan replacement with generated files. They distinguish an attempted close from
+one that completed before raising. Cleanup of private copies and temporary blobs, plus session
+release, preserves an earlier failure and still attempts the remaining releases. Orphan deletion
+checks fresh identity and link metadata; separate stat/unlink calls do not prevent every concurrent
+same-user replacement.

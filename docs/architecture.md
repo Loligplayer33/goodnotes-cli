@@ -82,6 +82,15 @@ ArtifactCache enters its private filesystem owner once and keeps all borrowed de
 session. Stages, pins and publication state belong to the transaction owner. Retention accounting
 passes known directory identities through deletion. Native scratch encloses every engine and iterator handle.
 
+Artifact copy and blob-scan scopes close acquired local descriptors even when initial validation is
+interrupted. Root preparation failure and session release detach stored ownership before close;
+provisional lock cleanup preserves acquisition errors, and release attempts unlock and both closes
+once. These cleanup paths retain an earlier operation error; a cleanup-only failure remains an error.
+A failed or interrupted close is not retried.
+Orphan cleanup rechecks each inventoried identity and its current file/link metadata before unlinking
+through the pinned blobs directory. New names wait for a later pass. The final stat and unlink remain
+separate, non-atomic calls against arbitrary same-user replacement.
+
 Snapshot markers contain the captured file inventory and are limited to 64 MiB. If the generated
 marker exceeds this limit, capture fails before publication and removes its staging copy; the
 previous active snapshot remains available.
