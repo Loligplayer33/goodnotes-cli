@@ -52,7 +52,19 @@ Unknown visibility, geometry, transforms, versions, and records remain unknown o
 | Registered annotated PDF | Recheck signature and page count before annotated output. Page order and annotation inclusion remain unverified; never fall back to background. |
 | Bundle page-local error | Multi-page output may be partial if any image succeeds. Failed rows have `image: null` and `render_error`, without success metadata or a background substitute. If all images fail, publish nothing. |
 | Full PDF export error | All-or-nothing. Any selected-page failure prevents publication of a partial PDF and keeps the page context in the error. |
-| Output destination | Must be outside snapshot and production Library paths. Existing paths are never overwritten; bundle manifest publishes last. |
+| Output destination | Must be disjoint from the snapshot and known captured source root, and outside conventional production Library paths. Existing paths are never overwritten; bundle manifest publishes last. |
+| Captured source provenance | Missing historical provenance remains unknown. Present malformed provenance blocks explicit outputs and mutable storage without blocking navigation or text reads. A valid missing source location stays protected. |
+
+Artifact storage and annotated-PDF sidecar creation admit their owned directories before creating
+parents, control files or staging, including for artifact reuse and sidecar re-registration. Source
+identity failures remain errors with their permission causes. Native scratch rejects a parent
+inside a protected root, allows common ancestor parents, and checks each allocated child before
+copying bytes or opening the runtime. Child rejection can remove an already allocated empty scratch
+directory. Source and snapshot inputs remain unchanged.
+
+These checks protect the recorded source location and currently observable aliases. They cannot
+recover unknown historical locations or identify a source renamed away from that location.
+Admission, identity checks and filesystem writes remain separate operating-system calls.
 
 Filesystem containment uses identity checks for aliases. Cleanup checks parent directories and unlinks symlinks without changing targets. See [test_safety.py](../tests/storage/test_safety.py), [test_library.py](../tests/reader/test_library.py), [test_documents.py](../tests/rendering/test_documents.py), and [test_agent_output.py](../tests/interface/test_agent_output.py).
 

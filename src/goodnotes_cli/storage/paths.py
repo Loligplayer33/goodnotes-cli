@@ -6,6 +6,7 @@ import errno
 import os
 import stat
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -114,6 +115,44 @@ def paths_overlap(left: str | Path, right: str | Path) -> bool:
     """Check whether two paths refer to overlapping filesystem locations."""
 
     return path_contains(left, right) or path_contains(right, left)
+
+
+@dataclass(frozen=True)
+class OutputProtection:
+    """Known input roots excluded from generated outputs and mutable storage."""
+
+    snapshot_root: Path
+    source_root: Path | None = None
+
+    def require_disjoint(self, path: Path, *, purpose: str) -> None:
+        """Require an owned write location outside, and not above, protected roots."""
+
+        self._require_outside(path, purpose=purpose, allow_ancestor=False)
+
+    def require_scratch_parent(self, path: Path) -> None:
+        """Allow an ancestor parent that will contain a fresh, separately checked child."""
+
+        self._require_outside(path, purpose="The scratch directory", allow_ancestor=True)
+
+    def _require_outside(self, path: Path, *, purpose: str, allow_ancestor: bool) -> None:
+        for root, label in (
+            (self.snapshot_root, "Goodnotes snapshot"),
+            (self.source_root, "captured Goodnotes source"),
+        ):
+            if root is None:
+                continue
+            try:
+                overlaps = (
+                    path_contains(root, path) if allow_ancestor else paths_overlap(path, root)
+                )
+            except (OSError, RuntimeError) as exc:
+                raise GoodnotesError(
+                    f"Could not inspect the {label} for write authorization."
+                ) from exc
+            if overlaps:
+                raise GoodnotesError(
+                    f"{purpose} must be outside the {label}; paths must not overlap."
+                )
 
 
 def safe_remove_tree(path: str | Path) -> None:
@@ -247,7 +286,7 @@ def safe_output(
 
     try:
         return _safe_output(path, sandbox, inputs=inputs)
-    except OSError as exc:
+    except (OSError, GoodnotesError) as exc:
         if not _permission_denied(exc):
             raise
         raise FilesystemAccessError.from_exception(
@@ -266,8 +305,7 @@ def _safe_output(
     resolved = _resolved(requested)
     for candidate in (requested.absolute(), resolved):
         _require_not_production(candidate, purpose="an output")
-    if paths_overlap(resolved, sandbox.root):
-        raise GoodnotesError("Output paths must be outside the Goodnotes snapshot.")
+    sandbox.output_protection().require_disjoint(resolved, purpose="Output paths")
     for input_path in inputs:
         resolved_input = _resolved(input_path)
         if paths_overlap(resolved, resolved_input):

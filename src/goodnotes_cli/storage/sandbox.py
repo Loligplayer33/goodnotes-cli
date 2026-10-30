@@ -13,7 +13,7 @@ from typing import Any
 
 from goodnotes_cli.errors import CacheAccessError, GoodnotesError, _permission_denied
 from goodnotes_cli.storage.metadata import SNAPSHOT_MARKER_LIMIT, read_json
-from goodnotes_cli.storage.paths import _require_not_production, safe_output
+from goodnotes_cli.storage.paths import OutputProtection, _require_not_production, safe_output
 
 SNAPSHOT_MARKER = "goodnotes-snapshot.json"
 _SQLITE_SIDECAR_PREFIX = "-"
@@ -123,6 +123,23 @@ class Sandbox:
             captured_at=captured_at,
             marker_data=dict(marker_data),
         )
+
+    def output_protection(self) -> OutputProtection:
+        """Interpret optional captured provenance only when authorizing writes."""
+
+        if "source_path" not in self.marker_data:
+            return OutputProtection(self.root)
+        source = self.marker_data["source_path"]
+        if (
+            not isinstance(source, str)
+            or not source
+            or "\x00" in source
+            or not Path(source).is_absolute()
+        ):
+            raise GoodnotesError(
+                "The snapshot's captured source path is invalid for write authorization."
+            )
+        return OutputProtection(self.root, Path(source))
 
     def ensure_output(
         self,

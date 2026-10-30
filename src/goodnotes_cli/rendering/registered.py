@@ -7,13 +7,12 @@ import json
 import os
 import stat
 import tempfile
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
 import pymupdf as fitz
 
-from ..errors import FilesystemAccessError, GoodnotesError
+from ..errors import FilesystemAccessError, GoodnotesError, _permission_denied
 from ..models import Page
 from ..storage.metadata import CACHE_METADATA_LIMIT, read_json
 from ..storage.paths import _require_not_production
@@ -158,7 +157,11 @@ def _current_page_count(sandbox: SandboxProtocol, document_id: str) -> int:
 def _sidecar_dir(sandbox: SandboxProtocol, *, create: bool = False) -> Path:
     try:
         return _sidecar_dir_checked(sandbox, create=create)
-    except OSError as exc:
+    except FilesystemAccessError:
+        raise
+    except (OSError, GoodnotesError) as exc:
+        if isinstance(exc, GoodnotesError) and not _permission_denied(exc):
+            raise
         raise FilesystemAccessError.from_exception(
             exc,
             operation="create_annotated_pdf_sidecar" if create else "read_annotated_pdf_record",
@@ -176,8 +179,9 @@ def _sidecar_dir_checked(sandbox: SandboxProtocol, *, create: bool) -> Path:
         raise GoodnotesError("The annotated-PDF sidecar must not be a symbolic link.")
     _require_not_production(sidecar_dir, purpose="an annotated-PDF sidecar")
     if create:
-        sentinel = sidecar_dir / f".validate-{uuid.uuid4().hex}"
-        sandbox.ensure_output(sentinel)
+        sandbox.output_protection().require_disjoint(
+            sidecar_dir, purpose="The annotated-PDF sidecar"
+        )
         try:
             sidecar_parent.mkdir(mode=0o700, exist_ok=True)
             sidecar_dir.mkdir(mode=0o700, exist_ok=True)

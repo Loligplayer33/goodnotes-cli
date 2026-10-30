@@ -14,8 +14,9 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
+from ..errors import GoodnotesError
 from ..storage.capture.copy import _clone_file_from_fd
-from ..storage.paths import _require_not_production, path_contains, stat_key
+from ..storage.paths import OutputProtection, _require_not_production, stat_key
 from ..storage.sandbox import Sandbox
 from .errors import NativeError
 from .runtime import NativeRuntime
@@ -169,7 +170,7 @@ def native_store_fingerprint(
 
 @contextmanager
 def _scratch_store(
-    source: Path, snapshot_root: Path, scratch_dir: Path | str | None = None
+    source: Path, protection: OutputProtection, scratch_dir: Path | str | None = None
 ) -> Generator[Path, None, None]:
     before = _validated_inventory(source)
     configured = scratch_dir if scratch_dir is not None else os.environ.get("GOODNOTES_SCRATCH_DIR")
@@ -181,10 +182,9 @@ def _scratch_store(
             raise OSError("The scratch directory must not be a symlink")
         scratch_parent = scratch_parent.resolve(strict=True)
         _require_not_production(scratch_parent, purpose="native scratch")
-        if path_contains(snapshot_root, scratch_parent):
-            raise OSError("The scratch directory must stay outside the snapshot")
+        protection.require_scratch_parent(scratch_parent)
         temporary = tempfile.TemporaryDirectory(prefix="goodnotes-native-", dir=scratch_parent)
-    except OSError as exc:
+    except (OSError, GoodnotesError) as exc:
         raise NativeError(
             "native_data_unavailable",
             f"Could not create private native scratch: {exc}",
@@ -192,6 +192,15 @@ def _scratch_store(
             path=scratch_parent,
         ) from exc
     try:
+        try:
+            protection.require_disjoint(Path(temporary.name), purpose="Native scratch")
+        except GoodnotesError as exc:
+            raise NativeError(
+                "native_data_unavailable",
+                f"Could not create private native scratch: {exc}",
+                operation="create_native_scratch",
+                path=temporary.name,
+            ) from exc
         target = Path(temporary.name) / "store"
         target.mkdir(mode=0o700)
         copy_budget = _MAX_COPY_FALLBACK
@@ -298,8 +307,17 @@ class NativeStoreSession:
         self._entered = True
         try:
             validated, source = _validated_snapshot_store(self._sandbox)
+            try:
+                protection = validated.output_protection()
+            except GoodnotesError as exc:
+                raise NativeError(
+                    "native_data_unavailable",
+                    f"Could not authorize private native scratch: {exc}",
+                    operation="create_native_scratch",
+                    path=validated.root,
+                ) from exc
             self._scratch_context = _scratch_store(
-                source, validated.root, scratch_dir=self._scratch_dir
+                source, protection, scratch_dir=self._scratch_dir
             )
             self._scratch = self._scratch_context.__enter__()
             self._runtime = NativeRuntime()
