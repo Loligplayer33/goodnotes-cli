@@ -9,9 +9,9 @@ from typing import Any
 
 import pytest
 
-from goodnotes_cli.documents import register_annotated_pdf
 from goodnotes_cli.errors import FilesystemAccessError, GoodnotesError, _permission_denied
 from goodnotes_cli.rendering import registered
+from goodnotes_cli.rendering.registered import register_annotated_pdf
 from goodnotes_cli.storage.sandbox import Sandbox
 from tests.rendering.test_documents import _make_pdf, _make_real_snapshot
 from tests.support.cli import _tree_manifest

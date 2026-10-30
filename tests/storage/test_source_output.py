@@ -8,9 +8,9 @@ from typing import Any
 
 import pytest
 
-from goodnotes_cli.artifacts import ArtifactCache, artifact_key
 from goodnotes_cli.errors import FilesystemAccessError, GoodnotesError, _permission_denied
 from goodnotes_cli.library import Library
+from goodnotes_cli.storage.artifacts import ArtifactCache, artifact_key
 from goodnotes_cli.storage.artifacts.filesystem import ArtifactFilesystem
 from goodnotes_cli.storage.sandbox import Sandbox
 from tests.support.cli import _tree_manifest
