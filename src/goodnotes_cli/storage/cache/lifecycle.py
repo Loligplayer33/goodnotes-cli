@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -18,7 +17,7 @@ from goodnotes_cli.errors import (
     _os_cause,
     _permission_denied,
 )
-from goodnotes_cli.storage.capture.lifecycle import create_snapshot
+from goodnotes_cli.storage.capture.lifecycle import _capture_snapshot
 from goodnotes_cli.storage.capture.types import _InventoryChanged
 from goodnotes_cli.storage.paths import _require_not_production, paths_overlap
 from goodnotes_cli.storage.sandbox import Sandbox
@@ -29,8 +28,6 @@ if TYPE_CHECKING:
 from goodnotes_cli.storage.cache.maintenance import (
     _clean_abandoned_staging,
     _prune_snapshots,
-    _remove_generation,
-    _safe_remove_tree,
     _validate_generated_snapshots,
 )
 from goodnotes_cli.storage.cache.state import (
@@ -235,32 +232,42 @@ def refresh_cache(
                         ),
                     )
 
-        checked_at = _timestamp()
-        captured_at = _timestamp()
-        generation = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid4().hex[:8]
-        staging = snapshots / f".staging-{uuid4().hex}"
-        destination = snapshots / generation
-        if destination.exists() or destination.is_symlink():
-            raise GoodnotesError(f"Refusing to overwrite a cache generation: {destination}")
+        return _capture_and_publish(
+            source, state, snapshots, force=force, active=active, source_signature=source_signature
+        )
 
+
+def _capture_and_publish(
+    source: Path,
+    state: Path,
+    snapshots: Path,
+    *,
+    force: bool,
+    active: tuple[dict[str, Any], Path, Sandbox | None] | None,
+    source_signature: str,
+) -> dict[str, object]:
+    """Capture one generation under the caller's sync lock and retain it through publication."""
+
+    checked_at = _timestamp()
+    captured_at = _timestamp()
+    generation = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid4().hex[:8]
+    staging_path = snapshots / f".staging-{uuid4().hex}"
+    destination = snapshots / generation
+    if destination.exists() or destination.is_symlink():
+        raise GoodnotesError(f"Refusing to overwrite a cache generation: {destination}")
+    previous_snapshot = (
+        active[1]
+        if not force
+        and active is not None
+        and active[2] is not None
+        and active[0].get("source_path") == str(source)
+        else None
+    )
+    with _capture_snapshot(source, staging_path, previous_snapshot=previous_snapshot) as staging:
         published = False
         try:
-            previous_snapshot = (
-                active[1]
-                if not force
-                and active is not None
-                and active[2] is not None
-                and active[0].get("source_path") == str(source)
-                else None
-            )
-            if previous_snapshot is None:
-                create_snapshot(source, staging)
-            else:
-                create_snapshot(source, staging, previous_snapshot=previous_snapshot)
-            sandbox = Sandbox.load(staging)
-            if destination.exists() or destination.is_symlink():
-                raise GoodnotesError(f"Refusing to overwrite a cache generation: {destination}")
-            os.replace(staging, destination)
+            Sandbox.load(staging.path)
+            staging.rename(destination)
             sandbox = Sandbox.load(destination)
             cache_signature = _input_signature(sandbox.library_dir, include_root=True)
             captured_at = _snapshot_captured_at(destination, sandbox.marker_data)
@@ -285,8 +292,7 @@ def refresh_cache(
                 pointer_data["source_signature"] = saved_signature
 
             with _file_lock(state / _VIEW_LOCK, exclusive=True):
-                # Re-check the pointer immediately before replacing it. This also rejects an
-                # unexpected symlink or malformed state introduced during capture.
+                # The pointer check and owner release share this publication lifetime.
                 previous = _read_pointer(state, snapshots, allow_missing_snapshot=True)
                 previous_name = previous[1].name if previous is not None else None
                 cleanup_warnings = []
@@ -296,6 +302,7 @@ def refresh_cache(
                     cleanup_warnings.append(f"Could not clean abandoned staging: {exc}")
                 _write_json_atomic(state, "active.json", pointer_data)
                 published = True
+                staging.release()
                 cleanup_warnings.extend(
                     _prune_snapshots(snapshots, destination.name, previous_name)
                 )
@@ -303,21 +310,12 @@ def refresh_cache(
             if not published:
                 try:
                     pointer = _read_pointer(state, snapshots)
-                    published = pointer is not None and pointer[1] == destination
-                except GoodnotesError:
-                    pass
-            if not published:
-                if staging.exists() and not staging.is_symlink():
-                    try:
-                        _safe_remove_tree(staging)
-                    except GoodnotesError:
-                        # Keep unsafe candidates for inspection instead of following links.
-                        pass
-                if destination.exists() and not destination.is_symlink():
-                    try:
-                        _remove_generation(snapshots, destination)
-                    except GoodnotesError:
-                        pass
+                except BaseException:
+                    # Publication is uncertain. Preserve the possibly active generation.
+                    staging.release()
+                else:
+                    if pointer is not None and pointer[1] == destination:
+                        staging.release()
             raise
 
         return _result(
