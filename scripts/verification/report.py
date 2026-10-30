@@ -48,15 +48,25 @@ def _protect_report_destination(target: Path, root: Path) -> None:
             raise ValueError("report_path_protected")
         try:
             result = subprocess.run(
-                ["git", "ls-files", "--error-unmatch", "--", relative.as_posix()],
+                [
+                    "git",
+                    "--literal-pathspecs",
+                    "ls-files",
+                    "--cached",
+                    "-z",
+                    "--",
+                    relative.as_posix(),
+                ],
                 cwd=root,
                 capture_output=True,
                 check=False,
                 timeout=15,
             )
-        except subprocess.TimeoutExpired:
+        except (OSError, subprocess.TimeoutExpired):
             raise ValueError("report_path_protection_unavailable") from None
-        if result.returncode == 0:
+        if result.returncode != 0:
+            raise ValueError("report_path_protection_unavailable")
+        if result.stdout:
             raise ValueError("report_path_protected")
         return
 

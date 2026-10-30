@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import sqlite3
 import struct
 import subprocess
@@ -15,6 +14,7 @@ from uuid import UUID
 
 import pymupdf as fitz
 
+from scripts.verification.environment import isolated_environment
 from tests.support.library import _create_snapshot
 from tests.support.native_store_fixture import (
     LOGICAL_IDS,
@@ -34,14 +34,15 @@ native_runtime = _native_runtime
 
 
 def _environment(tmp_path: Path) -> dict[str, str]:
-    environment = dict(os.environ)
-    environment.pop("GOODNOTES_SANDBOX", None)
-    environment["GOODNOTES_DATA_DIR"] = str(tmp_path / "cache")
     scratch = tmp_path / "scratch"
     scratch.mkdir(exist_ok=True)
-    environment["GOODNOTES_SCRATCH_DIR"] = str(scratch)
-    environment["PYTHONUNBUFFERED"] = "1"
-    return environment
+    return isolated_environment(
+        {
+            "GOODNOTES_DATA_DIR": str(tmp_path / "cache"),
+            "GOODNOTES_SCRATCH_DIR": str(scratch),
+            "PYTHONUNBUFFERED": "1",
+        }
+    )
 
 
 def _run(arguments: list[str], environment: dict[str, str]) -> subprocess.CompletedProcess[str]:

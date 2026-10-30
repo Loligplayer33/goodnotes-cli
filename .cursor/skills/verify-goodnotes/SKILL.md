@@ -14,12 +14,13 @@ current runner contract and optional target syntax.
 1. From the repository root, run the required generated checks:
 
    ```sh
-   uv run python scripts/verify.py
+   uv run --locked python scripts/verify.py
    ```
 
 2. Accept the run only when the receipt has `status: pass`, `exit_code: 0`,
-   `target.status: pass`, `tree_integrity.status: pass`, and
-   `generated_acceptance.status: pass`. Both required suites must report `pass`
+   `target.status: pass`, `checks.tree_integrity.status: pass`,
+   `checks.target_integrity.status: pass`, and
+   `checks.generated_acceptance.status: pass`. Both required suites must report `pass`
    with zero skips. If a private corpus was requested, require its status to
    pass as well. A required skip is `blocked`.
 3. Run an installed target with `--cli` only when the installed executable is in
@@ -33,8 +34,9 @@ current runner contract and optional target syntax.
 When inspecting a receipt, report `pass`, `fail`, `blocked`, or `unverified` for
 each selected check. An unrequested private-corpus check remains `unverified`.
 The receipt records source provenance and aggregate check results, not raw
-subprocess output. Read [the feature map](../../../features/verification.md) to
-choose focused suites and linked regression tests.
+subprocess output. Use the linked suites in
+[what the evidence establishes](../../../docs/verification.md#what-the-evidence-establishes)
+to choose focused coverage.
 
 ## Compare rendering
 
@@ -73,9 +75,9 @@ workflow.
 
 - [`scripts/verify.py`](../../../scripts/verify.py) runs required suites and
   writes the receipt.
-- [`scripts/verification_reference.py`](../../../scripts/verification_reference.py)
+- [`scripts/verification/reference.py`](../../../scripts/verification/reference.py)
   compares pages and runs explicit copied-corpus checks.
-- [`tests/native_fixture.py`](../../../tests/native_fixture.py) provides shared
+- [`tests/support/native_store_fixture.py`](../../../tests/support/native_store_fixture.py) provides shared
   generated native fixtures.
-- [`features/verification.md`](../../../features/verification.md) maps journeys
-  to tests and existing regressions.
+- [`tests/journeys/test_study_journeys.py`](../../../tests/journeys/test_study_journeys.py)
+  exercises generated study journeys through the selected console command.

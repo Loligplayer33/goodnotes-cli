@@ -93,7 +93,7 @@ class Settings:
                 selected = data["root_folder_id"]
                 if not isinstance(selected, str) or not selected.strip():
                     raise ValueError("Invalid root ID.")
-            except (OSError, ValueError, TypeError) as exc:
+            except (OSError, ValueError, TypeError, RecursionError) as exc:
                 raise CacheAccessError(
                     "cache_invalid",
                     "The library root selection is invalid.",

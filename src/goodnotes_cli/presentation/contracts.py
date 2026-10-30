@@ -258,14 +258,17 @@ def output_contract(command_name: str) -> dict[str, Any] | None:
                 for field, option in spec.conditional_fields
             }
         )
+        variant_options: dict[str, list[str]] = {}
         for option, variant_fields in spec.field_variants:
-            result.setdefault("optional_fields", {}).update(
-                {
-                    field: f"Requires --{option.replace('_', '-')}"
-                    for field in variant_fields
-                    if field not in spec.fields
-                }
-            )
+            for field in variant_fields:
+                if field not in spec.fields:
+                    variant_options.setdefault(field, []).append(f"--{option.replace('_', '-')}")
+        result["optional_fields"].update(
+            {
+                field: f"Requires {' or '.join(options)}"
+                for field, options in variant_options.items()
+            }
+        )
         if not result["optional_fields"]:
             del result["optional_fields"]
         if spec.example is not None:

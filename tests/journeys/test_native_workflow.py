@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import select
 import signal
 import stat
@@ -20,6 +19,7 @@ from goodnotes_cli.cache import read_view
 from goodnotes_cli.config import Settings
 from goodnotes_cli.documents import render_page
 from goodnotes_cli.library import Library
+from scripts.verification.environment import isolated_environment
 from tests.support.native_store_fixture import LOGICAL_IDS as LOGICAL_IDS
 from tests.support.native_store_fixture import (
     NOTEBOOK,
@@ -36,14 +36,15 @@ from tests.support.native_store_fixture import native_runtime as native_runtime
 
 
 def _environment(tmp_path: Path) -> dict[str, str]:
-    environment = dict(os.environ)
-    environment.pop("GOODNOTES_SANDBOX", None)
-    environment["GOODNOTES_DATA_DIR"] = str(tmp_path / "cache")
     scratch = tmp_path / "scratch"
     scratch.mkdir(exist_ok=True)
-    environment["GOODNOTES_SCRATCH_DIR"] = str(scratch)
-    environment["PYTHONUNBUFFERED"] = "1"
-    return environment
+    return isolated_environment(
+        {
+            "GOODNOTES_DATA_DIR": str(tmp_path / "cache"),
+            "GOODNOTES_SCRATCH_DIR": str(scratch),
+            "PYTHONUNBUFFERED": "1",
+        }
+    )
 
 
 def _command(arguments: list[str], environment: dict[str, str]) -> dict:

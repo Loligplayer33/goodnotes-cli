@@ -22,6 +22,7 @@ from goodnotes_cli.library import Library
 from goodnotes_cli.safety import Sandbox
 from goodnotes_cli.snapshot import create_snapshot
 from scripts.verification import reference as reference_checks
+from scripts.verification.environment import isolated_environment
 from tests.support.native_store_fixture import NOTEBOOK, GeneratedNativeStore
 from tests.support.native_store_fixture import generated_source as generated_source
 from tests.support.native_store_fixture import native_runtime as native_runtime
@@ -70,10 +71,12 @@ def test_generated_native_output_matches_independently_drawn_reference(
     image = tmp_path / "actual.png"
     executable = os.environ.get("GOODNOTES_VERIFY_CLI")
     if executable:
-        environment = dict(os.environ)
-        environment.pop("PYTHONPATH", None)
-        environment["GOODNOTES_DATA_DIR"] = str(tmp_path / "data")
-        environment["GOODNOTES_SCRATCH_DIR"] = str(tmp_path / "scratch")
+        environment = isolated_environment(
+            {
+                "GOODNOTES_DATA_DIR": str(tmp_path / "data"),
+                "GOODNOTES_SCRATCH_DIR": str(tmp_path / "scratch"),
+            }
+        )
         (tmp_path / "scratch").mkdir()
         completed = subprocess.run(
             [
