@@ -21,6 +21,7 @@ from goodnotes_cli.native import (
 from goodnotes_cli.native import runtime as native_runtime
 from goodnotes_cli.native import store as native
 from goodnotes_cli.native.store import _inventory, _scratch_store
+from goodnotes_cli.storage.paths import OutputProtection
 
 
 @pytest.mark.parametrize(
@@ -252,7 +253,7 @@ def test_private_scratch_writes_never_reach_snapshot_and_cleanup(
     monkeypatch.setenv("GOODNOTES_SCRATCH_DIR", str(scratch_parent))
     before = _inventory(source)
     content = {path.name: path.read_bytes() for path in source.iterdir()}
-    with _scratch_store(source, source.parents[2]) as scratch:
+    with _scratch_store(source, OutputProtection(source.parents[2])) as scratch:
         assert scratch.is_relative_to(scratch_parent)
         assert (scratch.parent.stat().st_mode & 0o777) == 0o700
         assert not list(scratch.glob("OPTIONS-*"))
@@ -276,7 +277,7 @@ def test_scratch_cleanup_after_engine_failure(
     source = store(tmp_path)
     monkeypatch.setenv("GOODNOTES_SCRATCH_DIR", str(tmp_path))
     with pytest.raises(ValueError, match="synthetic engine failure"):
-        with _scratch_store(source, source.parents[2]) as scratch:
+        with _scratch_store(source, OutputProtection(source.parents[2])) as scratch:
             raise ValueError("synthetic engine failure")
     assert not scratch.parent.exists()
 
@@ -422,7 +423,9 @@ def test_invalid_native_options_encoding_is_structured_and_precedes_scratch(
     )
 
     with pytest.raises(NativeError, match="not valid UTF-8") as result:
-        with _scratch_store(source, source.parents[2], scratch_dir=scratch_parent):
+        with _scratch_store(
+            source, OutputProtection(source.parents[2]), scratch_dir=scratch_parent
+        ):
             pytest.fail("invalid OPTIONS encoding was accepted")
 
     assert result.value.code == "native_data_unavailable"
@@ -445,7 +448,7 @@ def test_nonregular_store_entries_are_rejected_before_copy(tmp_path: Path, entry
 
         os.mkfifo(unsafe)
     with pytest.raises(NativeError, match="nonregular"):
-        with _scratch_store(source, source.parents[2]):
+        with _scratch_store(source, OutputProtection(source.parents[2])):
             pytest.fail("unsafe entry was copied")
 
 
@@ -456,14 +459,14 @@ def test_unsupported_options_are_not_loaded(tmp_path: Path, line: str) -> None:
     source = store(tmp_path)
     (source / "OPTIONS-000004").write_text(line)
     with pytest.raises(NativeError, match="Unsupported native"):
-        with _scratch_store(source, source.parents[2]):
+        with _scratch_store(source, OutputProtection(source.parents[2])):
             pytest.fail("unsupported config reached scratch")
 
 
 def test_external_options_paths_never_reach_engine_configuration(tmp_path: Path) -> None:
     source = store(tmp_path)
     (source / "OPTIONS-000004").write_text("wal_dir=/do/not/open\ndb_log_dir=/do/not/open\n")
-    with _scratch_store(source, source.parents[2]) as scratch:
+    with _scratch_store(source, OutputProtection(source.parents[2])) as scratch:
         assert not list(scratch.glob("OPTIONS-*"))
 
 
@@ -473,7 +476,7 @@ def test_snapshot_change_is_detected_and_scratch_cleaned(
     source = store(tmp_path)
     monkeypatch.setenv("GOODNOTES_SCRATCH_DIR", str(tmp_path))
     with pytest.raises(NativeError, match="changed while reading"):
-        with _scratch_store(source, source.parents[2]) as scratch:
+        with _scratch_store(source, OutputProtection(source.parents[2])) as scratch:
             (source / "000002.log").write_text("a concurrent actor changed this copied snapshot")
     assert not scratch.parent.exists()
 
@@ -484,7 +487,7 @@ def test_fallback_refuses_large_byte_copy(tmp_path: Path, monkeypatch: pytest.Mo
     monkeypatch.setattr(native, "_MAX_COPY_FALLBACK", 1)
     monkeypatch.setenv("GOODNOTES_SCRATCH_DIR", str(tmp_path))
     with pytest.raises(NativeError, match="copy-on-write"):
-        with _scratch_store(source, source.parents[2]):
+        with _scratch_store(source, OutputProtection(source.parents[2])):
             pytest.fail("large copy was allowed")
     assert not list(tmp_path.glob("goodnotes-native-*"))
 
@@ -496,7 +499,7 @@ def test_scratch_inside_snapshot_is_refused(
     root = source.parents[2]
     monkeypatch.setenv("GOODNOTES_SCRATCH_DIR", str(root))
     with pytest.raises(NativeError) as result:
-        with _scratch_store(source, root):
+        with _scratch_store(source, OutputProtection(root)):
             pytest.fail("scratch was created in snapshot")
     assert result.value.details["operation"] == "create_native_scratch"
     assert "GOODNOTES_SCRATCH_DIR" in str(result.value.details["remedy"])
@@ -513,7 +516,7 @@ def test_scratch_permission_failure_is_actionable(
         lambda **_: (_ for _ in ()).throw(PermissionError("synthetic denied")),
     )
     with pytest.raises(NativeError) as result:
-        with _scratch_store(source, source.parents[2]):
+        with _scratch_store(source, OutputProtection(source.parents[2])):
             pytest.fail("denied scratch was used")
     assert result.value.details["path"] == str(tmp_path)
     assert "write/search access" in str(result.value.details["remedy"])
@@ -583,7 +586,7 @@ def test_clone_cross_volume_error_falls_back_to_bounded_copy(
         raise OSError(error_number, "synthetic clone unavailable")
 
     monkeypatch.setattr(native, "_clone_file_from_fd", failed_clone)
-    with _scratch_store(source, source.parents[2]) as scratch:
+    with _scratch_store(source, OutputProtection(source.parents[2])) as scratch:
         assert (scratch / "CURRENT").read_bytes() == (source / "CURRENT").read_bytes()
 
 
@@ -597,7 +600,7 @@ def test_clone_permission_error_does_not_silently_fallback(
 
     monkeypatch.setattr(native, "_clone_file_from_fd", failed_clone)
     with pytest.raises(NativeError, match="Could not clone"):
-        with _scratch_store(source, source.parents[2]):
+        with _scratch_store(source, OutputProtection(source.parents[2])):
             pytest.fail("permission error used fallback")
 
 
@@ -629,5 +632,5 @@ def test_current_cannot_reference_a_foreign_or_missing_manifest(
     source = store(tmp_path)
     (source / "CURRENT").write_bytes(current)
     with pytest.raises(NativeError, match="local manifest"):
-        with _scratch_store(source, source.parents[2]):
+        with _scratch_store(source, OutputProtection(source.parents[2])):
             pytest.fail("foreign manifest reached scratch")

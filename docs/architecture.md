@@ -40,9 +40,25 @@ SQLite may accept only a committed WAL prefix. A checkpoint, backup, or integrit
 
 Locks must be regular, no-follow files with stable identity. Readers create no cache paths and never recreate missing locks. A long reader delays publish/prune while capture proceeds.
 
+Write authorization protects the selected snapshot and the physical source path recorded in its
+marker, including a recorded location that is now missing. Explicit outputs, artifact storage and
+annotated-PDF sidecar directories must be disjoint from these known roots in both directions.
+Sandbox parses source provenance only for writes. An absent historical `source_path` leaves the
+source unknown; a present malformed value blocks writes without blocking navigation or text reads.
+Virtual catalog root selection does not change physical source protection.
+
+Containment uses resolved paths and current filesystem identity. It does not rediscover a source
+moved away from its recorded name or unknown source locations in imported snapshots. Admission and
+filesystem acquisition remain separate operations, so they do not prevent every concurrent ancestor
+replacement. Captured provenance adds deny roots and never grants access to source data.
+
 ## Artifact cache
 
 Managed `render` and `bundle` outputs use a separate artifact store; explicit output paths remain caller-owned. Cleanup runs during later artifact operations, not in a background process.
+Production callers pass the selected Sandbox to ArtifactCache so admission includes its source
+provenance before storage creation or maintenance and again after the root is opened. The legacy
+bare snapshot-path constructor protects only the snapshot, with unknown source provenance and no
+implicit marker or database reads.
 
 | Bound | Behavior |
 | --- | --- |
@@ -136,6 +152,10 @@ scope membership; moved or deleted items may remain diagnostic records without
 becoming reachable notes.
 
 Native rendering uses disposable scratch copied from a validated snapshot. Fresh engine options keep writes in scratch; copied `OPTIONS` files are not loaded. Byte-copy fallback is limited to 64 MiB per extraction. The RocksDB runtime is optional for the CLI, but required by the default native image layer; `GOODNOTES_ROCKSDB_LIBRARY` and `GOODNOTES_SCRATCH_DIR` select runtime and scratch paths.
+Scratch parents must stay outside the snapshot and known source roots. A common ancestor may host
+a fresh sibling scratch directory. The actual child is checked for disjointness before copying
+bytes or opening the engine, within its cleanup scope. This check follows allocation of an empty
+unique directory and does not promise zero transient allocation at a missing recorded source path.
 
 Native page decoding reserves decompressed bytes per framed block before expansion, including work
 in records that later fail to decode. Per-object and cumulative page limits remain distinct.

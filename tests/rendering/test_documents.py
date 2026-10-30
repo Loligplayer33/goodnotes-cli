@@ -21,6 +21,7 @@ from goodnotes_cli.errors import FilesystemAccessError, GoodnotesError
 from goodnotes_cli.models import Page
 from goodnotes_cli.native import NativeError
 from goodnotes_cli.safety import Sandbox
+from goodnotes_cli.storage.paths import OutputProtection
 
 
 class FakeSandbox:
@@ -55,6 +56,9 @@ class FakeSandbox:
             raise GoodnotesError(f"Output file already exists: {candidate}")
         candidate.parent.mkdir(parents=True, exist_ok=True)
         return candidate
+
+    def output_protection(self) -> OutputProtection:
+        return OutputProtection(self.root)
 
 
 def _make_pdf(path: Path, labels: list[str], *, width: float = 612, height: float = 792) -> None:

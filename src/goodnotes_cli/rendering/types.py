@@ -3,6 +3,8 @@
 from pathlib import Path
 from typing import Protocol
 
+from ..storage.paths import OutputProtection
+
 
 class SandboxProtocol(Protocol):
     @property
@@ -18,3 +20,5 @@ class SandboxProtocol(Protocol):
     def projection_path(self) -> Path: ...
 
     def ensure_output(self, path: Path) -> Path: ...
+
+    def output_protection(self) -> OutputProtection: ...

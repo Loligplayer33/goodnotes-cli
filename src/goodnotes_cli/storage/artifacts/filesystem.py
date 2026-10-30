@@ -11,9 +11,9 @@ from typing import TYPE_CHECKING
 
 from goodnotes_cli.errors import GoodnotesError
 from goodnotes_cli.storage.paths import (
+    OutputProtection,
     _remove_entry_at,
     _require_not_production,
-    paths_overlap,
     stat_key,
     trusted_macos_alias,
 )
@@ -55,9 +55,9 @@ def _owned_fd(descriptor: int) -> Generator[None, None, None]:
 
 
 class ArtifactFilesystem:
-    def __init__(self, root: Path, snapshot_root: Path) -> None:
+    def __init__(self, root: Path, protection: OutputProtection) -> None:
         self._requested_root = root
-        self._requested_snapshot_root = snapshot_root
+        self._protection = protection
         self.root = root
         self.entries = root / "entries"
         self.blobs = root / "blobs"
@@ -70,7 +70,7 @@ class ArtifactFilesystem:
 
     def _prepare_root(self) -> None:
         raw_root = self._requested_root
-        requested_snapshot = self._requested_snapshot_root
+        requested_snapshot = self._protection.snapshot_root
         if not raw_root.is_absolute():
             raw_root = Path(os.path.abspath(raw_root))
         if not requested_snapshot.is_absolute():
@@ -87,16 +87,15 @@ class ArtifactFilesystem:
             ) from exc
         if stat.S_ISLNK(snapshot_info.st_mode) or not stat.S_ISDIR(snapshot_info.st_mode):
             raise GoodnotesError("The selected snapshot root must be a real directory.")
-        snapshot = requested_snapshot.resolve(strict=True)
+        protection = OutputProtection(
+            requested_snapshot.resolve(strict=True), self._protection.source_root
+        )
         try:
             root = raw_root.resolve(strict=False)
         except OSError as exc:
             raise GoodnotesError(f"Could not resolve artifact cache root: {raw_root}") from exc
         _require_not_production(root, purpose="artifact cache storage")
-        if paths_overlap(root, snapshot):
-            raise GoodnotesError(
-                "Artifact cache storage and the selected snapshot must not overlap."
-            )
+        protection.require_disjoint(root, purpose="Artifact cache storage")
         try:
             root_fd = self._open_directory_tree(raw_root)
         except OSError as exc:
@@ -119,10 +118,7 @@ class ArtifactFilesystem:
             self.staging_root = resolved / ".staging"
             self._root_identity = self._identity(info)
             self._verify_root_path()
-            if paths_overlap(resolved, snapshot):
-                raise GoodnotesError(
-                    "Artifact cache storage and the selected snapshot must not overlap."
-                )
+            protection.require_disjoint(resolved, purpose="Artifact cache storage")
             _require_not_production(resolved, purpose="artifact cache storage")
 
             marker_info = self._stat_at(root_fd, _ROOT_MARKER)

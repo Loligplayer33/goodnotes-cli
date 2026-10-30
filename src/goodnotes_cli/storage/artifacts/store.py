@@ -14,8 +14,10 @@ from uuid import uuid4
 
 from goodnotes_cli.errors import GoodnotesError
 from goodnotes_cli.storage.paths import (
+    OutputProtection,
     path_contains,
 )
+from goodnotes_cli.storage.sandbox import Sandbox
 
 from .blobs import ArtifactBlobs
 from .filesystem import ArtifactFilesystem, _owned_fd
@@ -39,7 +41,7 @@ class ArtifactCache:
     def __init__(
         self,
         root: str | Path,
-        snapshot_root: str | Path,
+        snapshot_root: str | Path | Sandbox,
         *,
         max_bytes: int = 100_000_000,
         ttl_seconds: float = 86_400,
@@ -56,7 +58,13 @@ class ArtifactCache:
         self._active_stages: dict[str, tuple[int, int]] = {}
         self._pinned_keys: set[str] = set()
         self._records: dict[str, _EntryRecord] = {}
-        self._fs = ArtifactFilesystem(Path(root).expanduser(), Path(snapshot_root).expanduser())
+        # Bare paths retain snapshot-only protection with unknown source provenance.
+        protection = (
+            snapshot_root.output_protection()
+            if isinstance(snapshot_root, Sandbox)
+            else OutputProtection(Path(snapshot_root).expanduser())
+        )
+        self._fs = ArtifactFilesystem(Path(root).expanduser(), protection)
         self._io = ArtifactIO(self._fs, int(max_bytes))
         self._fs._io = self._io
         self._blobs = ArtifactBlobs(self._fs, self._io)

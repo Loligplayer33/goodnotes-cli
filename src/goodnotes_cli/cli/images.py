@@ -91,7 +91,7 @@ def render(
         if output is None:
             from ..storage.artifacts import ArtifactCache
 
-            with ArtifactCache(_artifact_directory(settings(ctx)), lib.sandbox.root) as cache:
+            with ArtifactCache(_artifact_directory(settings(ctx)), lib.sandbox) as cache:
                 result = cached_render_pages(
                     lib.sandbox, [all_pages[number - 1]], cache, layer=layer, dpi=dpi
                 )[0]
@@ -184,7 +184,7 @@ def bundle(
             from ..storage.artifacts import ArtifactCache
 
             try:
-                with ArtifactCache(_artifact_directory(cfg), sandbox.root) as cache:
+                with ArtifactCache(_artifact_directory(cfg), sandbox) as cache:
                     response = _cached_bundle(
                         ctx,
                         lib,
