@@ -330,6 +330,58 @@ def test_unreadable_end_identity_blocks(
     assert result == {"status": "blocked", "reason": "target_revalidation_unavailable"}
 
 
+@pytest.mark.parametrize("changed", [False, True])
+def test_observed_version_change_precedes_later_schema_timeout(
+    installation: Installation, monkeypatch: pytest.MonkeyPatch, changed: bool
+) -> None:
+    selected = targets._select_target(str(installation.cli), installation.root, installation.python)
+    assert selected.receipt["status"] == "pass"
+    if changed:
+        metadata = installation.metadata / "METADATA"
+        metadata.write_text(metadata.read_text().replace("Version: 1.0", "Version: 2.0"))
+
+    def timeout(executable: Path, root: Path) -> dict[str, Any]:
+        raise subprocess.TimeoutExpired("schema", 15, output=b"PRIVATE_SENTINEL")
+
+    monkeypatch.setattr(targets, "_probe_cli_build", timeout)
+    end = targets._select_target(str(installation.cli), installation.root, installation.python)
+    assert end.receipt["version"] == ("2.0" if changed else "1.0")
+    assert end.receipt["status"] == "blocked"
+    integrity = targets._check_target_integrity(
+        str(installation.cli), installation.root, installation.python, selected
+    )
+    assert integrity["status"] == ("fail" if changed else "blocked")
+    assert "PRIVATE_SENTINEL" not in json.dumps(integrity)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "version",
+        "import_origin",
+        "executable_fingerprint",
+        "package_fingerprint",
+        "source_package_fingerprint",
+    ],
+)
+@pytest.mark.parametrize("observation", ["changed", "missing", "unavailable"])
+def test_partial_revalidation_compares_only_observed_identity(
+    installation: Installation, monkeypatch: pytest.MonkeyPatch, field: str, observation: str
+) -> None:
+    selected = targets._select_target(str(installation.cli), installation.root, installation.python)
+    assert selected.receipt["status"] == "pass"
+    receipt = {"status": "blocked", "reason": "installed_target_probe_failed"}
+    if observation != "missing":
+        receipt[field] = selected.receipt[field] + "-changed" if observation == "changed" else None
+    monkeypatch.setattr(
+        targets, "_select_target", lambda *args: targets.Target(selected.path, receipt)
+    )
+    integrity = targets._check_target_integrity(
+        str(installation.cli), installation.root, installation.python, selected
+    )
+    assert integrity["status"] == ("fail" if observation == "changed" else "blocked")
+
+
 def test_runner_integrates_end_target_change_and_keeps_paths_private(
     installation: Installation,
     monkeypatch: pytest.MonkeyPatch,

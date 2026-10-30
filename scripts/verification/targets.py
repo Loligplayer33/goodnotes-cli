@@ -415,6 +415,20 @@ def _check_target_integrity(
             if _python_package_fingerprint(start.package) != start.receipt["package_fingerprint"]:
                 return changed
         end = _select_target(cli, root, python)
+        identity_fields = (
+            "version",
+            "import_origin",
+            "executable_fingerprint",
+            "package_fingerprint",
+            "source_package_fingerprint",
+        )
+        if any(
+            end.receipt.get(key) is not None
+            and start.receipt.get(key) is not None
+            and end.receipt[key] != start.receipt[key]
+            for key in identity_fields
+        ):
+            return changed
         if end.receipt.get("status") != "pass":
             if end.receipt.get("reason") in {
                 "package_origin_in_checkout",
