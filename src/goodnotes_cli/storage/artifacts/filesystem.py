@@ -4,6 +4,8 @@ import errno
 import fcntl
 import os
 import stat
+from collections.abc import Generator
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -25,6 +27,31 @@ from .records import (
 
 if TYPE_CHECKING:
     from .io import ArtifactIO
+
+
+def _note_cleanup_failure(
+    primary: BaseException, cleanup: BaseException, *, operation: str
+) -> None:
+    error_number = cleanup.errno if isinstance(cleanup, OSError) else None
+    primary.add_note(
+        f"Artifact {operation} also failed: {type(cleanup).__name__} (errno {error_number})."
+    )
+
+
+@contextmanager
+def _owned_fd(descriptor: int) -> Generator[None, None, None]:
+    """Close a local descriptor once, retaining an error from its body."""
+
+    try:
+        yield
+    except BaseException as primary:
+        try:
+            os.close(descriptor)
+        except BaseException as cleanup:
+            _note_cleanup_failure(primary, cleanup, operation="descriptor close")
+        raise
+    else:
+        os.close(descriptor)
 
 
 class ArtifactFilesystem:
@@ -141,10 +168,14 @@ class ArtifactFilesystem:
                         "Refusing to adopt a non-empty unmarked artifact cache root."
                     )
 
-        except BaseException:
-            os.close(root_fd)
+        except BaseException as primary:
             self._root_fd = None
             self._root_identity = None
+            self._managed_directory_identities.clear()
+            try:
+                os.close(root_fd)
+            except BaseException as cleanup:
+                _note_cleanup_failure(primary, cleanup, operation="root preparation close")
             raise
 
     @staticmethod
@@ -321,22 +352,30 @@ class ArtifactFilesystem:
                 raise GoodnotesError("Artifact cache lock changed while it was being acquired.")
             self._verify_root_path()
             self._lock_fd = descriptor
-        except BaseException:
-            os.close(descriptor)
+        except BaseException as primary:
+            self._lock_fd = None
+            try:
+                os.close(descriptor)
+            except BaseException as cleanup:
+                _note_cleanup_failure(primary, cleanup, operation="provisional lock close")
             raise
 
-    def _release_lock(self) -> None:
+    def _release_lock(self, *, primary_error: BaseException | None = None) -> None:
         descriptor, self._lock_fd = self._lock_fd, None
-        if descriptor is not None:
-            try:
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
-            finally:
-                os.close(descriptor)
         root_fd, self._root_fd = self._root_fd, None
         self._root_identity = None
         self._managed_directory_identities.clear()
-        if root_fd is not None:
-            os.close(root_fd)
+        try:
+            with ExitStack() as resources:
+                if root_fd is not None:
+                    resources.enter_context(_owned_fd(root_fd))
+                if descriptor is not None:
+                    resources.enter_context(_owned_fd(descriptor))
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+        except BaseException as cleanup:
+            if primary_error is None:
+                raise
+            _note_cleanup_failure(primary_error, cleanup, operation="session release")
 
     def _ensure_managed_directories(self) -> None:
         self._verify_root_path()

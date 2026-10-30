@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import math
 import os
-import re
 import stat
 import time
 from collections import Counter
@@ -19,7 +18,7 @@ from goodnotes_cli.storage.paths import (
 )
 
 from .blobs import ArtifactBlobs
-from .filesystem import ArtifactFilesystem
+from .filesystem import ArtifactFilesystem, _owned_fd
 from .io import ArtifactIO
 from .metadata import ArtifactMetadata
 from .records import (
@@ -81,19 +80,24 @@ class ArtifactCache:
             self._fs._ensure_root_marker()
             self._fs._ensure_managed_directories()
             self._maintain()
-        except BaseException:
-            self._fs._release_lock()
+        except BaseException as primary:
+            self._fs._release_lock(primary_error=primary)
             raise
         return self
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        primary_error = exc if isinstance(exc, BaseException) else None
         try:
-            self.renew_leases()
-        except GoodnotesError:
-            if exc_type is None:
-                raise
+            try:
+                self.renew_leases()
+            except GoodnotesError:
+                if exc_type is None:
+                    raise
+        except BaseException as renewal_error:
+            primary_error = renewal_error
+            raise
         finally:
-            self._fs._release_lock()
+            self._fs._release_lock(primary_error=primary_error)
 
     def destination(self, key: str) -> Path:
         """Return the path for a validated key, whether or not it exists yet."""
@@ -527,27 +531,28 @@ class ArtifactCache:
         blob_map = self._blobs._blob_inventory()
         references.update(self._retention._active_stage_png_references(blob_map))
         directory_fd = self._fs._open_managed_directory("blobs")
-        try:
-            for item in os.scandir(directory_fd):
-                match = re.fullmatch(r"([0-9a-f]{64})\.png", item.name)
-                if match is None:
-                    raise GoodnotesError(f"Unexpected item in artifact blobs: {item.name}")
-                digest = match.group(1)
-                path = self._fs.blobs / item.name
-                info = blob_map[digest]
+        with _owned_fd(directory_fd):
+            for digest, inventoried in blob_map.items():
                 if references[digest]:
                     continue
+                name = f"{digest}.png"
+                path = self._fs.blobs / name
+                info = self._blobs._blob_info(
+                    digest,
+                    expected_size=inventoried.st_size,
+                    expected_identity=self._fs._identity(inventoried),
+                    dir_fd=directory_fd,
+                )
                 if info.st_nlink != 1:
                     raise GoodnotesError(
                         f"Unreferenced artifact blob has unexpected hardlinks: {path}"
                     )
                 try:
-                    os.unlink(item.name, dir_fd=directory_fd)
+                    os.unlink(name, dir_fd=directory_fd)
                 except OSError as exc:
                     raise GoodnotesError(f"Could not remove unused artifact blob: {path}") from exc
+                self._blobs._forget_blob(digest, inventoried)
                 self._blobs._forget_blob(digest, info)
-        finally:
-            os.close(directory_fd)
 
     def _now(self) -> float:
         value = float(self._clock())

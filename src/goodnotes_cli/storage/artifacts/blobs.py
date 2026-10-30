@@ -5,6 +5,7 @@ import os
 import re
 import stat
 from collections.abc import Mapping
+from contextlib import ExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import uuid4
@@ -14,6 +15,7 @@ from goodnotes_cli.storage.paths import (
     stat_key,
 )
 
+from .filesystem import _note_cleanup_failure, _owned_fd
 from .records import (
     _COPY_CHUNK,
     _DIGEST,
@@ -113,12 +115,11 @@ class ArtifactBlobs:
         """Read safe blob metadata without hashing content that no caller uses."""
 
         directory_fd = self._fs._open_managed_directory("blobs")
-        try:
-            items = list(os.scandir(directory_fd))
-        except OSError as exc:
-            os.close(directory_fd)
-            raise GoodnotesError(f"Could not inspect artifact blobs: {self._fs.blobs}") from exc
-        try:
+        with _owned_fd(directory_fd):
+            try:
+                items = list(os.scandir(directory_fd))
+            except OSError as exc:
+                raise GoodnotesError(f"Could not inspect artifact blobs: {self._fs.blobs}") from exc
             result: dict[str, os.stat_result] = {}
             for item in items:
                 match = re.fullmatch(r"([0-9a-f]{64})\.png", item.name)
@@ -130,8 +131,6 @@ class ArtifactBlobs:
                 digest = match.group(1)
                 result[digest] = self._blob_info(digest, dir_fd=directory_fd)
             return result
-        finally:
-            os.close(directory_fd)
 
     def _verify_blob(self, digest: str, *, expected_size: int | None = None) -> os.stat_result:
         if _DIGEST.fullmatch(digest) is None:
@@ -160,6 +159,7 @@ class ArtifactBlobs:
         digest: str,
         *,
         expected_size: int | None = None,
+        expected_identity: tuple[int, int] | None = None,
         dir_fd: int | None = None,
     ) -> os.stat_result:
         if _DIGEST.fullmatch(digest) is None:
@@ -179,6 +179,8 @@ class ArtifactBlobs:
             if owned_fd is not None:
                 os.close(owned_fd)
         self._fs._require_owner(info, purpose="artifact PNG blob")
+        if expected_identity is not None and self._fs._identity(info) != expected_identity:
+            raise GoodnotesError(f"Artifact PNG blob changed before removal: {path}")
         if stat.S_IMODE(info.st_mode) != 0o400 or (
             expected_size is not None and info.st_size != expected_size
         ):
@@ -190,7 +192,7 @@ class ArtifactBlobs:
         assert item.digest is not None
         target = self._fs.blobs / f"{item.digest}.png"
         directory_fd = self._fs._open_managed_directory("blobs")
-        try:
+        with _owned_fd(directory_fd):
             if self._fs._stat_at(directory_fd, target.name) is not None:
                 self._verified_blob(item.digest, expected_size=item.size)
                 return target
@@ -199,89 +201,96 @@ class ArtifactBlobs:
             # canonical name relative to the verified blobs directory.
             temp = item.path.parent / f".blob-{uuid4().hex}.tmp"
             temp_parent_fd = self._fs._open_directory_fd(temp.parent)
-            temp_identity: tuple[int, int] | None = None
-            try:
-                temp_identity = self._copy_private_file(
-                    item.path,
-                    temp,
-                    expected_identity=item.source_identity,
-                    destination_parent_fd=temp_parent_fd,
-                )
-                temp_fd = os.open(
-                    temp.name,
-                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-                    dir_fd=temp_parent_fd,
-                )
+            with _owned_fd(temp_parent_fd):
+                temp_identity: tuple[int, int] | None = None
+                primary_error: BaseException | None = None
                 try:
-                    temp_info = os.fstat(temp_fd)
-                    if (
-                        not stat.S_ISREG(temp_info.st_mode)
-                        or self._fs._identity(temp_info) != temp_identity
-                    ):
-                        raise GoodnotesError(f"Temporary artifact blob is unsafe: {temp}")
-                    os.fchmod(temp_fd, 0o400)
+                    try:
+                        temp_identity = self._copy_private_file(
+                            item.path,
+                            temp,
+                            expected_identity=item.source_identity,
+                            destination_parent_fd=temp_parent_fd,
+                        )
+                        temp_fd = os.open(
+                            temp.name,
+                            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                            dir_fd=temp_parent_fd,
+                        )
+                        with _owned_fd(temp_fd):
+                            temp_info = os.fstat(temp_fd)
+                            if (
+                                not stat.S_ISREG(temp_info.st_mode)
+                                or self._fs._identity(temp_info) != temp_identity
+                            ):
+                                raise GoodnotesError(f"Temporary artifact blob is unsafe: {temp}")
+                            os.fchmod(temp_fd, 0o400)
+                        os.link(
+                            temp.name,
+                            target.name,
+                            src_dir_fd=temp_parent_fd,
+                            dst_dir_fd=directory_fd,
+                            follow_symlinks=False,
+                        )
+                        published = self._fs._stat_at(directory_fd, target.name)
+                        if published is None or self._fs._identity(published) != temp_identity:
+                            raise GoodnotesError(
+                                f"Temporary artifact blob changed during publication: {temp}"
+                            )
+                    except FileExistsError:
+                        self._verified_blob(item.digest, expected_size=item.size)
+                    except OSError as exc:
+                        raise GoodnotesError(
+                            f"Could not publish artifact PNG blob: {target}"
+                        ) from exc
+                except BaseException as primary:
+                    primary_error = primary
+                    raise
                 finally:
-                    os.close(temp_fd)
-                os.link(
-                    temp.name,
-                    target.name,
-                    src_dir_fd=temp_parent_fd,
-                    dst_dir_fd=directory_fd,
-                    follow_symlinks=False,
-                )
-                published = self._fs._stat_at(directory_fd, target.name)
-                if published is None or self._fs._identity(published) != temp_identity:
-                    raise GoodnotesError(
-                        f"Temporary artifact blob changed during publication: {temp}"
-                    )
-            except FileExistsError:
-                self._verified_blob(item.digest, expected_size=item.size)
-            except OSError as exc:
-                raise GoodnotesError(f"Could not publish artifact PNG blob: {target}") from exc
-            finally:
-                try:
-                    if temp_identity is not None:
-                        current = self._fs._stat_at(temp_parent_fd, temp.name)
-                        if current is not None:
-                            if self._fs._identity(current) != temp_identity:
-                                raise GoodnotesError(f"Temporary artifact blob changed: {temp}")
-                            os.unlink(temp.name, dir_fd=temp_parent_fd)
-                except OSError as exc:
-                    raise GoodnotesError(
-                        f"Could not remove temporary artifact blob: {temp}"
-                    ) from exc
-                finally:
-                    os.close(temp_parent_fd)
-        finally:
-            os.close(directory_fd)
+                    try:
+                        if temp_identity is not None:
+                            current = self._fs._stat_at(temp_parent_fd, temp.name)
+                            if current is not None:
+                                if self._fs._identity(current) != temp_identity:
+                                    raise GoodnotesError(f"Temporary artifact blob changed: {temp}")
+                                os.unlink(temp.name, dir_fd=temp_parent_fd)
+                    except BaseException as cleanup:
+                        if primary_error is not None:
+                            _note_cleanup_failure(
+                                primary_error, cleanup, operation="temporary blob cleanup"
+                            )
+                        elif isinstance(cleanup, OSError):
+                            raise GoodnotesError(
+                                f"Could not remove temporary artifact blob: {temp}"
+                            ) from cleanup
+                        else:
+                            raise
         blob_info = self._blob_info(item.digest, expected_size=item.size)
         self._verified_blob_stats[item.digest] = self._fs._content_signature(blob_info)
         self._blob_digests_by_stat[self._fs._content_signature(blob_info)] = item.digest
         return target
 
     def _link_blob(self, source: Path, destination: Path) -> None:
-        source_fd = self._fs._open_directory_fd(source.parent)
-        try:
+        with ExitStack() as resources:
+            source_fd = self._fs._open_directory_fd(source.parent)
+            resources.enter_context(_owned_fd(source_fd))
             destination_fd = self._fs._open_directory_fd(destination.parent)
-        except BaseException:
-            os.close(source_fd)
-            raise
-        try:
-            source_info = self._fs._stat_at(source_fd, source.name)
-            if source_info is None or not stat.S_ISREG(source_info.st_mode):
-                raise GoodnotesError(f"Generated artifact image is unsafe: {source}")
-            os.link(
-                source.name,
-                destination.name,
-                src_dir_fd=source_fd,
-                dst_dir_fd=destination_fd,
-                follow_symlinks=False,
-            )
-        except OSError as exc:
-            raise GoodnotesError(f"Could not link generated artifact image: {destination}") from exc
-        finally:
-            os.close(source_fd)
-            os.close(destination_fd)
+            resources.enter_context(_owned_fd(destination_fd))
+            try:
+                source_info = self._fs._stat_at(source_fd, source.name)
+                if source_info is None or not stat.S_ISREG(source_info.st_mode):
+                    raise GoodnotesError(f"Generated artifact image is unsafe: {source}")
+                os.link(
+                    source.name,
+                    destination.name,
+                    src_dir_fd=source_fd,
+                    dst_dir_fd=destination_fd,
+                    follow_symlinks=False,
+                )
+            except OSError as exc:
+                raise GoodnotesError(
+                    f"Could not link generated artifact image: {destination}"
+                ) from exc
 
     def _copy_private_file(
         self,
@@ -291,86 +300,74 @@ class ArtifactBlobs:
         expected_identity: tuple[int, int, int, int, int, int] | None,
         destination_parent_fd: int | None = None,
     ) -> tuple[int, int]:
-        source_parent_fd = self._fs._open_directory_fd(source.parent)
-        try:
+        with ExitStack() as resources:
+            source_parent_fd = self._fs._open_directory_fd(source.parent)
+            resources.enter_context(_owned_fd(source_parent_fd))
             destination_parent_fd = (
                 self._fs._open_directory_fd(destination.parent)
                 if destination_parent_fd is None
                 else os.dup(destination_parent_fd)
             )
-        except BaseException:
-            os.close(source_parent_fd)
-            raise
-        before = self._fs._stat_at(source_parent_fd, source.name)
-        if before is None or not stat.S_ISREG(before.st_mode):
-            os.close(source_parent_fd)
-            os.close(destination_parent_fd)
-            raise GoodnotesError(f"Artifact staging file must be regular: {source}")
-        if expected_identity is not None and stat_key(before) != expected_identity:
-            os.close(source_parent_fd)
-            os.close(destination_parent_fd)
-            raise GoodnotesError(f"Artifact staging file changed before copy: {source}")
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
-        try:
-            source_fd = os.open(source.name, flags, dir_fd=source_parent_fd)
-        except OSError as exc:
-            os.close(source_parent_fd)
-            os.close(destination_parent_fd)
-            raise GoodnotesError(f"Could not open artifact staging file: {source}") from exc
-        target_fd: int | None = None
-        created_identity: tuple[int, int] | None = None
-        try:
-            opened = os.fstat(source_fd)
-            if not stat.S_ISREG(opened.st_mode) or stat_key(opened) != stat_key(before):
-                raise GoodnotesError(f"Artifact staging file changed while opening: {source}")
-            target_fd = os.open(
-                destination.name,
-                os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0),
-                0o600,
-                dir_fd=destination_parent_fd,
-            )
-            created_identity = self._fs._identity(os.fstat(target_fd))
-            total = 0
-            while True:
-                chunk = os.read(source_fd, _COPY_CHUNK)
-                if not chunk:
-                    break
-                total += len(chunk)
-                view = memoryview(chunk)
-                while view:
-                    written = os.write(target_fd, view)
-                    view = view[written:]
-            after = os.fstat(source_fd)
-            current = self._fs._stat_at(source_parent_fd, source.name)
-            if (
-                stat_key(after) != stat_key(opened)
-                or current is None
-                or not stat.S_ISREG(current.st_mode)
-                or stat_key(current) != stat_key(opened)
-                or total != opened.st_size
-            ):
-                raise GoodnotesError(f"Artifact staging file changed during copy: {source}")
-            os.fchmod(target_fd, 0o400)
-            os.fsync(target_fd)
-            return self._fs._identity(os.fstat(target_fd))
-        except BaseException:
-            if target_fd is not None:
-                os.close(target_fd)
-                target_fd = None
-            if created_identity is not None:
-                current = self._fs._stat_at(destination_parent_fd, destination.name)
-                if current is not None and self._fs._identity(current) == created_identity:
+            resources.enter_context(_owned_fd(destination_parent_fd))
+            before = self._fs._stat_at(source_parent_fd, source.name)
+            if before is None or not stat.S_ISREG(before.st_mode):
+                raise GoodnotesError(f"Artifact staging file must be regular: {source}")
+            if expected_identity is not None and stat_key(before) != expected_identity:
+                raise GoodnotesError(f"Artifact staging file changed before copy: {source}")
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+            try:
+                source_fd = os.open(source.name, flags, dir_fd=source_parent_fd)
+            except OSError as exc:
+                raise GoodnotesError(f"Could not open artifact staging file: {source}") from exc
+            resources.enter_context(_owned_fd(source_fd))
+            created_identity: tuple[int, int] | None = None
+            try:
+                opened = os.fstat(source_fd)
+                if not stat.S_ISREG(opened.st_mode) or stat_key(opened) != stat_key(before):
+                    raise GoodnotesError(f"Artifact staging file changed while opening: {source}")
+                target_fd = os.open(
+                    destination.name,
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0),
+                    0o600,
+                    dir_fd=destination_parent_fd,
+                )
+                with _owned_fd(target_fd):
+                    created_identity = self._fs._identity(os.fstat(target_fd))
+                    total = 0
+                    while True:
+                        chunk = os.read(source_fd, _COPY_CHUNK)
+                        if not chunk:
+                            break
+                        total += len(chunk)
+                        view = memoryview(chunk)
+                        while view:
+                            written = os.write(target_fd, view)
+                            view = view[written:]
+                    after = os.fstat(source_fd)
+                    current = self._fs._stat_at(source_parent_fd, source.name)
+                    if (
+                        stat_key(after) != stat_key(opened)
+                        or current is None
+                        or not stat.S_ISREG(current.st_mode)
+                        or stat_key(current) != stat_key(opened)
+                        or total != opened.st_size
+                    ):
+                        raise GoodnotesError(f"Artifact staging file changed during copy: {source}")
+                    os.fchmod(target_fd, 0o400)
+                    os.fsync(target_fd)
+                    return self._fs._identity(os.fstat(target_fd))
+            except BaseException as primary:
+                if created_identity is not None:
                     try:
-                        os.unlink(destination.name, dir_fd=destination_parent_fd)
-                    except FileNotFoundError:
-                        pass
-            raise
-        finally:
-            if target_fd is not None:
-                os.close(target_fd)
-            os.close(source_fd)
-            os.close(source_parent_fd)
-            os.close(destination_parent_fd)
+                        current = self._fs._stat_at(destination_parent_fd, destination.name)
+                        if current is not None and self._fs._identity(current) == created_identity:
+                            try:
+                                os.unlink(destination.name, dir_fd=destination_parent_fd)
+                            except FileNotFoundError:
+                                pass
+                    except BaseException as cleanup:
+                        _note_cleanup_failure(primary, cleanup, operation="private copy rollback")
+                raise
 
     def _hash_file(
         self, path: Path, *, dir_fd: int | None = None
