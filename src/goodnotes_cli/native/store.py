@@ -6,7 +6,6 @@ import ctypes as C
 import errno
 import os
 import re
-import shutil
 import stat
 import tempfile
 from collections.abc import Generator, Mapping
@@ -249,7 +248,18 @@ def _copy_store_file(
                 with _duplicate_reader(fd) as reader:
                     failed_path = copied
                     with copied.open("xb") as writer:
-                        shutil.copyfileobj(reader, writer)
+                        remaining = expected[3]
+                        while remaining:
+                            failed_path = source
+                            # Bound each buffer and the total copy to inventoried bytes.
+                            chunk = reader.read(min(remaining, 64 * 1024))
+                            if not chunk:
+                                break
+                            failed_path = copied
+                            writer.write(chunk)
+                            remaining -= len(chunk)
+                        failed_path = copied
+                    failed_path = source
             failed_path = copied
             copied.chmod(0o600)
             cloned = copied.stat()
@@ -272,7 +282,7 @@ def _copy_store_file(
             "native_data_unavailable",
             str(exc),
             operation="clone_native_store",
-            path=exc.filename or failed_path,
+            path=failed_path,
         ) from exc
     return copy_budget
 

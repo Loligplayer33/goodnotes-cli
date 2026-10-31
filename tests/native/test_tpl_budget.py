@@ -99,3 +99,36 @@ def test_rejected_later_array_does_not_reset_sibling_work(
     monkeypatch.setattr(tpl, "_MAX_WORK", 15)
     with pytest.raises(tpl.TplDecodeError, match="cumulative work"):
         tpl.decode_tpl(image)
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+@pytest.mark.parametrize(("count", "width"), [(0, 32), (1, 32), (64, 64), (1000, 1000)])
+def test_empty_nested_arrays_do_not_repeat_wide_fixed_schema_discovery(
+    monkeypatch: pytest.MonkeyPatch, wrapped: bool, count: int, width: int
+) -> None:
+    fields = "S(" + "u" * width + ")" if wrapped else "u" * width
+    payload = struct.pack("<I", count) + struct.pack("<I", 0) * count + struct.pack("<I", 0)
+    image = _image(f"A(A({fields}))B", payload)
+    cost = width + count + (11 if wrapped else 9)
+    visits = 0
+    fixed_formats = tpl._fixed_formats
+
+    def observed(children: tuple) -> str | None:
+        nonlocal visits
+        visits += len(children)
+        return fixed_formats(children)
+
+    monkeypatch.setattr(tpl, "_fixed_formats", observed)
+    monkeypatch.setattr(tpl, "_MAX_WORK", cost)
+    assert tpl.decode_tpl(image).values == ([[] for _ in range(count)], b"")
+    # Discovery work must fit the charged image work, rather than count * width.
+    assert visits <= cost
+    monkeypatch.setattr(tpl, "_MAX_WORK", cost - 1)
+    with pytest.raises(tpl.TplDecodeError, match="cumulative work"):
+        tpl.decode_tpl(image)
+
+
+@pytest.mark.parametrize("payload", [b"", struct.pack("<I", 0)])
+def test_empty_array_shortcut_keeps_structural_and_count_validation(payload: bytes) -> None:
+    with pytest.raises(tpl.TplDecodeError, match="truncated|array count"):
+        tpl.decode_tpl(_image("A()", payload))

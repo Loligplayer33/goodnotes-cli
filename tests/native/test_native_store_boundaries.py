@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import errno
 import os
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -167,7 +168,7 @@ def test_acquired_descriptors_and_streams_close_once_when_construction_fails(
     assert not copied.exists()
 
 
-@pytest.mark.parametrize("phase", ["mkdir", "open", "fstat", "write", "chmod", "stat"])
+@pytest.mark.parametrize("phase", ["mkdir", "open", "fstat", "chmod", "stat"])
 def test_scratch_preparation_errors_are_native_and_remove_only_scratch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str
 ) -> None:
@@ -230,12 +231,6 @@ def test_scratch_preparation_errors_are_native_and_remove_only_scratch(
             raise failure
         return original_stat(path, *args, **kwargs)
 
-    def copy(reader: Any, writer: Any) -> None:
-        nonlocal failed_path
-        writer.write(b"partial scratch bytes")
-        failed_path = Path(writer.name)
-        raise failure
-
     monkeypatch.setattr(native, "_validated_inventory", validated_inventory)
     monkeypatch.setattr(native.os, "open", open_file)
     monkeypatch.setattr(native.os, "fstat", fstat)
@@ -243,8 +238,6 @@ def test_scratch_preparation_errors_are_native_and_remove_only_scratch(
     monkeypatch.setattr(Path, "chmod", chmod)
     monkeypatch.setattr(Path, "stat", stat)
     monkeypatch.setattr(native, "_clone_file_from_fd", lambda *_: False)
-    if phase == "write":
-        monkeypatch.setattr(native.shutil, "copyfileobj", copy)
     with pytest.raises(NativeError) as captured:
         with native._scratch_store(
             source, OutputProtection(source.parents[2]), scratch_dir=scratch_parent
@@ -255,6 +248,145 @@ def test_scratch_preparation_errors_are_native_and_remove_only_scratch(
     assert captured.value.details["path"] == str(failed_path)
     assert not list(scratch_parent.iterdir())
     assert {path.name: path.read_bytes() for path in source.iterdir()} == source_bytes
+
+
+@pytest.mark.parametrize(
+    "phase", ["read", "destination_open", "write", "reader_close", "writer_close"]
+)
+def test_fallback_copy_attributes_filename_less_errors_to_the_actual_io_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str
+) -> None:
+    source = store(tmp_path)
+    expected_bytes = {path.name: path.read_bytes() for path in source.iterdir()}
+    scratch_parent = tmp_path / "scratch"
+    scratch_parent.mkdir()
+    failure = OSError(errno.EIO, f"generated {phase} failure")
+    failed_source: Path | None = None
+    failed_destination: Path | None = None
+    duplicate_reader, path_open = native._duplicate_reader, Path.open
+
+    @contextmanager
+    def reader(fd: int) -> Any:
+        with duplicate_reader(fd) as stream:
+
+            class Reader:
+                def read(self, size: int) -> bytes:
+                    if phase == "read" and failed_destination is not None:
+                        raise failure
+                    return stream.read(size)
+
+            yield Reader()
+            if phase == "reader_close" and failed_destination is not None:
+                raise failure
+
+    class Writer:
+        def __init__(self, stream: Any) -> None:
+            self.stream = stream
+
+        def __enter__(self) -> Writer:
+            return self
+
+        def write(self, value: bytes) -> int:
+            if phase == "write":
+                self.stream.write(value[:1])
+                raise failure
+            return self.stream.write(value)
+
+        def __exit__(self, *args: Any) -> None:
+            self.stream.close()
+            if phase == "writer_close":
+                raise failure
+
+    def writer_open(path: Path, *args: Any, **kwargs: Any) -> Any:
+        nonlocal failed_destination, failed_source
+        if path.parent.name == "store" and path.is_relative_to(scratch_parent):
+            failed_source = source / path.name
+            failed_destination = path
+            if phase == "destination_open":
+                raise failure
+            stream = path_open(path, *args, **kwargs)
+            return Writer(stream) if phase in {"write", "writer_close"} else stream
+        return path_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(native, "_clone_file_from_fd", lambda *_: False)
+    monkeypatch.setattr(native, "_duplicate_reader", reader)
+    monkeypatch.setattr(Path, "open", writer_open)
+    with pytest.raises(NativeError) as captured:
+        with native._scratch_store(
+            source, OutputProtection(source.parents[2]), scratch_dir=scratch_parent
+        ):
+            pytest.fail("failed copy reached caller")
+    assert captured.value.code == "native_data_unavailable"
+    assert captured.value.details["operation"] == "clone_native_store"
+    assert captured.value.details["path"] == str(
+        failed_source if phase in {"read", "reader_close"} else failed_destination
+    )
+    assert captured.value.__cause__ is failure
+    assert not list(scratch_parent.iterdir())
+    assert {path.name: path.read_bytes() for path in source.iterdir()} == expected_bytes
+
+
+@pytest.mark.parametrize("chunk_size", [1, 70_000])
+def test_fallback_copy_reads_bounded_chunks_and_preserves_independent_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, chunk_size: int
+) -> None:
+    source = tmp_path / "source"
+    content = b"generated copy bytes" * 8000
+    source.write_bytes(content)
+    copied = tmp_path / "copied"
+    requested: list[int] = []
+    duplicate_reader = native._duplicate_reader
+
+    @contextmanager
+    def reader(fd: int) -> Any:
+        with duplicate_reader(fd) as stream:
+
+            class Reader:
+                def read(self, size: int) -> bytes:
+                    requested.append(size)
+                    return stream.read(min(size, chunk_size))
+
+            yield Reader()
+
+    monkeypatch.setattr(native, "_clone_file_from_fd", lambda *_: False)
+    monkeypatch.setattr(native, "_duplicate_reader", reader)
+    assert native._copy_store_file(source, copied, stat_key(source.stat()), len(content)) == 0
+    assert copied.read_bytes() == content
+    assert copied.stat().st_ino != source.stat().st_ino
+    assert source.read_bytes() == content
+    assert max(requested) <= 64 * 1024
+    assert requested[-1] <= len(content)
+
+
+@pytest.mark.parametrize("change", ["early_eof", "grow"])
+def test_bounded_fallback_rejects_early_eof_and_growing_sources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    source = tmp_path / "source"
+    content = b"generated original bytes"
+    source.write_bytes(content)
+    expected = stat_key(source.stat())
+    copied = tmp_path / "copied"
+    duplicate_reader = native._duplicate_reader
+
+    @contextmanager
+    def reader(fd: int) -> Any:
+        with duplicate_reader(fd) as stream:
+
+            class Reader:
+                def read(self, size: int) -> bytes:
+                    if change == "early_eof":
+                        return b""
+                    source.write_bytes(content + b"generated growth")
+                    return stream.read(size)
+
+            yield Reader()
+
+    monkeypatch.setattr(native, "_clone_file_from_fd", lambda *_: False)
+    monkeypatch.setattr(native, "_duplicate_reader", reader)
+    with pytest.raises(NativeError, match="independent stable copy"):
+        native._copy_store_file(source, copied, expected, len(content))
+    assert copied.stat().st_size <= len(content)
 
 
 def test_scratch_does_not_reclassify_a_caller_body_oserror(

@@ -159,6 +159,8 @@ def _decode_value(node: _FormatNode, cursor: _Cursor) -> TplValue:
         count = cursor.u32()
         if count > 1_000_000 or count > len(cursor.data) - cursor.position or not children:
             raise TplDecodeError("TPL array count exceeds remaining bytes or budget")
+        if count == 0:
+            return []
         fixed_values = _decode_fixed_array(children, count, cursor)
         if fixed_values is not None:
             return fixed_values
