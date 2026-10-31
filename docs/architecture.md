@@ -93,6 +93,11 @@ its index and projection connections; every PDF close is attempted even when one
 index initialization owns a provisional connection until schema and casefold setup succeed. Readers
 borrow PDF handles until Library closes. The caller's shared view lock encloses this full lifetime.
 Reader algorithms return domain records; the public Library boundary formats coverage recommendations.
+Page-number validation follows the resolved notebook scope before inspecting stored identities.
+Stored text IDs and PDF page bindings use exact integer checks. Bounded text queries retain
+unmatched candidate metadata so invalid reached rows cannot disappear as empty results; rows beyond
+the requested text budget remain unexamined. Search owns each source producer within its notebook
+batch, and each producer closes its cursor before the borrowed session connection is released.
 
 ArtifactCache enters its private filesystem owner once and keeps all borrowed descriptors inside the
 session. Stages, pins and publication state belong to the transaction owner. Retention accounting
@@ -139,6 +144,12 @@ Its staging parent and source directory remain pinned through handoff, including
 render failure. Rollback owns only links whose calls returned successfully. An interrupted link
 has an uncertain outcome and remains untouched, even if it matches the source inode. The command
 fails; inspect and explicitly remove incomplete output or choose a new destination before retrying.
+One rendering context owns the explicit bundle stage from creation through rendering and
+publication. The CLI borrows its path; publication borrows its pinned descriptors and records
+completion before closing its own destination descriptor. Cleanup retains that completion fact
+rather than inferring success from the current destination pathname. Every acquired descriptor
+gets one close attempt. An earlier operation error remains primary; a cleanup-only error is raised
+after the remaining closes, and does not undo completed output or remove its parent.
 
 ## Native and output limits
 
@@ -159,6 +170,15 @@ unique directory and does not promise zero transient allocation at a missing rec
 
 Native page decoding reserves decompressed bytes per framed block before expansion, including work
 in records that later fail to decode. Per-object and cumulative page limits remain distinct.
+The generic TPL parser also shares a limit of 1,000,000 logical work units across one image.
+Units count retained schema nodes, decoded values and their list/tuple containers, including root
+and empty-group tuples. Fixed-array decoding reserves the same cost before bulk expansion.
+This bounds retained logical expansion and proportional decoding work, not exact heap bytes or
+every temporary allocation. Existing byte, array and nesting limits remain separate. Native callers
+check expected formats before generic parsing; arbitrary-format CLI reachability is unproven.
+Copied-store inspection and scratch preparation translate filesystem failures at their native
+operation boundary, preserving causes. Scratch preparation ends before the caller body, so a
+caller's filesystem error is not relabeled as a copying failure.
 PDF fallback revalidates attachment confinement at each read and invalidates changed PDF handles
 while retaining the session LRU. Completed snapshots must remain immutable; these checks do not
 promise protection against every concurrent replacement of a path or its ancestors.

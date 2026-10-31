@@ -41,8 +41,8 @@ def test_bundle_failure_preserves_replacement_staging_tree(
         replace_parent(args[2][0].parent)
         raise GoodnotesError("Generated staging failure.")
 
-    def replaced_handoff(stage: Path, destination: Path, **kwargs: Any) -> None:
-        replace_parent(stage)
+    def replaced_handoff(stage: publication._BundleStage, destination: Path, **kwargs: Any) -> None:
+        replace_parent(stage.path)
         original_publish(stage, destination, **kwargs)
 
     def replaced_publication(*args: Any, **kwargs: Any) -> None:

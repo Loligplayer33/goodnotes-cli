@@ -145,25 +145,6 @@ def decode_message(data: bytes) -> Message:
     return Message(tuple(fields), data)
 
 
-def decode_delimited_messages(data: bytes) -> tuple[Message, ...]:
-    """Decode a stream of varint-length-prefixed protobuf messages.
-
-    GoodNotes indexes and note members in the supplied corpus use this framing;
-    it is distinct from a protobuf field and is therefore decoded before schema
-    interpretation rather than guessed from arbitrary byte patterns.
-    """
-    messages: list[Message] = []
-    pos = 0
-    while pos < len(data):
-        length, pos = _read_varint(data, pos)
-        end = pos + length
-        if end > len(data):
-            raise DecodeError("truncated delimited protobuf record")
-        messages.append(decode_message(data[pos:end]))
-        pos = end
-    return tuple(messages)
-
-
 def try_decode_message(data: bytes) -> Message | None:
     """Return a message only when all bytes form a valid, non-empty protobuf stream."""
     if not data:

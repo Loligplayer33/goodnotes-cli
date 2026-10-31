@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import os
+import tempfile
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Generator
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 from ..errors import FilesystemAccessError, GoodnotesError
@@ -42,99 +45,165 @@ def _identity(info: os.stat_result) -> tuple[int, int]:
     return info.st_dev, info.st_ino
 
 
-def publish_bundle(
-    temporary: Path,
+_DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+
+
+@dataclass
+class _BundleStage:
+    path: Path
+    parent_fd: int
+    directory_fd: int
+    parent_identity: tuple[int, int]
+    directory_identity: tuple[int, int]
+    publication_completed: bool = False
+
+
+def _close_bundle_descriptors(descriptors: list[int], primary: BaseException | None) -> None:
+    """Detach and attempt each release once, preserving an earlier operation failure."""
+    failure = primary
+    while descriptors:
+        descriptor = descriptors.pop()
+        try:
+            os.close(descriptor)
+        except BaseException as exc:
+            failure = failure or exc
+    if primary is None and failure is not None:
+        raise failure
+
+
+def _check_bundle_stage(stage: _BundleStage) -> None:
+    if (
+        _identity(os.fstat(stage.directory_fd)) != stage.directory_identity
+        or _identity(os.stat(stage.path.name, dir_fd=stage.parent_fd, follow_symlinks=False))
+        != stage.directory_identity
+    ):
+        raise GoodnotesError("The bundle staging directory changed before publication.")
+    if _identity(stage.path.parent.stat()) != stage.parent_identity:
+        raise GoodnotesError("The bundle output parent changed during staging or publication.")
+
+
+@contextmanager
+def bundle_stage(destination: Path) -> Generator[_BundleStage, None, None]:
+    """Own one sibling stage and its pinned directories through explicit bundle creation."""
+    parent_existed = destination.parent.exists()
+    descriptors: list[int] = []
+    parent_identity: tuple[int, int] | None = None
+    temporary: Path | None = None
+    stage_identity: tuple[int, int] | None = None
+    stage: _BundleStage | None = None
+    primary: BaseException | None = None
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        parent_fd = os.open(destination.parent, _DIRECTORY_FLAGS)
+        descriptors.append(parent_fd)
+        parent_identity = _identity(os.fstat(parent_fd))
+        temporary = Path(tempfile.mkdtemp(prefix=".goodnotes-bundle-", dir=destination.parent))
+        stage_identity = _identity(os.stat(temporary.name, dir_fd=parent_fd, follow_symlinks=False))
+        source_fd = os.open(temporary.name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
+        descriptors.append(source_fd)
+        stage = _BundleStage(temporary, parent_fd, source_fd, parent_identity, stage_identity)
+        _check_bundle_stage(stage)
+        yield stage
+    except BaseException as exc:
+        primary = exc
+        raise
+    finally:
+        try:
+            if temporary is not None and stage_identity is not None:
+                try:
+                    _remove_entry_at(
+                        descriptors[0], temporary.name, temporary, expected_identity=stage_identity
+                    )
+                except (OSError, GoodnotesError):
+                    pass
+            if (
+                primary is not None
+                and not parent_existed
+                and parent_identity is not None
+                and (stage is None or not stage.publication_completed)
+            ):
+                try:
+                    if _identity(destination.parent.lstat()) == parent_identity:
+                        destination.parent.rmdir()
+                except OSError:
+                    pass
+        except BaseException as cleanup:
+            if primary is None:
+                primary = cleanup
+                raise
+        finally:
+            _close_bundle_descriptors(descriptors, primary)
+
+
+def _rollback_bundle(
+    stage: _BundleStage,
     destination: Path,
-    *,
-    expected_source_identity: tuple[int, int] | None = None,
+    directory_fd: int | None,
+    directory_identity: tuple[int, int] | None,
+    published: list[tuple[str, tuple[int, int]]],
 ) -> None:
-    """Publish into the reserved directory and remove only entries we created on failure."""
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-    nofollow = getattr(os, "O_NOFOLLOW", 0)
-    source_parent_fd = os.open(temporary.parent, flags)
-    source_fd = -1
-    parent_fd = -1
-    directory_fd = -1
-    source_identity: tuple[int, int] | None = None
+    if directory_fd is not None:
+        for name, identity in published:
+            try:
+                if _identity(os.stat(name, dir_fd=directory_fd, follow_symlinks=False)) == identity:
+                    os.unlink(name, dir_fd=directory_fd)
+            except OSError:
+                pass
+    if directory_identity is not None:
+        try:
+            if (
+                _identity(os.stat(destination.name, dir_fd=stage.parent_fd, follow_symlinks=False))
+                == directory_identity
+            ):
+                os.rmdir(destination.name, dir_fd=stage.parent_fd)
+        except OSError:
+            pass
+
+
+def publish_bundle(stage: _BundleStage, destination: Path) -> None:
+    """Borrow the pinned stage and own only the reservation and confirmed output links."""
+    directory_fd: int | None = None
     directory_identity: tuple[int, int] | None = None
     published: list[tuple[str, tuple[int, int]]] = []
-    reserved = False
+    primary: BaseException | None = None
     try:
-        source_fd = os.open(temporary.name, flags | nofollow, dir_fd=source_parent_fd)
-        source_identity = _identity(os.fstat(source_fd))
-        if (
-            expected_source_identity is not None and source_identity != expected_source_identity
-        ) or _identity(
-            os.stat(temporary.name, dir_fd=source_parent_fd, follow_symlinks=False)
-        ) != source_identity:
-            raise GoodnotesError("The bundle staging directory changed before publication.")
-        parent_fd = os.open(destination.parent, flags)
-        parent_identity = _identity(os.fstat(parent_fd))
-        os.mkdir(destination.name, mode=0o700, dir_fd=parent_fd)
-        reserved = True
+        _check_bundle_stage(stage)
+        os.mkdir(destination.name, mode=0o700, dir_fd=stage.parent_fd)
         directory_identity = _identity(
-            os.stat(destination.name, dir_fd=parent_fd, follow_symlinks=False)
+            os.stat(destination.name, dir_fd=stage.parent_fd, follow_symlinks=False)
         )
-        directory_fd = os.open(destination.name, flags | nofollow, dir_fd=parent_fd)
+        directory_fd = os.open(destination.name, _DIRECTORY_FLAGS, dir_fd=stage.parent_fd)
         if _identity(os.fstat(directory_fd)) != directory_identity:
             raise GoodnotesError("The bundle output directory changed during publication.")
-        files = sorted(os.listdir(source_fd), key=lambda name: name == "text.json")
+        files = sorted(os.listdir(stage.directory_fd), key=lambda name: name == "text.json")
         for name in files:
-            identity = _identity(os.stat(name, dir_fd=source_fd, follow_symlinks=False))
+            identity = _identity(os.stat(name, dir_fd=stage.directory_fd, follow_symlinks=False))
             os.link(
-                name, name, src_dir_fd=source_fd, dst_dir_fd=directory_fd, follow_symlinks=False
+                name,
+                name,
+                src_dir_fd=stage.directory_fd,
+                dst_dir_fd=directory_fd,
+                follow_symlinks=False,
             )
-            # An interrupted syscall has an unknown outcome. Only confirmed links
-            # belong to rollback, even if an uncertain entry matches the source inode.
+            # Only calls that returned successfully establish rollback ownership.
             published.append((name, identity))
         if (
-            _identity(os.stat(destination.name, dir_fd=parent_fd, follow_symlinks=False))
+            _identity(os.stat(destination.name, dir_fd=stage.parent_fd, follow_symlinks=False))
             != directory_identity
         ):
             raise GoodnotesError("The bundle output directory changed during publication.")
-        if _identity(destination.parent.stat()) != parent_identity:
+        if _identity(destination.parent.stat()) != stage.parent_identity:
             raise GoodnotesError("The bundle output parent changed during publication.")
         for name, identity in published:
             if _identity(os.stat(name, dir_fd=directory_fd, follow_symlinks=False)) != identity:
                 raise GoodnotesError("A bundle output file changed during publication.")
-    except BaseException:
-        if directory_fd >= 0:
-            for name, identity in published:
-                try:
-                    if (
-                        _identity(os.stat(name, dir_fd=directory_fd, follow_symlinks=False))
-                        == identity
-                    ):
-                        os.unlink(name, dir_fd=directory_fd)
-                except OSError:
-                    pass
-        if directory_identity is not None and parent_fd >= 0:
-            try:
-                if (
-                    _identity(os.stat(destination.name, dir_fd=parent_fd, follow_symlinks=False))
-                    == directory_identity
-                ):
-                    os.rmdir(destination.name, dir_fd=parent_fd)
-            except OSError:
-                pass
+        stage.publication_completed = True
+    except BaseException as exc:
+        primary = exc
+        try:
+            _rollback_bundle(stage, destination, directory_fd, directory_identity, published)
+        except BaseException:
+            pass
         raise
     finally:
-        if directory_fd >= 0:
-            os.close(directory_fd)
-        if parent_fd >= 0:
-            os.close(parent_fd)
-        try:
-            if reserved and source_identity is not None:
-                try:
-                    _remove_entry_at(
-                        source_parent_fd,
-                        temporary.name,
-                        temporary,
-                        expected_identity=source_identity,
-                    )
-                except (OSError, GoodnotesError):
-                    pass
-        finally:
-            if source_fd >= 0:
-                os.close(source_fd)
-            os.close(source_parent_fd)
+        _close_bundle_descriptors([] if directory_fd is None else [directory_fd], primary)

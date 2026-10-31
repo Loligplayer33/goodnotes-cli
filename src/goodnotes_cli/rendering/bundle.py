@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NotRequired, TypedDict, cast
 
@@ -20,6 +21,29 @@ class _BundlePage(TypedDict):
     render: NotRequired[dict[str, Any]]
     render_error: NotRequired[dict[str, Any]]
     warnings: NotRequired[list[str]]
+
+
+@dataclass(frozen=True)
+class _BundleRender:
+    success: dict[str, object] | None = None
+    error: dict[str, Any] | None = None
+
+
+def _classify_render(rendered: dict[str, object], document_id: str, number: int) -> _BundleRender:
+    if rendered.get("page") != number:
+        raise GoodnotesError("Bundle page render has missing or inconsistent page identity.")
+    if "render_error" in rendered:
+        error = rendered["render_error"]
+        if not isinstance(error, dict):
+            raise GoodnotesError("Bundle page render error must be a dictionary.")
+        if "document_id" in rendered and rendered["document_id"] != document_id:
+            raise GoodnotesError(
+                "Bundle page render has missing or inconsistent document identity."
+            )
+        return _BundleRender(error=dict(error))
+    if rendered.get("document_id") != document_id:
+        raise GoodnotesError("Bundle page render has missing or inconsistent document identity.")
+    return _BundleRender(success=dict(rendered))
 
 
 def _read_bundle_text(
@@ -62,19 +86,13 @@ def _bundle_content(
             raise GoodnotesError("Bundle page text has missing or inconsistent document identity.")
         if text.get("page") != number:
             raise GoodnotesError("Bundle page text has missing or inconsistent page identity.")
-        if "render_error" not in rendered and rendered.get("document_id") != document_id:
-            raise GoodnotesError(
-                "Bundle page render has missing or inconsistent document identity."
-            )
-        if rendered.get("page") != number:
-            raise GoodnotesError("Bundle page render has missing or inconsistent page identity.")
-        render_error = rendered.get("render_error")
-        if isinstance(render_error, dict):
+        classified = _classify_render(rendered, document_id, number)
+        if classified.error is not None:
             manifest.append(
                 {
                     "page": number,
                     "image": None,
-                    "render_error": dict(render_error),
+                    "render_error": classified.error,
                     "warnings": [
                         f"Native image rendering failed for page {number}; no image is available."
                     ],
@@ -82,11 +100,12 @@ def _bundle_content(
                 }
             )
         else:
+            assert classified.success is not None
             manifest.append(
                 {
                     "page": number,
                     "image": f"page-{number:04d}.png",
-                    "render": dict(rendered),
+                    "render": classified.success,
                     "text": text,
                 }
             )

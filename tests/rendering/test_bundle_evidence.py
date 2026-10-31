@@ -91,3 +91,19 @@ def test_bundle_rejects_text_stored_under_another_page() -> None:
         _bundle_content(
             {1: _text(2)}, "document", [1], [{"document_id": "document", "page": 1}], 100
         )
+
+
+@pytest.mark.parametrize("error", [None, "generated", []])
+def test_bundle_rejects_malformed_present_render_error(error: object) -> None:
+    with pytest.raises(GoodnotesError, match="render error"):
+        _bundle_content({1: _text(1)}, "document", [1], [{"page": 1, "render_error": error}], 100)
+
+
+@pytest.mark.parametrize("document", [None, "another-document"])
+@pytest.mark.parametrize("partial", [False, True])
+def test_bundle_rejects_inconsistent_render_document(document: object, partial: bool) -> None:
+    rendered: dict[str, object] = {"page": 1, "document_id": document}
+    if partial:
+        rendered["render_error"] = {"code": "generated"}
+    with pytest.raises(GoodnotesError, match="document identity"):
+        _bundle_content({1: _text(1)}, "document", [1], [rendered], 100)

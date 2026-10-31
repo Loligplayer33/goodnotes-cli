@@ -240,31 +240,3 @@ def _pdf_source_signature(path: Path) -> tuple[int, int, int, int, int, int]:
     if not stat.S_ISREG(info.st_mode):
         raise GoodnotesError("A page background is no longer a regular file.")
     return stat_key(info)
-
-
-def _pdf_final_use_flags(paths: list[Path], capacity: int = _MAX_OPEN_PDF_SOURCES) -> list[bool]:
-    """Mark each cached PDF handle's last insertion before reuse ends or eviction."""
-    cache: OrderedDict[tuple[int, int], int] = OrderedDict()
-    handles: list[int] = []
-    last_use: dict[int, int] = {}
-    signatures: dict[tuple[int, int], tuple[int, int, int, int, int, int]] = {}
-    next_handle = 0
-    for index, path in enumerate(paths):
-        signature = _pdf_source_signature(path)
-        identity = signature[0], signature[1]
-        previous = signatures.get(identity)
-        if previous is not None and previous != signature:
-            raise GoodnotesError("A page background changed during the rendering operation.")
-        signatures[identity] = signature
-        handle = cache.get(identity)
-        if handle is None:
-            if len(cache) >= capacity:
-                cache.popitem(last=False)
-            handle = next_handle
-            next_handle += 1
-            cache[identity] = handle
-        else:
-            cache.move_to_end(identity)
-        handles.append(handle)
-        last_use[handle] = index
-    return [last_use[handle] == index for index, handle in enumerate(handles)]

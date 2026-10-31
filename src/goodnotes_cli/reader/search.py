@@ -5,7 +5,8 @@ from __future__ import annotations
 import hashlib
 import heapq
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Generator
+from contextlib import closing
 from dataclasses import dataclass
 
 from ..errors import GoodnotesError, TextIndexUnavailableError
@@ -17,6 +18,7 @@ from .pages import PageReader
 from .pdf import PdfTextReader
 from .scope import ScopeResolver
 from .session import ReaderSession
+from .validation import required_integer
 
 
 @dataclass(frozen=True)
@@ -140,71 +142,66 @@ class SearchReader:
         # Each source cursor orders by text_id, and a page/source fixes the other
         # sort fields. Thus a later exact duplicate can never outrank its first row;
         # keys for candidates outside the retained top-K set need not be kept.
-        active_notebook_ids = self._catalog.active_items_by_kind("notebook")
-        page_numbers = self._pages.page_numbers(active_notebook_ids)
+        page_numbers = self._pages.page_numbers(notebook_ids)
         for item_source in available:
-            if item_source == "pdf":
-                assert pdf_bindings is not None
-                rows = (
-                    row
-                    for notebook_batch in notebook_batches
-                    for row in text_queries.search_pdf_rows(
+            for notebook_batch in notebook_batches:
+                if item_source == "pdf":
+                    assert pdf_bindings is not None
+                    rows = text_queries.search_pdf_rows(
                         self._session.fts, pdf_bindings, folded_query, notebook_batch
                     )
-                )
-            else:
-                rows = (
-                    row
-                    for notebook_batch in notebook_batches
-                    for row in self._search_rows(item_source, folded_query, notebook_batch)
-                )
-            for row in rows:
-                document_id = row["document_id"]
-                page_id = row["page_id"]
-                page_number = page_numbers.get((document_id, page_id))
-                if page_number is None:
-                    continue
-                entry = self._catalog.entries.get(("notebook", document_id))
-                path = self._catalog.paths.get(("notebook", document_id))
-                if entry is None or path is None:
-                    continue
-                text = row["text"]
-                digest = hashlib.blake2b(
-                    text.encode("utf-8", errors="surrogatepass"), digest_size=16
-                ).digest()
-                duplicate_key = (page_id, item_source, len(text), digest)
-                if duplicate_key in retained_keys:
-                    continue
-                sort_key = (
-                    path.casefold(),
-                    page_number,
-                    source_order[item_source],
-                    int(row["sort_id"] or 0),
-                )
-                candidate = _SearchCandidate(
-                    sort_key=sort_key,
-                    sequence=sequence,
-                    duplicate_key=duplicate_key,
-                    hit=SearchHit(
-                        document_id=document_id,
-                        path=path,
-                        page=page_number,
-                        page_id=page_id,
-                        source=item_source,
-                        text=text,
-                    ),
-                )
-                sequence += 1
-                if len(candidates) < limit:
-                    heapq.heappush(candidates, candidate)
-                    retained_keys.add(duplicate_key)
-                elif (candidate.sort_key, candidate.sequence) < (
-                    candidates[0].sort_key,
-                    candidates[0].sequence,
-                ):
-                    evicted = heapq.heapreplace(candidates, candidate)
-                    retained_keys.remove(evicted.duplicate_key)
-                    retained_keys.add(duplicate_key)
+                else:
+                    rows = self._search_rows(item_source, folded_query, notebook_batch)
+                with closing(rows):
+                    for row in rows:
+                        document_id = row["document_id"]
+                        page_id = row["page_id"]
+                        page_number = page_numbers.get((document_id, page_id))
+                        if page_number is None:
+                            continue
+                        entry = self._catalog.entries.get(("notebook", document_id))
+                        path = self._catalog.paths.get(("notebook", document_id))
+                        if entry is None or path is None:
+                            continue
+                        text = row["text"]
+                        digest = hashlib.blake2b(
+                            text.encode("utf-8", errors="surrogatepass"), digest_size=16
+                        ).digest()
+                        duplicate_key = (page_id, item_source, len(text), digest)
+                        if duplicate_key in retained_keys:
+                            continue
+                        sort_key = (
+                            path.casefold(),
+                            page_number,
+                            source_order[item_source],
+                            required_integer(
+                                row["sort_id"], f"{index.TEXT_TABLES[item_source]}.text_id"
+                            ),
+                        )
+                        candidate = _SearchCandidate(
+                            sort_key=sort_key,
+                            sequence=sequence,
+                            duplicate_key=duplicate_key,
+                            hit=SearchHit(
+                                document_id=document_id,
+                                path=path,
+                                page=page_number,
+                                page_id=page_id,
+                                source=item_source,
+                                text=text,
+                            ),
+                        )
+                        sequence += 1
+                        if len(candidates) < limit:
+                            heapq.heappush(candidates, candidate)
+                            retained_keys.add(duplicate_key)
+                        elif (candidate.sort_key, candidate.sequence) < (
+                            candidates[0].sort_key,
+                            candidates[0].sequence,
+                        ):
+                            evicted = heapq.heapreplace(candidates, candidate)
+                            retained_keys.remove(evicted.duplicate_key)
+                            retained_keys.add(duplicate_key)
         return [
             candidate.hit
             for candidate in sorted(candidates, key=lambda x: (x.sort_key, x.sequence))
@@ -219,7 +216,7 @@ class SearchReader:
 
     def _search_rows(
         self, source: str, query: str, document_ids: list[str] | None = None
-    ) -> Iterator[sqlite3.Row]:
+    ) -> Generator[sqlite3.Row, None, None]:
         """Search handwriting or textbox rows for a bounded notebook-id set."""
         assert self._session.fts is not None
         if document_ids is None:
@@ -246,8 +243,9 @@ class SearchReader:
         scope = ", ".join("?" for _ in document_ids)
         page_meta_columns = self._session.table_columns(self._session.fts, "page_meta")
         mapping_filter = index.page_meta_live_filter(page_meta_columns, alias="p")
-        yield from self._session.fts.execute(
-            f"""
+        with closing(
+            self._session.fts.execute(
+                f"""
             SELECT p.document_id, {alias}.page_id, {alias}.text,
                    {alias}.text_id AS sort_id
             FROM {table} AS {alias}
@@ -255,6 +253,10 @@ class SearchReader:
             WHERE p.document_id IN ({scope}) {mapping_filter}
               AND instr(casefold({alias}.text), ?) > 0
             ORDER BY {alias}.text_id
-            """,
-            (*document_ids, query),
-        )
+                """,
+                (*document_ids, query),
+            )
+        ) as cursor:
+            # yield from would delegate a second cursor close on GeneratorExit.
+            for row in cursor:  # noqa: UP028
+                yield row

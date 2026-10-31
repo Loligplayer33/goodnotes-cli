@@ -459,9 +459,9 @@ class PageReader:
             ORDER BY document_id, position, id
             """
         ):
-            document_id = self._required_text(row["document_id"], "pages.document_id")
-            if document_id not in notebook_ids:
+            if row["document_id"] not in notebook_ids:
                 continue
+            document_id = self._required_text(row["document_id"], "pages.document_id")
             page_id = self._required_text(row["id"], "pages.id")
             number = counts.get(document_id, 0) + 1
             counts[document_id] = number
