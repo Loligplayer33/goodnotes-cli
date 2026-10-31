@@ -184,6 +184,7 @@ def test_scratch_preparation_errors_are_native_and_remove_only_scratch(
     validated = native._validated_inventory
     copied_source_fds: set[int] = set()
     preparing = False
+    fstat_injected = False
 
     def validated_inventory(path: Path) -> dict:
         nonlocal preparing
@@ -204,8 +205,10 @@ def test_scratch_preparation_errors_are_native_and_remove_only_scratch(
         return original_open(path, *args, **kwargs)
 
     def fstat(fd: int) -> os.stat_result:
-        nonlocal failed_path
-        if phase == "fstat" and fd in copied_source_fds:
+        nonlocal failed_path, fstat_injected
+        if phase == "fstat" and fd in copied_source_fds and not fstat_injected:
+            # Cleanup may reuse this numeric fd after the source has closed.
+            fstat_injected = True
             failed_path = active_source
             raise failure
         return original_fstat(fd)
@@ -246,6 +249,7 @@ def test_scratch_preparation_errors_are_native_and_remove_only_scratch(
     assert captured.value.__cause__ is failure
     assert captured.value.details["operation"] == "clone_native_store"
     assert captured.value.details["path"] == str(failed_path)
+    assert fstat_injected == (phase == "fstat")
     assert not list(scratch_parent.iterdir())
     assert {path.name: path.read_bytes() for path in source.iterdir()} == source_bytes
 
