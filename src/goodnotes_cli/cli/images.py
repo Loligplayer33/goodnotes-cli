@@ -254,6 +254,8 @@ def _artifact_directory(cfg: Settings) -> Path:
 
 
 def _bundle_native_remedy(exc: NativeError) -> None:
+    if exc.details.get("operation") == "map_page_rotation":
+        return
     exc.details["remedy"] = (
         f"{exc.details['remedy']} For page backgrounds without annotations, "
         "rerun bundle with --layer background."

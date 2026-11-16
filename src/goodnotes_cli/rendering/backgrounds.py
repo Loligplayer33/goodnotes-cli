@@ -68,6 +68,8 @@ def _resolve_attachment_path(sandbox: SandboxProtocol, page: Page) -> Path:
 
 def _page_rotation(page: Page) -> int:
     rotation = page.rotation
+    if rotation is None:
+        raise GoodnotesError(f"Page {page.number} has unknown Goodnotes rotation.")
     if isinstance(rotation, bool) or not isinstance(rotation, int) or rotation % 90:
         raise GoodnotesError(f"Page {page.number} has an unsupported rotation value.")
     return rotation % 360

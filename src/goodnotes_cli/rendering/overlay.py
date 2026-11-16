@@ -126,12 +126,6 @@ def render_native_overlay(
     height_points: float,
     record_reader: Callable[[str], list[tuple[bytes, bytes]]] | None = None,
 ) -> NativeOverlay:
-    if page.rotation != 0:
-        raise NativeError(
-            "native_data_unavailable",
-            "Native rendering does not support rotated Goodnotes pages yet.",
-            operation="map_native_page",
-        )
     if page.width is None or page.height is None:
         raise NativeError(
             "native_data_unavailable",

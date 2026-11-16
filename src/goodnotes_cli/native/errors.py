@@ -33,6 +33,8 @@ class NativeError(GoodnotesError):
                 "Grant write/search access to the temporary directory or set "
                 "GOODNOTES_SCRATCH_DIR to a writable private directory outside the snapshot."
             )
+        elif operation == "map_page_rotation":
+            remedy = "Use a Goodnotes-exported annotated PDF to obtain the displayed page."
         elif operation == "map_native_page":
             remedy = (
                 "The copied page mapping or geometry is unsupported. Inspect this page's "
