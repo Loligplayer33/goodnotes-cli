@@ -39,7 +39,7 @@ uv run --locked goodnotes --text read "Course Notes" --pages 1
 Replace `"Course Notes"` with a returned notebook name, full path, or ID.
 Use `sync --library /path/to/Library` for an explicit source containing `Databases/`
 and `Attachments/`. Sync needs source read and cache write access; later reads use
-the copy. On macOS, respond to any system privacy prompt for your terminal or agent.
+the copy. See [macOS Library access](#macos-library-access) if sync reports `source_permission_denied`.
 Development checks use generated fixtures or a pre-existing private copy, never the default live sync.
 
 Page numbers start at 1. `--text` indents JSON; global options go before the command.
@@ -47,6 +47,20 @@ Page numbers start at 1. `--text` indents JSON; global options go before the com
 `--source handwriting` or `--source all` to include unverified stored handwriting recognition
 candidates. Use `read --pages` to select pages; `--page` remains a hidden compatibility option.
 The CLI does not run OCR on images.
+
+### macOS Library access
+
+[macOS 27](https://developer.apple.com/documentation/macos-release-notes/macos-27-release-notes)
+denies access to another developer's app container by default. After a denied sync, open
+**System Settings → Privacy & Security → Files & Folders**, expand the app that ran the
+command, and enable its **Goodnotes** entry. Grant access separately for a terminal app
+and a desktop agent if you sync from both. On macOS 14 through 26, grant access if the
+[system privacy prompt](https://developer.apple.com/videos/play/wwdc2023/10053/?time=356)
+appears.
+
+Retry with the same Library and data directory. If the agent can read the source but its
+sandbox blocks writes to the cache, grant the agent write access to that cache directory
+or run sync from the authorized terminal and [use the same cache in the agent](docs/usage.md#restricted-readers-and-refresh).
 
 ## Choose a task
 

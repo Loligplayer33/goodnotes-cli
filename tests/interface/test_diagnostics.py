@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import errno
 import os
+import platform
 import sqlite3
 from collections.abc import Iterator
 from pathlib import Path
@@ -10,6 +11,7 @@ from typing import Literal
 import pytest
 
 from goodnotes_cli.cache import refresh_cache
+from goodnotes_cli.config import default_library
 from goodnotes_cli.diagnostics import inspect_environment
 from goodnotes_cli.errors import CacheAccessError, FilesystemAccessError, GoodnotesError
 from tests.support.cli import _tree_manifest
@@ -179,6 +181,42 @@ def test_filesystem_error_uses_chained_permission_path(
     assert error.details["path"] == "/generated/denied"
     assert error.details["operation"] == "generated_operation"
     assert "sandboxed agent" in error.details["remedy"]
+
+
+@pytest.mark.parametrize(
+    ("os_version", "settings_hint", "prompt_hint"),
+    [("27.2.1", True, False), ("26.6", False, True), ("", False, False)],
+)
+def test_source_permission_hint_uses_macos_version_for_app_container(
+    os_version: str,
+    settings_hint: bool,
+    prompt_hint: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(platform, "mac_ver", lambda: (os_version, ("", "", ""), ""))
+
+    def denied(path: Path) -> str:
+        error = FilesystemAccessError.from_exception(
+            PermissionError(errno.EPERM, "generated denial", str(path)),
+            operation="inventory_source_library",
+            path=path.parent,
+            kind="source",
+        )
+        assert error.code == "source_permission_denied"
+        return error.details["remedy"]
+
+    remedy = denied(default_library() / "Databases")
+    assert ("Files & Folders" in remedy) is settings_hint
+    assert ("If macOS asks" in remedy) is prompt_hint
+    for copy in (
+        tmp_path / "source" / "Databases",
+        default_library().parent.parent / ".." / "copy" / "Databases",
+    ):
+        generic = denied(copy)
+        assert "macOS" not in generic
+        assert "sandboxed agent" in generic
 
 
 def test_output_missing_parent_error_is_distinct_from_permission_denied() -> None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import errno
 import os
+import platform
 from pathlib import Path
 from typing import Literal
 
@@ -44,6 +45,28 @@ def _permission_denied(exc: BaseException) -> bool:
     )
 
 
+def _app_container_permission_hint(path: str | Path) -> str:
+    from .config import default_library
+
+    try:
+        if not Path(os.path.normpath(path)).is_relative_to(default_library().parent.parent):
+            return ""
+        major = int(platform.mac_ver()[0].partition(".")[0])
+    except (OSError, RuntimeError, ValueError):
+        return ""
+    if major >= 27:
+        return (
+            "On this macOS version, enable Goodnotes under System Settings > Privacy & "
+            "Security > Files & Folders for the terminal or desktop app running the CLI. "
+        )
+    if major >= 14:
+        return (
+            "If macOS asks whether the terminal or desktop app may access data from "
+            "other apps, allow access and retry. "
+        )
+    return ""
+
+
 class FilesystemAccessError(GoodnotesError):
     """A source-read or output-write failure with a concrete recovery action."""
 
@@ -78,7 +101,8 @@ class FilesystemAccessError(GoodnotesError):
         code = f"{kind}_{'permission_denied' if permission_denied else 'unavailable'}"
         if kind == "source":
             remedy = (
-                "Grant this CLI process read access to the selected Library and search access "
+                _app_container_permission_hint(failed_path or path)
+                + "Grant this CLI process read access to the selected Library and search access "
                 "to its parent directories. A sandboxed agent may need access granted by its "
                 "host. Keep Goodnotes source permissions unchanged and use the same --library "
                 "selection when retrying."
