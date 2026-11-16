@@ -2,9 +2,9 @@
 
 Notable changes to the project are recorded here. Versions follow Semantic Versioning.
 
-## [Unreleased]
+## [0.2.0] - 2026-11-16
 
-### 0.2.0 interface and rendering updates
+### CLI defaults and rendering
 
 - Native rendering and full-notebook PDF export now include pages whose copied store query returns no records. Their status and warnings preserve uncertainty about annotation absence; unavailable stores and failed reads remain errors.
 - The main help focuses on ten everyday commands. Specialist commands, including `attach-pdf`, remain available through targeted help and schema. The schema command index now comes from registered commands.
@@ -39,6 +39,9 @@ Notable changes to the project are recorded here. Versions follow Semantic Versi
 
 ### Fixed
 
+- Native ink and PDF backgrounds stay aligned on cropped and rotated pages. The `pages` command reports the Goodnotes page rotation in clockwise degrees, or `null` if it cannot read the stored value.
+- Notebook search validates page numbers within the selected notebook and reports invalid stored text and PDF mappings instead of silently dropping those results.
+- Native exports report store and scratch failures at the operation that failed. Cleanup preserves completed bundles and leaves uncertain output links untouched.
 - Decode shared move/quadratic command streams, disconnected sections, filled subpaths and rotated arc controls. Shape styles/translations, rotated images, translucent fills and observed scale-1 patterns retain their content. Pencil tone, stroke width, taper, contours, pressure response and texture remain approximate. Faint gray details around some fill edges remain unverified. Other pattern resolutions remain approximate; unknown formats still report partial coverage.
 
 - Separate catalog root namespaces before navigation and search. A cache-local root selection keeps unrelated libraries out of normal browsing, preserves exact selectors, and avoids cross-library path collisions without folder-name rules.
