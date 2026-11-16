@@ -1515,9 +1515,9 @@ def test_unsupported_background_mapping_all_failed_and_export_are_strict(
 ) -> None:
     sandbox = FakeSandbox(tmp_path / "sandbox")
     with fitz.open() as source:
-        source.new_page(width=612, height=792).set_rotation(90)
-        source.save(sandbox.attachments_dir / "rotated.pdf")
-    page = _page(str(uuid4()), 1, "rotated.pdf")
+        source.new_page(width=612, height=792).set_cropbox(fitz.Rect(10, 10, 602, 782))
+        source.save(sandbox.attachments_dir / "cropped.pdf")
+    page = replace(_page(str(uuid4()), 1, "cropped.pdf"), width=1122, height=1452)
 
     class Session:
         def __init__(self, _sandbox: object) -> None:
@@ -1533,7 +1533,7 @@ def test_unsupported_background_mapping_all_failed_and_export_are_strict(
             return []
 
     monkeypatch.setattr("goodnotes_cli.native.NativeStoreSession", Session)
-    with pytest.raises(NativeError, match="rotated or cropped") as error:
+    with pytest.raises(NativeError, match="dimensions do not match the verified scale") as error:
         if operation == "bundle":
             render_pages(
                 sandbox, [page], [Path("one.png")], layer="native", allow_partial_native_errors=True

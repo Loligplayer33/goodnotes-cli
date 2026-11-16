@@ -27,7 +27,7 @@ class Page:
     width: float | None = None
     height: float | None = None
     annotation_count: int | None = 0
-    rotation: int = 0
+    rotation: int | None = 0
 
 
 @dataclass(frozen=True)

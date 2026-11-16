@@ -9,11 +9,32 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+from .._vendor.wire import WireType, try_decode_message
 from ..errors import GoodnotesError
 from ..models import Item, Page, PageRef
 from . import index
 from .attachments import AttachmentResolver
 from .session import ReaderSession
+
+
+def _decode_page_rotation(value: object) -> int | None:
+    if not isinstance(value, bytes):
+        return None
+    message = try_decode_message(value)
+    if message is None:
+        return None
+    # The observed last-write-wins envelope stores clockwise quarter turns in
+    # field 1 (omitted for zero) and write metadata in field 2.
+    metadata = message.by_number(2)
+    if len(metadata) != 1 or metadata[0].wire_type is not WireType.LENGTH_DELIMITED:
+        return None
+    turns = message.by_number(1)
+    if not turns:
+        return 0
+    if len(turns) != 1 or turns[0].wire_type is not WireType.VARINT:
+        return None
+    count = turns[0].value
+    return count * 90 if isinstance(count, int) and 0 <= count <= 3 else None
 
 
 class PageReader:
@@ -36,6 +57,18 @@ class PageReader:
     def attachment_state_by_page(self) -> dict[tuple[str, str], tuple[str, str | None]]:
         return self._attachment_state_by_page
 
+    def _page_columns(self) -> str:
+        connection = self._session.projection
+        assert connection is not None
+        columns = "id, document_id, template_id, position, group_id"
+        if "lww_rotation" in self._session.table_columns(connection, "pages"):
+            # Read only the tiny rotation envelope, even for a malformed copied column.
+            columns += (
+                ", CASE WHEN typeof(lww_rotation) = 'blob' AND length(lww_rotation) <= 128 "
+                "THEN lww_rotation END AS lww_rotation"
+            )
+        return columns
+
     def pages(self, notebook_id: str) -> list[Page]:
         cached = self._pages_by_notebook.get(notebook_id)
         if cached is not None:
@@ -43,7 +76,7 @@ class PageReader:
         assert self._session.projection is not None
         index.sql_batch_size(self._session.projection)
         rows = self._session.projection.execute(
-            """SELECT id, document_id, template_id, position, group_id FROM pages
+            f"""SELECT {self._page_columns()} FROM pages
                WHERE document_id = ? AND COALESCE(deleted, 0) = 0 ORDER BY position, id""",
             (notebook_id,),
         ).fetchall()
@@ -203,8 +236,8 @@ class PageReader:
             fetch_count = min(remaining, notebook.page_count - local_offset)
             index.sql_batch_size(self._session.projection, fixed=2)
             rows = self._session.projection.execute(
-                """
-                SELECT id, document_id, template_id, position, group_id
+                f"""
+                SELECT {self._page_columns()}
                 FROM pages
                 WHERE document_id = ? AND COALESCE(deleted, 0) = 0
                 ORDER BY position, id
@@ -387,6 +420,11 @@ class PageReader:
                 width=width,
                 height=height,
                 annotation_count=annotation_count,
+                rotation=(
+                    _decode_page_rotation(row["lww_rotation"])
+                    if "lww_rotation" in row.keys()
+                    else 0
+                ),
             )
             self._page_cache[(document_id, page_id)] = page
 

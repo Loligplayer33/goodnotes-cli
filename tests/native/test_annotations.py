@@ -71,7 +71,7 @@ def test_native_overlay_accepts_a_session_record_reader(
 
 @pytest.mark.parametrize(
     "edit",
-    [{"rotation": 90}, {"width": None}, {"height": 0}, {"width": math.inf}, {"id": "invalid"}],
+    [{"width": None}, {"height": 0}, {"width": math.inf}, {"id": "invalid"}],
 )
 def test_invalid_page_mapping_fails_before_native_read(
     monkeypatch: pytest.MonkeyPatch, edit: dict[str, Any]

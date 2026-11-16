@@ -10,8 +10,14 @@
 
 Native output reports coverage and warnings; it does not establish full fidelity.
 Missing native data and render errors remain visible, with no silent background
-substitution. Use `--layer background` when a clean background is needed or native
-rendering is unavailable.
+substitution. Use `--layer background` when the background can be mapped and you
+need it without native ink.
+
+For PDF backgrounds, native rendering aligns ink to the visible crop at the stored
+template scale, then applies any Goodnotes page rotation to the background and ink
+together. A crop whose dimensions disagree with the stored template still produces
+a page mapping error. In `pages` output, `rotation` is the Goodnotes rotation in
+clockwise degrees. An unreadable stored value appears as `null`.
 
 If a native lookup succeeds but finds no page records, the result reports
 `annotation_status: native-no-records-observed` and

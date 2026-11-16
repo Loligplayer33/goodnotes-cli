@@ -618,35 +618,22 @@ def test_removed_flags_have_no_hidden_aliases(arguments: list[str], tmp_path: Pa
     assert not (tmp_path / "state").exists()
 
 
-@pytest.mark.parametrize(
-    ("managed", "mapping", "verbose"),
-    [(m, mapping, True) for m in (False, True) for mapping in ("rotation", "crop")]
-    + [(True, "rotation", False)],
-)
-def test_bundle_reports_unsupported_native_background_per_page(
+@pytest.mark.parametrize(("managed", "verbose"), [(False, True), (True, True), (True, False)])
+def test_bundle_reports_unrecognized_goodnotes_rotation_per_page(
     generated_copy: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     managed: bool,
-    mapping: str,
     verbose: bool,
 ) -> None:
-    import pymupdf as fitz
-
     from goodnotes_cli.rendering.overlay import NativeOverlay
 
-    background = generated_copy / "Library" / "Attachments" / "safe.pdf"
-    with fitz.open() as pdf:
-        first = pdf.new_page(width=600, height=800)
-        if mapping == "rotation":
-            first.set_rotation(90)
-        else:
-            first.set_cropbox(fitz.Rect(10, 10, 590, 790))
-        pdf.new_page(width=600, height=800)
-        pdf.save(background)
     with sqlite3.connect(generated_copy / "Library" / "Databases" / "projection.sqlite") as db:
+        db.execute("ALTER TABLE pages ADD COLUMN lww_rotation BLOB")
+        db.execute("UPDATE pages SET lww_rotation = X'12020801'")
+        db.execute("UPDATE pages SET lww_rotation = X'080412020801' WHERE id = 'page-02'")
         db.execute("UPDATE templates SET page_number = 1 WHERE id = 'template-02'")
-        db.execute("UPDATE templates SET page_number = 2 WHERE id = 'template-10'")
+        db.execute("UPDATE templates SET page_number = 1 WHERE id = 'template-10'")
 
     class Session:
         def __init__(self, _sandbox: object) -> None:
@@ -678,9 +665,17 @@ def test_bundle_reports_unsupported_native_background_per_page(
     assert result["status"] == "partial"
     assert result["failed_pages"] == [1]
     assert result["page_evidence"][0]["image"] is None
-    assert result["page_evidence"][0]["render_error"]["details"]["operation"] == "map_native_page"
+    assert result["page_evidence"][0]["render_error"]["details"]["operation"] == "map_page_rotation"
     assert Path(result["page_evidence"][1]["image"]).is_file()
     assert not list(Path(result["manifest"]).parent.glob("page-0001.png"))
+
+    failed = invoke_in_process(
+        ["bundle", "doc-hostile", "--pages", "1"], tmp_path, sandbox=generated_copy
+    )
+    assert failed.returncode == 1
+    details = json.loads(failed.stderr)["error"]["details"]
+    assert details["operation"] == "map_page_rotation"
+    assert "--layer background" not in details["remedy"]
 
 
 @pytest.mark.parametrize(

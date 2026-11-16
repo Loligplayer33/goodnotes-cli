@@ -15,6 +15,7 @@ from .backgrounds import (
     _append_background_page,
     _check_dpi,
     _check_render_size,
+    _page_rotation,
     _PdfDocumentCache,
     _resolve_attachment_path,
 )
@@ -157,6 +158,7 @@ def _is_page_local_native_error(exc: NativeError) -> bool:
         "decode_native_page",
         "render_native_page",
         "map_native_page",
+        "map_page_rotation",
         "read_native_page",
     }
 
@@ -363,30 +365,34 @@ def _append_native_page(
     final: bool = True,
 ) -> dict[str, object]:
     """Compose a copied native overlay with its verified background mapping."""
+    from ..native import NativeError
     from .overlay import render_native_overlay
 
+    try:
+        goodnotes_rotation = _page_rotation(page)
+    except GoodnotesError as exc:
+        raise NativeError(
+            "native_data_unavailable",
+            str(exc),
+            operation="map_page_rotation",
+            context={"page": page.number},
+        ) from exc
     source_path = source_path or _resolve_attachment_path(sandbox, page)
     index = _append_background_page(
         document, page, source_path, source_doc=pdf_cache.open(source_path), final=final
     )
     target = document[index]
-    if target.rotation or target.cropbox != target.mediabox:
-        from ..native import NativeError
-
-        raise NativeError(
-            "native_data_unavailable",
-            "Native annotation rendering does not yet support rotated or cropped backgrounds.",
-            operation="map_native_page",
-            context={"page": page.number},
-        )
-    from ..native import NativeError
+    # The stored ink uses the visible template before Goodnotes rotates the notebook page.
+    width_points, height_points = target.rect.width, target.rect.height
+    if goodnotes_rotation in (90, 270):
+        width_points, height_points = height_points, width_points
 
     try:
         overlay = render_native_overlay(
             sandbox,
             page,
-            width_points=target.rect.width,
-            height_points=target.rect.height,
+            width_points=width_points,
+            height_points=height_points,
             record_reader=record_reader,
         )
     except NativeError as exc:
@@ -397,5 +403,15 @@ def _append_native_page(
     ):
         with fitz.open(stream=overlay.svg, filetype="svg") as vector:
             with fitz.open(stream=vector.convert_to_pdf(), filetype="pdf") as ink:
-                target.show_pdf_page(target.rect, ink, 0, overlay=True)
+                # Counter-rotate the PDF's own angle when inserting the template ink.
+                # The final Goodnotes page rotation then turns the background and ink together.
+                combined_rotation = target.rotation
+                pdf_rotation = (combined_rotation - goodnotes_rotation) % 360
+                if combined_rotation:
+                    target.set_rotation(0)
+                try:
+                    target.show_pdf_page(target.rect, ink, 0, overlay=True, rotate=pdf_rotation)
+                finally:
+                    if combined_rotation:
+                        target.set_rotation(combined_rotation)
     return {"page": page.number, "page_id": page.id, **overlay.metadata}

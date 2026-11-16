@@ -6,6 +6,7 @@ import hashlib
 import json
 import select
 import signal
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -233,6 +234,91 @@ def test_native_png_pdf_bundle_preserve_sources_and_readonly_cache(
     finally:
         for path, mode in sorted(modes.items(), key=lambda pair: len(pair[0].parts)):
             path.chmod(mode)
+
+
+@pytest.mark.parametrize(
+    ("pdf_rotation", "turns", "cropped", "origin_x"),
+    [
+        (90, 0, False, 0),
+        (180, 0, False, 0),
+        (270, 0, False, 10),
+        (0, 0, True, 0),
+        (0, 1, False, 0),
+        (0, 2, False, 0),
+        (0, 3, False, 0),
+        (90, 1, True, 0),
+        (270, 1, True, 10),
+    ],
+)
+def test_native_bundle_and_export_align_ink_with_crop_and_rotation(
+    generated_source: tuple[Path, GeneratedNativeStore],
+    tmp_path: Path,
+    pdf_rotation: int,
+    turns: int,
+    cropped: bool,
+    origin_x: int,
+) -> None:
+    source, store = generated_source
+    store.close()
+    if turns:
+        # Field 1 is the quarter-turn enum. Field 2 holds write metadata.
+        with sqlite3.connect(source / "Databases" / "projection.sqlite") as db:
+            db.execute("ALTER TABLE pages ADD COLUMN lww_rotation BLOB")
+            db.execute("UPDATE pages SET lww_rotation = X'12020801'")
+            db.execute(
+                "UPDATE pages SET lww_rotation = ? WHERE id = ?",
+                (bytes((8, turns, 18, 2, 8, 1)), PAGE_IDS[0]),
+            )
+    attachment = source / "Attachments" / "generated.pdf"
+    width, height = (180, 240) if pdf_rotation in (90, 270) else (240, 180)
+    margin = 30 if cropped else 0
+    media = fitz.Rect(origin_x, 0, width + origin_x + margin, height + margin)
+    rotation = (pdf_rotation + 90 * turns) % 360
+    with fitz.open() as pdf:
+        page = pdf.new_page(width=media.width, height=media.height)
+        page.set_mediabox(media)
+        if cropped:
+            page.set_cropbox(fitz.Rect(origin_x + 6, 17, origin_x + 6 + width, 17 + height))
+        crop = page.cropbox
+        page.draw_rect((5, 8, 19, 25), color=None, fill=(0, 1, 0))
+        page.set_rotation(pdf_rotation)
+        pdf.new_page(width=240, height=180)
+        pdf.save(attachment)
+        page = pdf[0]
+        page.set_rotation(rotation)
+        marker = fitz.Point(10, 12) * page.rotation_matrix
+        background = page.get_pixmap()
+    original = _manifest(source)
+    environment = _environment(tmp_path)
+    _command(["sync", "--library", str(source)], environment)
+    selection = [NOTEBOOK, "--pages", "1"]
+    probe = _command(["--fields", "number,rotation", "pages", NOTEBOOK], environment)
+    assert probe["pages"][0] == {"number": 1, "rotation": 90 * turns}
+
+    ink_x, ink_y = [(60, 30), (150, 60), (180, 150), (30, 180)][turns]
+
+    bundle = _command(
+        ["bundle", *selection, "--dpi", "72", "--output", str(tmp_path / "bundle")],
+        environment,
+    )
+    evidence = bundle["page_evidence"][0]
+    assert evidence["includes_handwriting"] is True
+    assert evidence["native_annotations"]["rendered_strokes"] == 1
+    rendered = fitz.Pixmap(evidence["image"])
+    assert (rendered.width, rendered.height) == (background.width, background.height)
+    assert background.pixel(ink_x, ink_y) == (255, 255, 255)
+    assert rendered.pixel(ink_x, ink_y) == (255, 0, 0)
+    assert background.pixel(int(marker.x), int(marker.y)) == (0, 255, 0)
+    assert rendered.pixel(int(marker.x), int(marker.y)) == (0, 255, 0)
+
+    output_pdf = tmp_path / "rotated.pdf"
+    _command(["export", *selection, "--output", str(output_pdf)], environment)
+    with fitz.open(output_pdf) as pdf:
+        assert pdf[0].rotation == rotation
+        assert pdf[0].mediabox == media
+        assert pdf[0].cropbox == crop
+        assert pdf[0].get_pixmap().samples == rendered.samples
+    assert _manifest(source) == original
 
 
 @pytest.mark.parametrize("generated_source", [{"image_only": True}], indirect=True)
